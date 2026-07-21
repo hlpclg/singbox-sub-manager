@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NODES_FILE="${1:-nodes.conf}"
-TOKEN_FILE="${TOKEN_FILE:-/etc/proxy-sub-token}"
+BASE_DIR="/etc/singbox-sub-manager"
+NODES_FILE="${1:-$BASE_DIR/nodes.conf}"
+STATE_DIR="/var/lib/singbox-sub-manager"
+TOKEN_FILE="${TOKEN_FILE:-$STATE_DIR/token}"
 SUB_ROOT="${SUB_ROOT:-/var/www/proxy-sub}"
 
 if [[ $(id -u) -ne 0 ]]; then
-  echo "请用 sudo 运行：sudo bash merge-nodes.sh nodes.conf" >&2
+  echo "请用 sudo 运行：sudo bash merge-nodes.sh [nodes.conf]" >&2
   exit 1
 fi
 if [[ ! -f "$NODES_FILE" ]]; then
@@ -25,6 +27,7 @@ mkdir -p "$OUT"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "$(uname -m)" in x86_64|amd64) CLI_ARCH=amd64;; aarch64|arm64) CLI_ARCH=arm64;; *) echo "不支持的架构" >&2; exit 1;; esac
+
 if command -v proxyctl >/dev/null 2>&1; then
   proxyctl merge --nodes "$NODES_FILE" --output "$OUT"
 elif [[ -x "$ROOT/bin/proxyctl-linux-$CLI_ARCH" ]]; then
