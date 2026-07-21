@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/YOUR_GITHUB_USERNAME/proxy-installer/internal/nodes"
+	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 )
 
 func Clash(ns []nodes.Node) string {

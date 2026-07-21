@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [ "main", "v0.*" ]
   pull_request:
 
 permissions:
@@ -19,7 +20,15 @@ jobs:
         run: |
           bash -n install-proxy.sh
           bash -n merge-nodes.sh
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: ShellCheck
+        run: |
+          shellcheck install-proxy.sh
+          shellcheck merge-nodes.sh
+      - name: Go fmt
+        run: if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then echo "Go code is not formatted"; exit 1; fi
       - name: Go test
-        run: go test ./...
+        run: go test -v ./...
       - name: Go vet
         run: go vet ./...
