@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/YOUR_GITHUB_USERNAME/proxy-installer/internal/nodes"
-	"github.com/YOUR_GITHUB_USERNAME/proxy-installer/internal/render"
+	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"github.com/hlpclg/singbox-sub-manager/internal/render"
 	"gopkg.in/yaml.v3"
 )
 

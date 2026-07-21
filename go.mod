@@ -1,4 +1,4 @@
-module github.com/YOUR_GITHUB_USERNAME/proxy-installer
+module github.com/hlpclg/singbox-sub-manager
 
 go 1.22
 

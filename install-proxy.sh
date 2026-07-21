@@ -3,17 +3,13 @@ set -euo pipefail
 
 umask 077
 
-MODE="install"
 DOMAIN=""
 EMAIL="admin@example.com"
-FORCE=false
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    install|update|repair) MODE="$1"; shift ;;
     --domain) DOMAIN="$2"; shift 2 ;;
     --email) EMAIL="$2"; shift 2 ;;
-    --force) FORCE=true; shift ;;
     *) echo "Unknown parameter: $1" >&2; exit 1 ;;
   esac
 done
@@ -111,9 +107,9 @@ log "Checking ports"
 check_tcp_port() {
   local port="$1"
   local allowed_proc="$2"
-  if ss -lntp | grep -qE "[:.]$port[[:space:]]"; then
+  if ss -lntp | grep -qE "[:.]${port}[[:space:]]"; then
     local pids
-    pids=$(ss -lntp | grep -E "[:.]$port[[:space:]]" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
+    pids=$(ss -lntp | grep -E "[:.]${port}[[:space:]]" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
     for pid in $pids; do
       local exe
       exe=$(readlink -f /proc/"$pid"/exe 2>/dev/null || echo "unknown")
@@ -126,9 +122,9 @@ check_tcp_port() {
 check_udp_port() {
   local port="$1"
   local allowed_proc="$2"
-  if ss -lnup | grep -qE "[:.]$port[[:space:]]"; then
+  if ss -lnup | grep -qE "[:.]${port}[[:space:]]"; then
     local pids
-    pids=$(ss -lnup | grep -E "[:.]$port[[:space:]]" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
+    pids=$(ss -lnup | grep -E "[:.]${port}[[:space:]]" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
     for pid in $pids; do
       local exe
       exe=$(readlink -f /proc/"$pid"/exe 2>/dev/null || echo "unknown")
@@ -282,7 +278,7 @@ systemctl restart sing-box
 
 # Check sing-box health
 sleep 1
-if ! systemctl is-active --quiet sing-box || ! ss -lnup | grep -qE "[:.]$HY2_PORT[[:space:]]"; then
+if ! systemctl is-active --quiet sing-box || ! ss -lnup | grep -qE "[:.]${HY2_PORT}[[:space:]]"; then
   log_error "sing-box failed to start or bind port, restoring previous config"
   if [[ -f "$CONF_DIR/config.json.previous.$TS" ]]; then
     mv "$CONF_DIR/config.json.previous.$TS" "$CONF_DIR/config.json"
