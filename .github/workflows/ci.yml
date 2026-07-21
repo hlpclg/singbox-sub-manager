@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+      - name: Shell syntax
+        run: |
+          bash -n install-proxy.sh
+          bash -n merge-nodes.sh
+      - name: Go test
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...

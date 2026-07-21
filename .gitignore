@@ -1,0 +1,6 @@
+bin/
+dist/
+*.log
+.env
+nodes.conf
+.DS_Store
