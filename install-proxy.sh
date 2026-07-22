@@ -99,6 +99,7 @@ CADDY_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
 CADDY_APT_LIST="/etc/apt/sources.list.d/caddy-stable.list"
 CADDY_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
 CADDY_APT_URL="https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
+CADDY_APT_SOURCE_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
 PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.2.1}"
@@ -153,22 +154,38 @@ apt_update_or_die() {
   exit 1
 }
 
+remove_legacy_caddy_apt_sources() {
+  local source_file
+
+  while IFS= read -r -d '' source_file; do
+    [[ "$source_file" == "$CADDY_APT_LIST" ]] && continue
+    grep -q 'dl.cloudsmith.io/public/caddy/stable' "$source_file" 2>/dev/null || continue
+
+    if [[ "$source_file" == *.list ]]; then
+      if grep -vE '^[[:space:]]*(#|$)' "$source_file" | grep -qv 'dl.cloudsmith.io/public/caddy/stable'; then
+        die "Legacy Caddy source is mixed with other repositories: $source_file. Remove the Caddy entry manually."
+      fi
+    elif [[ "$source_file" == *.sources ]]; then
+      if ! grep -qE '^[[:space:]]*URIs:[[:space:]]*https://dl\.cloudsmith\.io/public/caddy/stable' "$source_file" || grep -E '^[[:space:]]*URIs:' "$source_file" | grep -qv 'dl.cloudsmith.io/public/caddy/stable'; then
+        die "Legacy Caddy source is mixed with other repositories: $source_file. Remove the Caddy entry manually."
+      fi
+    fi
+
+    log "Removing legacy Caddy APT source: $source_file"
+    rm -f "$source_file"
+  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+}
+
 reset_caddy_apt_source() {
   install -d -m 0755 /etc/apt/sources.list.d /usr/share/keyrings
+  remove_legacy_caddy_apt_sources
   rm -f "$CADDY_APT_LIST" "$CADDY_KEYRING"
 }
 
 install_caddy_apt_source() {
-  local source_file
   local expected_source="deb [signed-by=$CADDY_KEYRING] $CADDY_APT_URL any-version main"
 
-  while IFS= read -r -d '' source_file; do
-    if [[ "$source_file" != "$CADDY_APT_LIST" ]] && grep -q 'dl.cloudsmith.io/public/caddy/stable' "$source_file" 2>/dev/null; then
-      die "Conflicting Caddy APT source found: $source_file. Remove it or merge it into $CADDY_APT_LIST."
-    fi
-  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
-
-  if [[ -f "$CADDY_KEYRING" && -f "$CADDY_APT_LIST" ]] && grep -Fxq "$expected_source" "$CADDY_APT_LIST"; then
+  if [[ -f "$CADDY_KEYRING" && -f "$CADDY_APT_LIST" ]] && grep -Fxq "$expected_source" "$CADDY_APT_LIST" && gpg --show-keys --with-colons "$CADDY_KEYRING" 2>/dev/null | grep -q 'ABA1F9B8875A6661'; then
     return
   fi
 
@@ -179,11 +196,17 @@ install_caddy_apt_source() {
     die "Failed to install Caddy APT signing key"
   fi
   chmod 0644 "$CADDY_KEYRING"
+  if ! gpg --show-keys --with-colons "$CADDY_KEYRING" 2>/dev/null | grep -q 'ABA1F9B8875A6661'; then
+    rm -f "$CADDY_KEYRING"
+    die "Downloaded Caddy APT key does not contain the active signing key"
+  fi
 
-  cat > "$CADDY_APT_LIST" <<EOF
-$expected_source
-EOF
+  if ! curl -fsSL "$CADDY_APT_SOURCE_URL" -o "$CADDY_APT_LIST"; then
+    rm -f "$CADDY_APT_LIST"
+    die "Failed to install the official Caddy APT source"
+  fi
   chmod 0644 "$CADDY_APT_LIST"
+  grep -Fxq "$expected_source" "$CADDY_APT_LIST" || die "Official Caddy APT source is missing its signed-by configuration"
 }
 
 install_proxyctl_binary() {
