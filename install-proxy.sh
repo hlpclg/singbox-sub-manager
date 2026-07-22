@@ -5,14 +5,75 @@ umask 077
 
 DOMAIN=""
 EMAIL="admin@example.com"
+EMAIL_EXPLICIT=false
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  sudo ./install-proxy.sh <domain> [email]
+  sudo ./install-proxy.sh --domain <domain> [--email <email>]
+
+Example:
+  sudo ./install-proxy.sh sub.example.com admin@example.com
+EOF
+}
+
+POSITIONAL=()
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --domain) DOMAIN="$2"; shift 2 ;;
-    --email) EMAIL="$2"; shift 2 ;;
-    *) echo "Unknown parameter: $1" >&2; exit 1 ;;
+    install) shift ;;
+    --domain)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --domain" >&2; usage; exit 1; }
+      DOMAIN="$2"
+      shift 2
+      ;;
+    --email)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --email" >&2; usage; exit 1; }
+      EMAIL="$2"
+      EMAIL_EXPLICIT=true
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Unknown parameter: $1" >&2; usage; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
   esac
 done
+
+if [[ ${#POSITIONAL[@]} -gt 2 ]]; then
+  echo "Too many positional parameters: ${POSITIONAL[*]}" >&2
+  usage
+  exit 1
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 ]]; then
+  if [[ -n "$DOMAIN" ]]; then
+    echo "Domain provided both positionally and with --domain" >&2
+    usage
+    exit 1
+  fi
+  DOMAIN="${POSITIONAL[0]}"
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
+  if [[ "$EMAIL_EXPLICIT" == true ]]; then
+    echo "Email provided both positionally and with --email" >&2
+    usage
+    exit 1
+  fi
+  EMAIL="${POSITIONAL[1]}"
+fi
+
+if [[ -z "$DOMAIN" ]]; then
+  echo "Missing required domain" >&2
+  usage
+  exit 1
+fi
+
+if [[ "$DOMAIN" =~ :// || "$DOMAIN" == */* || "$DOMAIN" == *:* || "$DOMAIN" == *[[:space:]]* || "$DOMAIN" != *.* ]]; then
+  echo "Domain must be a hostname only, for example: sub.example.com" >&2
+  exit 1
+fi
 
 HY2_PORT="${HY2_PORT:-443}"
 NODE_NAME="${NODE_NAME:-AWS-HY2}"
@@ -34,6 +95,13 @@ LOCK_FILE="/run/lock/singbox-sub-manager.lock"
 # Not fully used in v0.2.0, pre-created for v0.3.0
 TEMPLATE_DIR="/usr/share/singbox-sub-manager/templates"
 EXAMPLES_DIR="/usr/share/singbox-sub-manager/examples"
+CADDY_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
+CADDY_APT_LIST="/etc/apt/sources.list.d/caddy-stable.list"
+CADDY_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+CADDY_APT_URL="https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
+PROXYCTL_BIN="/usr/local/bin/proxyctl"
+PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.2.1}"
 
 mkdir -p "$BASE_DIR" "$CERTS_DIR" "$STATE_DIR" "$LOG_DIR" "$SUB_ROOT" "$TEMPLATE_DIR" "$EXAMPLES_DIR"
 
@@ -64,6 +132,389 @@ log_error() {
 die() {
   log_error "$1"
   exit 1
+}
+
+apt_update_or_die() {
+  local err
+  err="$(mktemp "/tmp/apt-update.err.XXXXXX")"
+  if apt-get update -y > /dev/null 2>"$err"; then
+    rm -f "$err"
+    return
+  fi
+
+  if grep -qE 'NO_PUBKEY|EXPKEYSIG|KEYEXPIRED|not signed' "$err"; then
+    log_error "apt-get update failed because an APT repository signature could not be verified."
+  else
+    log_error "apt-get update failed."
+  fi
+  sed 's/^/apt: /' "$err" >&2
+  sed 's/^/apt: /' "$err" >> "$LOG_FILE"
+  rm -f "$err"
+  exit 1
+}
+
+reset_caddy_apt_source() {
+  install -d -m 0755 /etc/apt/sources.list.d /usr/share/keyrings
+  rm -f "$CADDY_APT_LIST" "$CADDY_KEYRING"
+}
+
+install_caddy_apt_source() {
+  local source_file
+  local expected_source="deb [signed-by=$CADDY_KEYRING] $CADDY_APT_URL any-version main"
+
+  while IFS= read -r -d '' source_file; do
+    if [[ "$source_file" != "$CADDY_APT_LIST" ]] && grep -q 'dl.cloudsmith.io/public/caddy/stable' "$source_file" 2>/dev/null; then
+      die "Conflicting Caddy APT source found: $source_file. Remove it or merge it into $CADDY_APT_LIST."
+    fi
+  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+
+  if [[ -f "$CADDY_KEYRING" && -f "$CADDY_APT_LIST" ]] && grep -Fxq "$expected_source" "$CADDY_APT_LIST"; then
+    return
+  fi
+
+  reset_caddy_apt_source
+
+  if ! curl -fsSL "$CADDY_GPG_URL" | gpg --dearmor --yes -o "$CADDY_KEYRING"; then
+    rm -f "$CADDY_KEYRING"
+    die "Failed to install Caddy APT signing key"
+  fi
+  chmod 0644 "$CADDY_KEYRING"
+
+  cat > "$CADDY_APT_LIST" <<EOF
+$expected_source
+EOF
+  chmod 0644 "$CADDY_APT_LIST"
+}
+
+install_proxyctl_binary() {
+  local cli_arch="$1"
+  local base_url="https://github.com/$PROXYCTL_REPOSITORY/releases/download/$PROXYCTL_VERSION"
+  local binary_name="proxyctl-linux-$cli_arch"
+  local tmp_dir expected actual
+
+  tmp_dir="$(mktemp -d /tmp/proxyctl.XXXXXX)"
+  log "Downloading proxyctl $PROXYCTL_VERSION for linux-$cli_arch"
+  if ! curl -fsSL "$base_url/$binary_name" -o "$tmp_dir/$binary_name" || ! curl -fsSL "$base_url/checksums.txt" -o "$tmp_dir/checksums.txt"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  expected="$(awk -v file="$binary_name" '$2 == file {print $1}' "$tmp_dir/checksums.txt")"
+  actual="$(sha256sum "$tmp_dir/$binary_name" | awk '{print $1}')"
+  if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  install -m 0755 "$tmp_dir/$binary_name" "$PROXYCTL_BIN"
+  rm -rf "$tmp_dir"
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+yaml_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+url_encode_component() {
+  local value="$1"
+  local i char hex
+  local LC_ALL=C
+
+  for ((i = 0; i < ${#value}; i++)); do
+    char="${value:i:1}"
+    case "$char" in
+      [A-Za-z0-9.~_-]) printf '%s' "$char" ;;
+      *) printf -v hex '%02X' "'$char"; printf '%%%s' "$hex" ;;
+    esac
+  done
+}
+
+validate_node_fields() {
+  local line_no="$1"
+  local name="$2"
+  local server="$3"
+  local port="$4"
+  local password="$5"
+  local obfs_password="$6"
+  local sni="$7"
+
+  if [[ -z "$name" || -z "$server" || -z "$port" || -z "$password" || -z "$obfs_password" || -z "$sni" ]]; then
+    die "nodes.conf line $line_no: empty field"
+  fi
+  if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
+    die "nodes.conf line $line_no: invalid port"
+  fi
+  if [[ "$password" == *CHANGE_ME* || "$obfs_password" == *CHANGE_ME* ]]; then
+    die "nodes.conf line $line_no: replace placeholder secrets"
+  fi
+}
+
+write_subscriptions_with_shell() {
+  local nodes_file="$1"
+  local output_dir="$2"
+  local clash_tmp sr_tmp line line_no
+  local name server port password obfs_password sni extra
+  local node_count=0 seen_nodes=$'\n'
+
+  mkdir -p "$output_dir"
+  clash_tmp="$(mktemp "$output_dir/.clash.yaml.tmp.XXXXXX")"
+  sr_tmp="$(mktemp "$output_dir/.sr.txt.tmp.XXXXXX")"
+
+  cat > "$clash_tmp" <<'EOF'
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-redirect: true
+  strict-route: true
+  mtu: 1400
+  dns-hijack:
+    - any:53
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  proxy-server-nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.msftconnecttest.com"
+    - "*.msftncsi.com"
+
+proxies:
+EOF
+
+  line_no=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$((line_no + 1))
+    line="$(trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    IFS='|' read -r name server port password obfs_password sni extra <<< "$line"
+    if [[ -n "${extra:-}" ]]; then
+      die "nodes.conf line $line_no: expected 6 fields"
+    fi
+    name="$(trim "$name")"
+    server="$(trim "$server")"
+    port="$(trim "$port")"
+    password="$(trim "$password")"
+    obfs_password="$(trim "$obfs_password")"
+    sni="$(trim "$sni")"
+    validate_node_fields "$line_no" "$name" "$server" "$port" "$password" "$obfs_password" "$sni"
+    if [[ "$seen_nodes" == *$'\n'"$name"$'\n'* ]]; then
+      die "nodes.conf line $line_no: duplicate node name $name"
+    fi
+    seen_nodes+="$name"$'\n'
+    node_count=$((node_count + 1))
+
+    {
+      printf '  - name: %s\n' "$(yaml_quote "$name")"
+      printf '    type: hysteria2\n'
+      printf '    server: %s\n' "$(yaml_quote "$server")"
+      printf '    port: %s\n' "$port"
+      printf '    password: %s\n' "$(yaml_quote "$password")"
+      printf '    obfs: salamander\n'
+      printf '    obfs-password: %s\n' "$(yaml_quote "$obfs_password")"
+      printf '    sni: %s\n' "$(yaml_quote "$sni")"
+      printf '    skip-cert-verify: true\n'
+      printf '    alpn: [h3]\n'
+    } >> "$clash_tmp"
+
+    {
+      printf 'hysteria2://%s@%s:%s/?sni=%s&insecure=1&obfs=salamander&obfs-password=%s#%s\n' \
+        "$(url_encode_component "$password")" \
+        "$server" \
+        "$port" \
+        "$(url_encode_component "$sni")" \
+        "$(url_encode_component "$obfs_password")" \
+        "$(url_encode_component "$name")"
+    } >> "$sr_tmp"
+  done < "$nodes_file"
+
+  if [[ "$node_count" -eq 0 ]]; then
+    die "nodes.conf has no nodes"
+  fi
+
+  cat >> "$clash_tmp" <<'EOF'
+
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - 自动选择
+EOF
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    IFS='|' read -r name _ <<< "$line"
+    name="$(trim "$name")"
+    printf '      - %s\n' "$(yaml_quote "$name")" >> "$clash_tmp"
+  done < "$nodes_file"
+
+  cat >> "$clash_tmp" <<'EOF'
+      - DIRECT
+
+  - name: 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+EOF
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    IFS='|' read -r name _ <<< "$line"
+    name="$(trim "$name")"
+    printf '      - %s\n' "$(yaml_quote "$name")" >> "$clash_tmp"
+  done < "$nodes_file"
+
+  cat >> "$clash_tmp" <<'EOF'
+
+rule-providers:
+  private:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.yaml
+    path: ./ruleset/private.yaml
+    interval: 86400
+  cn:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.yaml
+    path: ./ruleset/cn.yaml
+    interval: 86400
+  geolocation-cn:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/geolocation-cn.yaml
+    path: ./ruleset/geolocation-cn.yaml
+    interval: 86400
+  geolocation-not-cn:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/geolocation-!cn.yaml
+    path: ./ruleset/geolocation-not-cn.yaml
+    interval: 86400
+  google:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/google.yaml
+    path: ./ruleset/google.yaml
+    interval: 86400
+  openai:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/openai.yaml
+    path: ./ruleset/openai.yaml
+    interval: 86400
+  anthropic:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/anthropic.yaml
+    path: ./ruleset/anthropic.yaml
+    interval: 86400
+  github:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/github.yaml
+    path: ./ruleset/github.yaml
+    interval: 86400
+  apple-cn:
+    type: http
+    behavior: domain
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/apple-cn.yaml
+    path: ./ruleset/apple-cn.yaml
+    interval: 86400
+
+rules:
+  - DOMAIN,play.googleapis.com,节点选择
+  - DOMAIN,android.clients.google.com,节点选择
+  - DOMAIN,android.googleapis.com,节点选择
+  - DOMAIN-SUFFIX,play.google.com,节点选择
+  - DOMAIN-SUFFIX,googleplay.com,节点选择
+  - DOMAIN-SUFFIX,googleapis.com,节点选择
+  - DOMAIN-SUFFIX,googleapis.cn,节点选择
+  - DOMAIN-SUFFIX,gvt1.com,节点选择
+  - DOMAIN-SUFFIX,gvt2.com,节点选择
+  - DOMAIN-SUFFIX,ggpht.com,节点选择
+  - DOMAIN-SUFFIX,googleusercontent.com,节点选择
+  - DOMAIN-SUFFIX,googleusercontent.cn,节点选择
+  - DOMAIN-SUFFIX,android.com,节点选择
+  - DOMAIN-SUFFIX,google.com,节点选择
+  - DOMAIN-SUFFIX,chatgpt.com,节点选择
+  - DOMAIN-SUFFIX,openai.com,节点选择
+  - DOMAIN-SUFFIX,oaistatic.com,节点选择
+  - DOMAIN-SUFFIX,oaiusercontent.com,节点选择
+  - DOMAIN-SUFFIX,anthropic.com,节点选择
+  - DOMAIN-SUFFIX,claude.ai,节点选择
+  - DOMAIN-SUFFIX,github.com,节点选择
+  - DOMAIN-SUFFIX,githubusercontent.com,节点选择
+  - RULE-SET,google,节点选择
+  - RULE-SET,openai,节点选择
+  - RULE-SET,anthropic,节点选择
+  - RULE-SET,github,节点选择
+  - RULE-SET,private,DIRECT
+  - RULE-SET,apple-cn,DIRECT
+  - RULE-SET,cn,DIRECT
+  - RULE-SET,geolocation-cn,DIRECT
+  - RULE-SET,geolocation-not-cn,节点选择
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+EOF
+
+  mv "$clash_tmp" "$output_dir/clash.yaml"
+  mv "$sr_tmp" "$output_dir/sr.txt"
+  chmod 0644 "$output_dir/clash.yaml" "$output_dir/sr.txt"
+  log "Generated $node_count node subscription files with shell renderer"
+}
+
+run_proxyctl_merge() {
+  local nodes_file="$1"
+  local output_dir="$2"
+  local cli_arch
+  local root
+
+  cli_arch="$(arch)"
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  if command -v proxyctl >/dev/null 2>&1; then
+    proxyctl merge --nodes "$nodes_file" --output "$output_dir"
+  elif [[ -x "$root/bin/proxyctl-linux-$cli_arch" ]]; then
+    "$root/bin/proxyctl-linux-$cli_arch" merge --nodes "$nodes_file" --output "$output_dir"
+  elif command -v go >/dev/null 2>&1 && [[ -f "$root/go.mod" ]]; then
+    (cd "$root" && go run ./cmd/proxyctl merge --nodes "$nodes_file" --output "$output_dir")
+  elif install_proxyctl_binary "$cli_arch"; then
+    "$PROXYCTL_BIN" merge --nodes "$nodes_file" --output "$output_dir"
+  else
+    log_warn "proxyctl not found and automatic download failed; using built-in shell renderer."
+    write_subscriptions_with_shell "$nodes_file" "$output_dir"
+  fi
 }
 
 # 1. OS & Root Check
@@ -192,7 +643,8 @@ mkdir -p "$OUT"
 # 6. Install Dependencies
 log "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y > /dev/null
+reset_caddy_apt_source
+apt_update_or_die
 apt-get install -y curl wget tar openssl ca-certificates gnupg debian-keyring debian-archive-keyring apt-transport-https qrencode > /dev/null
 
 log "Installing sing-box"
@@ -204,11 +656,9 @@ tar -xzf "$TMP/sb.tgz" -C "$TMP"
 install -m 0755 "$TMP/sing-box-${SB_VERSION}-linux-$(arch)/sing-box" /usr/local/bin/sing-box
 
 log "Installing Caddy"
+install_caddy_apt_source
+apt_update_or_die
 if ! command -v caddy >/dev/null 2>&1; then
-  install -d -m 0755 /usr/share/keyrings
-  curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
-  apt-get update -y > /dev/null
   apt-get install -y caddy > /dev/null
 fi
 
@@ -315,16 +765,14 @@ else
   fi
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if command -v proxyctl >/dev/null 2>&1; then
-  proxyctl merge --nodes "$NODES_CONF" --output "$OUT"
-elif [[ -x "$ROOT/bin/proxyctl-linux-$(arch)" ]]; then
-  "$ROOT/bin/proxyctl-linux-$(arch)" merge --nodes "$NODES_CONF" --output "$OUT"
-elif command -v go >/dev/null 2>&1 && [[ -f "$ROOT/go.mod" ]]; then
-  (cd "$ROOT" && go run ./cmd/proxyctl merge --nodes "$NODES_CONF" --output "$OUT")
-else
-  die "proxyctl not found. Please use release package or install Go to build."
-fi
+run_proxyctl_merge "$NODES_CONF" "$OUT"
+
+# Caddy runs as the caddy user and must be able to traverse the subscription path.
+chown root:root /var/www
+chmod 0755 /var/www
+chown -R caddy:caddy "$SUB_ROOT"
+find "$SUB_ROOT" -type d -exec chmod 755 {} +
+find "$SUB_ROOT" -type f -exec chmod 644 {} +
 
 # 10. Configure Caddy
 log "Configuring Caddy"
@@ -344,22 +792,25 @@ $DOMAIN {
 EOF
 
 caddy fmt --overwrite "$CADDY_TMP" >/dev/null
-if ! caddy validate --config "$CADDY_TMP" >/dev/null 2>&1; then
+if ! CADDY_VALIDATE_ERROR="$(caddy validate --config "$CADDY_TMP" --adapter caddyfile 2>&1)"; then
+  log_error "caddy validate failed: $CADDY_VALIDATE_ERROR"
   rm -f "$CADDY_TMP"
-  die "caddy validate failed."
+  die "caddy validate failed. Review the Caddy error above and $LOG_FILE."
 fi
 
 if [[ -f "/etc/caddy/Caddyfile" ]]; then
   cp -p "/etc/caddy/Caddyfile" "/etc/caddy/Caddyfile.previous.$TS"
 fi
+chown root:caddy "$CADDY_TMP"
+chmod 0640 "$CADDY_TMP"
 mv "$CADDY_TMP" "/etc/caddy/Caddyfile"
 
 if systemctl is-active --quiet caddy; then
-  if ! caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+  if ! caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
     log_error "caddy reload failed, restoring previous config"
     if [[ -f "/etc/caddy/Caddyfile.previous.$TS" ]]; then
       mv "/etc/caddy/Caddyfile.previous.$TS" "/etc/caddy/Caddyfile"
-      caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || true
+      caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || true
       if ! systemctl is-active --quiet caddy; then
         die "caddy health check failed even after rollback."
       fi
@@ -370,12 +821,14 @@ else
   systemctl enable --now caddy
 fi
 
-chown -R caddy:caddy "$SUB_ROOT" 2>/dev/null || true
-
 # Check external & local access
 sleep 1
-if ! curl -sf --resolve "$DOMAIN:443:127.0.0.1" --connect-timeout 5 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/null; then
-  log_warn "Local curl check to Caddy failed. Check Caddy logs."
+LOCAL_SUBSCRIPTION_STATUS="$(curl -sk -o /dev/null -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" --connect-timeout 5 "https://$DOMAIN/$TOKEN/clash.yaml" || true)"
+if [[ "$LOCAL_SUBSCRIPTION_STATUS" == "403" ]]; then
+  log_error "Caddy returned HTTP 403 for the subscription after permissions were applied. Check /etc/caddy/Caddyfile and the requested token path."
+  die "Local Caddy subscription check returned HTTP 403."
+elif [[ "$LOCAL_SUBSCRIPTION_STATUS" != "200" ]]; then
+  log_warn "Local Caddy subscription check returned HTTP ${LOCAL_SUBSCRIPTION_STATUS:-000}. Check Caddy logs and DNS."
 fi
 
 if ! curl -sf --connect-timeout 10 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/null; then
