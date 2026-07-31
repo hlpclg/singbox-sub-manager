@@ -25,6 +25,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch args[0] {
+	case "node":
+		return cmdNode(args[1:], stdout, stderr)
 	case "merge":
 		return cmdMerge(args[1:], stdout, stderr)
 	case "validate":
@@ -40,6 +42,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func usage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "usage: proxyctl <command> [args]")
 	fmt.Fprintln(stderr, "commands:")
+	fmt.Fprintln(stderr, "  node     list|add|edit|remove|enable|disable|migrate")
 	fmt.Fprintln(stderr, "  merge    --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  validate --nodes nodes.conf")
 	fmt.Fprintln(stderr, "  version  -- show version")
