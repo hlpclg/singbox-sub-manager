@@ -101,7 +101,7 @@ CADDY_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
 CADDY_APT_SOURCE_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.2.1}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.2.2}"
 
 # 1. OS & Root Check (Safe Early Exit)
 if [[ "$(id -u)" -ne 0 ]]; then

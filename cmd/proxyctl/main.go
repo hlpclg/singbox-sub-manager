@@ -12,6 +12,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var Version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -22,6 +24,8 @@ func main() {
 		cmdMerge(os.Args[2:])
 	case "validate":
 		cmdValidate(os.Args[2:])
+	case "version":
+		fmt.Println(Version)
 	default:
 		usage()
 	}
@@ -32,6 +36,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  merge    --nodes nodes.conf --output DIR")
 	fmt.Fprintln(os.Stderr, "  validate --nodes nodes.conf")
+	fmt.Fprintln(os.Stderr, "  version  -- show version")
 	os.Exit(2)
 }
 
