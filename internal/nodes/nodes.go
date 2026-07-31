@@ -51,8 +51,20 @@ func validateFields(n Node) error {
 	if n.Port < 1 || n.Port > 65535 {
 		return fmt.Errorf("node %q: invalid port %d", n.Name, n.Port)
 	}
-	if strings.Contains(n.Password, "CHANGE_ME") || strings.Contains(n.ObfsPassword, "CHANGE_ME") {
-		return fmt.Errorf("node %q: replace placeholder secrets (CHANGE_ME)", n.Name)
+	fields := []struct {
+		label string
+		value string
+	}{
+		{"Name", n.Name},
+		{"Server", n.Server},
+		{"Password", n.Password},
+		{"ObfsPassword", n.ObfsPassword},
+		{"SNI", n.SNI},
+	}
+	for _, f := range fields {
+		if strings.Contains(f.value, "CHANGE_ME") {
+			return fmt.Errorf("node %q: replace placeholder secret in field %s (CHANGE_ME)", n.Name, f.label)
+		}
 	}
 	return nil
 }

@@ -90,6 +90,20 @@ func TestLoadRejectsChangeMe(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsChangeMeInServer(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=CHANGE_ME\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected CHANGE_ME rejection for SERVER field")
+	}
+}
+
+func TestLoadRejectsChangeMeInSNI(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=CHANGE_ME\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected CHANGE_ME rejection for SNI field")
+	}
+}
+
 func TestLoadRejectsDuplicateName(t *testing.T) {
 	p := writeTemp(t, "JP|1.2.3.4|443|p|o|s\nJP|5.6.7.8|443|p|o|s\n")
 	if _, _, err := Load(p); err == nil {
