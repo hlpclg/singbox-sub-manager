@@ -97,3 +97,55 @@ func TestRunInvalidFlags(t *testing.T) {
 		t.Errorf("expected exit code 2 for invalid flag in validate, got %d", code)
 	}
 }
+
+func TestSubscriptionBuildEqualsMerge(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "nodes.conf")
+	content := "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p1\nOBFS_PASSWORD=o1\nSNI=www.bing.com\nENABLED=true\n"
+	if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(tmp, "out")
+	var so, se bytes.Buffer
+	if code := run([]string{"subscription", "build", "--nodes", p, "--output", out}, &so, &se); code != 0 {
+		t.Fatalf("subscription build code=%d err=%s", code, se.String())
+	}
+	if _, err := os.Stat(filepath.Join(out, "clash.yaml")); err != nil {
+		t.Fatalf("clash.yaml not generated: %v", err)
+	}
+}
+
+func TestMergeExcludesDisabled(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "nodes.conf")
+	content := "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p1\nOBFS_PASSWORD=o1\nSNI=www.bing.com\nENABLED=true\n\n[US]\nSERVER=5.6.7.8\nPORT=443\nPASSWORD=p2\nOBFS_PASSWORD=o2\nSNI=www.apple.com\nENABLED=false\n"
+	if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(tmp, "out")
+	var so, se bytes.Buffer
+	if code := run([]string{"merge", "--nodes", p, "--output", out}, &so, &se); code != 0 {
+		t.Fatalf("merge code=%d err=%s", code, se.String())
+	}
+	data, _ := os.ReadFile(filepath.Join(out, "sr.txt"))
+	if strings.Contains(string(data), "US") {
+		t.Fatalf("disabled node US leaked into subscription: %s", string(data))
+	}
+	if !strings.Contains(string(data), "JP") {
+		t.Fatalf("enabled node JP missing: %s", string(data))
+	}
+}
+
+func TestMergeAllDisabledErrors(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "nodes.conf")
+	content := "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p1\nOBFS_PASSWORD=o1\nSNI=www.bing.com\nENABLED=false\n"
+	if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(tmp, "out")
+	var so, se bytes.Buffer
+	if code := run([]string{"merge", "--nodes", p, "--output", out}, &so, &se); code == 0 {
+		t.Fatal("expected error when all nodes disabled")
+	}
+}

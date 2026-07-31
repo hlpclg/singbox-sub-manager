@@ -31,6 +31,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdMerge(args[1:], stdout, stderr)
 	case "validate":
 		return cmdValidate(args[1:], stdout, stderr)
+	case "subscription":
+		return cmdSubscription(args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, Version)
 		return 0
@@ -45,6 +47,7 @@ func usage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "  node     list|add|edit|remove|enable|disable|migrate")
 	fmt.Fprintln(stderr, "  merge    --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  validate --nodes nodes.conf")
+	fmt.Fprintln(stderr, "  subscription build --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  version  -- show version")
 	return 2
 }
@@ -61,6 +64,11 @@ func cmdMerge(args []string, stdout, stderr io.Writer) int {
 	ns, err := nodes.ParseFile(*nodeFile)
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	ns = nodes.Enabled(ns)
+	if len(ns) == 0 {
+		fmt.Fprintln(stderr, "error: no enabled nodes")
 		return 1
 	}
 	if err := render.Write(*output, ns); err != nil {
@@ -82,6 +90,11 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	ns, err := nodes.ParseFile(*nodeFile)
 	if err != nil {
 		fmt.Fprintln(stderr, "validation failed: nodes.conf error:", err)
+		return 1
+	}
+	ns = nodes.Enabled(ns)
+	if len(ns) == 0 {
+		fmt.Fprintln(stderr, "validation failed: no enabled nodes")
 		return 1
 	}
 
@@ -175,4 +188,12 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout, "validation passed")
 	return 0
+}
+
+func cmdSubscription(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 || args[0] != "build" {
+		fmt.Fprintln(stderr, "usage: proxyctl subscription build --nodes nodes.conf --output DIR")
+		return 2
+	}
+	return cmdMerge(args[1:], stdout, stderr)
 }

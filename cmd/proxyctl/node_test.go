@@ -136,3 +136,25 @@ func TestNodeRemoveMissing(t *testing.T) {
 		t.Fatal("expected error removing missing node")
 	}
 }
+
+func TestNodeMigrateLegacyToSectioned(t *testing.T) {
+	p := writeNodes(t, "JP|1.2.3.4|443|p1|o1|www.bing.com\nUS|5.6.7.8|443|p2|o2|www.apple.com\n")
+	var out, errb bytes.Buffer
+	if code := run([]string{"node", "migrate", "--nodes", p}, &out, &errb); code != 0 {
+		t.Fatalf("migrate code=%d err=%s", code, errb.String())
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "[JP]") || !strings.Contains(string(data), "ENABLED=true") {
+		t.Fatalf("migrated file: %s", string(data))
+	}
+	bak, err := os.ReadFile(p + ".bak")
+	if err != nil || !strings.Contains(string(bak), "JP|1.2.3.4") {
+		t.Fatalf("backup missing/wrong: %q err=%v", string(bak), err)
+	}
+	// Re-running on an already-sectioned file is a no-op success.
+	out.Reset()
+	errb.Reset()
+	if code := run([]string{"node", "migrate", "--nodes", p}, &out, &errb); code != 0 {
+		t.Fatalf("second migrate code=%d err=%s", code, errb.String())
+	}
+}

@@ -338,10 +338,30 @@ func cmdNodeEdit(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// cmdNodeMigrate is a TEMPORARY stub for the command implemented in Task 5.
-// It exists only so this package compiles and the node dispatcher above can
-// route to it.
 func cmdNodeMigrate(args []string, stdout, stderr io.Writer) int {
-	fmt.Fprintln(stderr, "not implemented")
-	return 1
+	fs := flag.NewFlagSet("node migrate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("nodes", defaultNodesPath, "node configuration file")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ns, format, err := nodes.Load(*path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	switch format {
+	case nodes.FormatSectioned:
+		fmt.Fprintln(stdout, "already in sectioned format; nothing to do")
+		return 0
+	case nodes.FormatEmpty:
+		fmt.Fprintln(stderr, "error: no nodes to migrate")
+		return 1
+	}
+	if err := nodes.WriteFile(*path, ns); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "migrated %d node(s); backup at %s.bak\n", len(ns), *path)
+	return 0
 }
