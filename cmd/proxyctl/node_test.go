@@ -54,6 +54,69 @@ func TestNodeRemove(t *testing.T) {
 	}
 }
 
+func TestNodeAddViaFlags(t *testing.T) {
+	p := writeNodes(t, sectioned)
+	var out, errb bytes.Buffer
+	code := run([]string{"node", "add",
+		"--name", "SG", "--server", "9.9.9.9", "--port", "443",
+		"--password", "p3", "--obfs-password", "o3", "--sni", "www.bing.com",
+		"--nodes", p}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("add code=%d err=%s", code, errb.String())
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "[SG]") || !strings.Contains(string(data), "ENABLED=true") {
+		t.Fatalf("file after add: %s", string(data))
+	}
+}
+
+func TestNodeAddMissingFieldNonTTYErrors(t *testing.T) {
+	p := writeNodes(t, sectioned)
+	var out, errb bytes.Buffer
+	// No --password; go test stdin is not a TTY, so it must error, not hang.
+	code := run([]string{"node", "add",
+		"--name", "SG", "--server", "9.9.9.9", "--port", "443",
+		"--obfs-password", "o3", "--sni", "www.bing.com",
+		"--nodes", p}, &out, &errb)
+	if code == 0 {
+		t.Fatal("expected error for missing field on non-TTY")
+	}
+	if !strings.Contains(errb.String(), "password") {
+		t.Fatalf("expected missing-field message, got: %s", errb.String())
+	}
+}
+
+func TestNodeEditPartialAndRename(t *testing.T) {
+	p := writeNodes(t, sectioned)
+	var out, errb bytes.Buffer
+	// Change only the port of JP.
+	if code := run([]string{"node", "edit", "JP", "--port", "8888", "--nodes", p}, &out, &errb); code != 0 {
+		t.Fatalf("edit port code=%d err=%s", code, errb.String())
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "PORT=8888") {
+		t.Fatalf("port not updated: %s", string(data))
+	}
+	// Rename JP -> JP2.
+	out.Reset()
+	errb.Reset()
+	if code := run([]string{"node", "edit", "JP", "--name", "JP2", "--nodes", p}, &out, &errb); code != 0 {
+		t.Fatalf("edit rename code=%d err=%s", code, errb.String())
+	}
+	data, _ = os.ReadFile(p)
+	if !strings.Contains(string(data), "[JP2]") || strings.Contains(string(data), "[JP]") {
+		t.Fatalf("rename failed: %s", string(data))
+	}
+}
+
+func TestNodeEditRenameCollision(t *testing.T) {
+	p := writeNodes(t, sectioned)
+	var out, errb bytes.Buffer
+	if code := run([]string{"node", "edit", "JP", "--name", "US", "--nodes", p}, &out, &errb); code == 0 {
+		t.Fatal("expected rename collision error")
+	}
+}
+
 func TestNodeMutationRefusesLegacy(t *testing.T) {
 	p := writeNodes(t, "JP|1.2.3.4|443|p|o|www.bing.com\n")
 	var out, errb bytes.Buffer

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"golang.org/x/term"
 )
 
 const defaultNodesPath = "/etc/singbox-sub-manager/nodes.conf"
@@ -160,20 +164,183 @@ func cmdNodeRemove(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// The following are TEMPORARY stubs for commands implemented in later tasks
-// (Task 4: add/edit, Task 5: migrate). They exist only so this package
-// compiles and the node dispatcher above can route to them.
+func isTTY(f *os.File) bool {
+	return term.IsTerminal(int(f.Fd()))
+}
+
+func promptLine(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func promptSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// resolveField returns the flag value if non-empty; otherwise prompts on a TTY,
+// or records a missing-field error when non-interactive.
+func resolveField(name, val string, secret bool, missing *[]string) string {
+	if val != "" {
+		return val
+	}
+	if !isTTY(os.Stdin) {
+		*missing = append(*missing, name)
+		return ""
+	}
+	var got string
+	if secret {
+		got, _ = promptSecret(fmt.Sprintf("%s: ", name))
+	} else {
+		got, _ = promptLine(fmt.Sprintf("%s: ", name))
+	}
+	return got
+}
 
 func cmdNodeAdd(args []string, stdout, stderr io.Writer) int {
-	fmt.Fprintln(stderr, "not implemented")
-	return 1
+	fs := flag.NewFlagSet("node add", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("nodes", defaultNodesPath, "node configuration file")
+	name := fs.String("name", "", "node name")
+	server := fs.String("server", "", "server address")
+	port := fs.Int("port", 0, "port")
+	password := fs.String("password", "", "password")
+	obfs := fs.String("obfs-password", "", "obfs password")
+	sni := fs.String("sni", "", "sni")
+	enabled := fs.Bool("enabled", true, "enabled")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	var missing []string
+	nName := resolveField("name", *name, false, &missing)
+	nServer := resolveField("server", *server, false, &missing)
+	nSNI := resolveField("sni", *sni, false, &missing)
+	nPassword := resolveField("password", *password, true, &missing)
+	nObfs := resolveField("obfs-password", *obfs, true, &missing)
+	nPort := *port
+	if nPort == 0 {
+		if !isTTY(os.Stdin) {
+			missing = append(missing, "port")
+		} else if v, err := promptLine("port: "); err == nil {
+			nPort, _ = strconv.Atoi(v)
+		}
+	}
+	if len(missing) > 0 {
+		fmt.Fprintf(stderr, "error: missing required field(s): %s\n", strings.Join(missing, ", "))
+		return 2
+	}
+
+	ns, ok := loadForMutation(*path, stderr)
+	if !ok {
+		return 1
+	}
+	updated, err := nodes.Add(ns, nodes.Node{
+		Name: nName, Server: nServer, Port: nPort,
+		Password: nPassword, ObfsPassword: nObfs, SNI: nSNI, Enabled: *enabled,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if err := nodes.WriteFile(*path, updated); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "added node %q\n", nName)
+	return 0
 }
 
+// cmdNodeEdit expects the node name as a leading positional argument, e.g.
+// "node edit JP --port 8888 --nodes PATH". flag.FlagSet.Parse stops at the
+// first non-flag argument, so calling fs.Parse on the full args slice would
+// treat "JP" as ending the flag section and silently ignore every flag that
+// follows it. To avoid that, the positional name is pulled off args[0]
+// ourselves before handing the remainder to fs.Parse.
 func cmdNodeEdit(args []string, stdout, stderr io.Writer) int {
-	fmt.Fprintln(stderr, "not implemented")
-	return 1
+	fs := flag.NewFlagSet("node edit", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("nodes", defaultNodesPath, "node configuration file")
+	newName := fs.String("name", "", "new node name")
+	server := fs.String("server", "", "server address")
+	port := fs.Int("port", 0, "port")
+	password := fs.String("password", "", "password")
+	obfs := fs.String("obfs-password", "", "obfs password")
+	sni := fs.String("sni", "", "sni")
+	var enabled bool
+	fs.BoolVar(&enabled, "enabled", true, "enabled")
+
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		fmt.Fprintln(stderr, "error: node name required")
+		return 2
+	}
+	target := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+
+	// Track which flags were explicitly set so unset flags leave fields untouched.
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	ns, ok := loadForMutation(*path, stderr)
+	if !ok {
+		return 1
+	}
+	idx, found := nodes.Find(ns, target)
+	if !found {
+		fmt.Fprintf(stderr, "error: node %q not found\n", target)
+		return 1
+	}
+	n := ns[idx]
+	if set["name"] {
+		n.Name = *newName
+	}
+	if set["server"] {
+		n.Server = *server
+	}
+	if set["port"] {
+		n.Port = *port
+	}
+	if set["password"] {
+		n.Password = *password
+	}
+	if set["obfs-password"] {
+		n.ObfsPassword = *obfs
+	}
+	if set["sni"] {
+		n.SNI = *sni
+	}
+	if set["enabled"] {
+		n.Enabled = enabled
+	}
+
+	updated, err := nodes.Replace(ns, target, n)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if err := nodes.WriteFile(*path, updated); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "updated node %q\n", n.Name)
+	return 0
 }
 
+// cmdNodeMigrate is a TEMPORARY stub for the command implemented in Task 5.
+// It exists only so this package compiles and the node dispatcher above can
+// route to it.
 func cmdNodeMigrate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stderr, "not implemented")
 	return 1
