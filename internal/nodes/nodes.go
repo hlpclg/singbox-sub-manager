@@ -1,10 +1,10 @@
 package nodes
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"os"
-	"strconv"
+	"regexp"
 	"strings"
 )
 
@@ -15,53 +15,99 @@ type Node struct {
 	Password     string
 	ObfsPassword string
 	SNI          string
+	Enabled      bool
 }
 
+type Format int
+
+const (
+	FormatEmpty Format = iota
+	FormatLegacy
+	FormatSectioned
+)
+
+var nameRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ValidateName enforces the node-name charset (usable as a section header and
+// as a Clash proxy name).
+func ValidateName(name string) error {
+	if name == "" {
+		return errors.New("node name is empty")
+	}
+	if !nameRE.MatchString(name) {
+		return fmt.Errorf("invalid node name %q: allowed chars are letters, digits, '.', '_', '-'", name)
+	}
+	return nil
+}
+
+// validateFields runs the shared field checks used by both parsers.
+func validateFields(n Node) error {
+	if err := ValidateName(n.Name); err != nil {
+		return err
+	}
+	if n.Server == "" || n.Password == "" || n.ObfsPassword == "" || n.SNI == "" {
+		return fmt.Errorf("node %q: empty required field", n.Name)
+	}
+	if n.Port < 1 || n.Port > 65535 {
+		return fmt.Errorf("node %q: invalid port %d", n.Name, n.Port)
+	}
+	if strings.Contains(n.Password, "CHANGE_ME") || strings.Contains(n.ObfsPassword, "CHANGE_ME") {
+		return fmt.Errorf("node %q: replace placeholder secrets (CHANGE_ME)", n.Name)
+	}
+	return nil
+}
+
+// Load reads a node file in either legacy pipe or sectioned key=value format.
+// A missing file or one with no meaningful content returns (nil, FormatEmpty, nil).
+func Load(path string) ([]Node, Format, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, FormatEmpty, nil
+		}
+		return nil, FormatEmpty, err
+	}
+	lines := strings.Split(string(data), "\n")
+	format := detectFormat(lines)
+	switch format {
+	case FormatEmpty:
+		return nil, FormatEmpty, nil
+	case FormatSectioned:
+		ns, err := parseSectioned(lines)
+		return ns, FormatSectioned, err
+	default:
+		ns, err := parseLegacy(lines)
+		return ns, FormatLegacy, err
+	}
+}
+
+// ParseFile keeps the strict behavior relied on by merge/validate: an empty set
+// is an error.
 func ParseFile(path string) ([]Node, error) {
-	f, err := os.Open(path)
+	ns, _, err := Load(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	if len(ns) == 0 {
+		return nil, errors.New("no nodes found")
+	}
+	return ns, nil
+}
 
-	var out []Node
-	s := bufio.NewScanner(f)
-	lineNo := 0
-	seen := map[string]bool{}
-	for s.Scan() {
-		lineNo++
-		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+func isMeaningful(line string) bool {
+	t := strings.TrimSpace(line)
+	return t != "" && !strings.HasPrefix(t, "#")
+}
+
+func detectFormat(lines []string) Format {
+	for _, l := range lines {
+		if !isMeaningful(l) {
 			continue
 		}
-		parts := strings.Split(line, "|")
-		if len(parts) != 6 {
-			return nil, fmt.Errorf("line %d: expected 6 fields", lineNo)
+		if strings.HasPrefix(strings.TrimSpace(l), "[") {
+			return FormatSectioned
 		}
-		for i := range parts {
-			parts[i] = strings.TrimSpace(parts[i])
-		}
-		port, err := strconv.Atoi(parts[2])
-		if err != nil || port < 1 || port > 65535 {
-			return nil, fmt.Errorf("line %d: invalid port", lineNo)
-		}
-		if seen[parts[0]] {
-			return nil, fmt.Errorf("line %d: duplicate node name %q", lineNo, parts[0])
-		}
-		if parts[0] == "" || parts[1] == "" || parts[3] == "" || parts[4] == "" || parts[5] == "" {
-			return nil, fmt.Errorf("line %d: empty field", lineNo)
-		}
-		if strings.Contains(parts[3], "CHANGE_ME") || strings.Contains(parts[4], "CHANGE_ME") {
-			return nil, fmt.Errorf("line %d: replace placeholder secrets", lineNo)
-		}
-		seen[parts[0]] = true
-		out = append(out, Node{Name: parts[0], Server: parts[1], Port: port, Password: parts[3], ObfsPassword: parts[4], SNI: parts[5]})
+		return FormatLegacy
 	}
-	if err := s.Err(); err != nil {
-		return nil, err
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no nodes found")
-	}
-	return out, nil
+	return FormatEmpty
 }
