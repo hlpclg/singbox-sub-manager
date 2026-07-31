@@ -66,7 +66,16 @@ func parseSectioned(lines []string) ([]Node, error) {
 			return fmt.Errorf("node %q: invalid port %q", cur.Name, curPort)
 		}
 		cur.Port = port
-		cur.Enabled = curEnabled != "false" // default true; only explicit false disables
+		switch {
+		case curEnabled == "":
+			cur.Enabled = true // absent defaults to enabled
+		case strings.EqualFold(curEnabled, "true"):
+			cur.Enabled = true
+		case strings.EqualFold(curEnabled, "false"):
+			cur.Enabled = false
+		default:
+			return fmt.Errorf("node %q: invalid ENABLED value %q (want true or false)", cur.Name, curEnabled)
+		}
 		if err := validateFields(*cur); err != nil {
 			return err
 		}

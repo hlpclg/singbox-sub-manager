@@ -239,7 +239,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.2.2`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.3.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；

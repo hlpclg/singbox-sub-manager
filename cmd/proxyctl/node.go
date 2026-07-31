@@ -68,6 +68,9 @@ func extractNodesFlag(args []string, stderr io.Writer) (path string, rest []stri
 			path = strings.TrimPrefix(a, "--nodes=")
 		case strings.HasPrefix(a, "-nodes="):
 			path = strings.TrimPrefix(a, "-nodes=")
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintf(stderr, "error: unknown flag: %s\n", a)
+			return "", nil, false
 		default:
 			rest = append(rest, a)
 		}

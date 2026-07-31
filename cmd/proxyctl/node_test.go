@@ -129,6 +129,18 @@ func TestNodeMutationRefusesLegacy(t *testing.T) {
 	}
 }
 
+func TestNodeDisableRejectsUnknownFlag(t *testing.T) {
+	p := writeNodes(t, sectioned)
+	var out, errb bytes.Buffer
+	code := run([]string{"node", "disable", "US", "--bogus", "--nodes", p}, &out, &errb)
+	if code != 2 {
+		t.Fatalf("expected exit code 2 for unknown flag, got %d (stderr=%s)", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "unknown flag") || !strings.Contains(errb.String(), "--bogus") {
+		t.Fatalf("expected stderr to mention unknown flag --bogus, got: %s", errb.String())
+	}
+}
+
 func TestNodeRemoveMissing(t *testing.T) {
 	p := writeNodes(t, sectioned)
 	var out, errb bytes.Buffer

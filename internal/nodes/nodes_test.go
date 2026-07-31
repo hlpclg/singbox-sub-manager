@@ -54,6 +54,37 @@ func TestLoadSectionedEnabledDefaultsTrue(t *testing.T) {
 	}
 }
 
+func TestLoadSectionedEnabledFalseDisables(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=pass\nOBFS_PASSWORD=obfs\nSNI=www.bing.com\nENABLED=false\n")
+	ns, _, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ns[0].Enabled {
+		t.Fatalf("ENABLED=false should disable")
+	}
+}
+
+func TestLoadSectionedEnabledCaseInsensitiveTrue(t *testing.T) {
+	for _, v := range []string{"TRUE", "True", "true"} {
+		p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=pass\nOBFS_PASSWORD=obfs\nSNI=www.bing.com\nENABLED="+v+"\n")
+		ns, _, err := Load(p)
+		if err != nil {
+			t.Fatalf("Load(ENABLED=%s): %v", v, err)
+		}
+		if !ns[0].Enabled {
+			t.Fatalf("ENABLED=%s should enable", v)
+		}
+	}
+}
+
+func TestLoadSectionedEnabledInvalidValueRejected(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=pass\nOBFS_PASSWORD=obfs\nSNI=www.bing.com\nENABLED=flase\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error for invalid ENABLED value 'flase'")
+	}
+}
+
 func TestLoadEmptyFileIsFormatEmpty(t *testing.T) {
 	p := writeTemp(t, "# only a comment\n")
 	ns, format, err := Load(p)
