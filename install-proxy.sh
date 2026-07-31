@@ -99,9 +99,15 @@ CADDY_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
 CADDY_APT_LIST="/etc/apt/sources.list.d/caddy-stable.list"
 CADDY_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
 CADDY_APT_SOURCE_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
+CADDY_SIGNING_FINGERPRINT="2F5C3BE9886ACD2913299EFBABA1F9B8875A6661"
+CADDY_APT_BACKUP_ORIGINALS=()
+CADDY_APT_BACKUP_FILES=()
+CADDY_APT_BOOTSTRAP_ORIGINALS=()
+CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
 PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.2.2}"
+PROXYCTL_VALIDATED_BIN=""
 
 # 1. OS & Root Check (Safe Early Exit)
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -182,83 +188,200 @@ apt_update_or_die() {
   sed 's/^/apt: /' "$err" >&2
   sed 's/^/apt: /' "$err" >> "$LOG_FILE"
   rm -f "$err"
-  exit 1
+  return 1
 }
 
-remove_legacy_caddy_apt_sources() {
-  local source_file
+validate_caddy_apt_source() {
+  local source_file="$1" line normalized active_count=0
+  local expected="deb [signed-by=$CADDY_KEYRING] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
 
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+    normalized="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[[:space:]][[:space:]]*/ /g')"
+    [[ "$normalized" == "$expected" ]] || return 1
+    ((active_count += 1))
+  done < "$source_file"
+
+  [[ "$active_count" -eq 1 ]]
+}
+
+backup_caddy_apt_state() {
+  local backup_dir="$1" source_dir source_file backup_file index=0 count
+  source_dir="$(dirname "$CADDY_APT_LIST")"
+  CADDY_APT_BACKUP_ORIGINALS=()
+  CADDY_APT_BACKUP_FILES=()
+
+  if [[ -f "$CADDY_KEYRING" ]]; then
+    CADDY_APT_BACKUP_ORIGINALS+=("$CADDY_KEYRING")
+  fi
   while IFS= read -r -d '' source_file; do
-    [[ "$source_file" == "$CADDY_APT_LIST" ]] && continue
-    grep -q 'dl.cloudsmith.io/public/caddy/stable' "$source_file" 2>/dev/null || continue
-
-    if [[ "$source_file" == *.list ]]; then
-      if grep -vE '^[[:space:]]*(#|$)' "$source_file" | grep -qv 'dl.cloudsmith.io/public/caddy/stable'; then
-        die "Legacy Caddy source is mixed with other repositories: $source_file. Remove the Caddy entry manually."
+    if [[ "$source_file" == "$CADDY_APT_LIST" ]] || grep -q 'dl.cloudsmith.io/public/caddy/stable' "$source_file" 2>/dev/null; then
+      if [[ "$source_file" != "$CADDY_APT_LIST" ]] && ! validate_caddy_apt_source "$source_file"; then
+        log_error "Legacy Caddy source is mixed with or differs from the official repository: $source_file"
+        return 1
       fi
-    elif [[ "$source_file" == *.sources ]]; then
-      if ! grep -qE '^[[:space:]]*URIs:[[:space:]]*https://dl\.cloudsmith\.io/public/caddy/stable' "$source_file" || grep -E '^[[:space:]]*URIs:' "$source_file" | grep -qv 'dl.cloudsmith.io/public/caddy/stable'; then
-        die "Legacy Caddy source is mixed with other repositories: $source_file. Remove the Caddy entry manually."
-      fi
+      CADDY_APT_BACKUP_ORIGINALS+=("$source_file")
     fi
+  done < <(find "$source_dir" -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
 
-    log "Removing legacy Caddy APT source: $source_file"
-    rm -f "$source_file"
-  done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null)
+  count="${#CADDY_APT_BACKUP_ORIGINALS[@]}"
+  for ((index = 0; index < count; index += 1)); do
+    source_file="${CADDY_APT_BACKUP_ORIGINALS[$index]}"
+    backup_file="$backup_dir/$index"
+    if ! mv "$source_file" "$backup_file"; then
+      restore_caddy_apt_state "$backup_dir"
+      return 1
+    fi
+    CADDY_APT_BACKUP_FILES+=("$backup_file")
+  done
 }
 
-reset_caddy_apt_source() {
-  install -d -m 0755 /etc/apt/sources.list.d /usr/share/keyrings
-  remove_legacy_caddy_apt_sources
+restore_caddy_apt_state() {
+  local backup_dir="$1" index count
   rm -f "$CADDY_APT_LIST" "$CADDY_KEYRING"
+  count="${#CADDY_APT_BACKUP_ORIGINALS[@]}"
+  for ((index = 0; index < count; index += 1)); do
+    [[ -e "${CADDY_APT_BACKUP_FILES[$index]}" ]] && mv "${CADDY_APT_BACKUP_FILES[$index]}" "${CADDY_APT_BACKUP_ORIGINALS[$index]}"
+  done
+  rm -rf "$backup_dir"
+}
+
+discard_caddy_apt_state_backup() {
+  rm -rf "$1"
+}
+
+prepare_caddy_apt_bootstrap() {
+  local source_dir
+  source_dir="$(dirname "$CADDY_APT_LIST")"
+  install -d -m 0755 "$source_dir" "$(dirname "$CADDY_KEYRING")"
+  CADDY_APT_BOOTSTRAP_DIR="$(mktemp -d "$source_dir/.caddy-apt-bootstrap.XXXXXX")"
+  if ! backup_caddy_apt_state "$CADDY_APT_BOOTSTRAP_DIR"; then
+    discard_caddy_apt_state_backup "$CADDY_APT_BOOTSTRAP_DIR"
+    CADDY_APT_BOOTSTRAP_DIR=""
+    return 1
+  fi
+  CADDY_APT_BOOTSTRAP_ORIGINALS=()
+  CADDY_APT_BOOTSTRAP_FILES=()
+  local index backup_count="${#CADDY_APT_BACKUP_ORIGINALS[@]}"
+  for ((index = 0; index < backup_count; index += 1)); do
+    CADDY_APT_BOOTSTRAP_ORIGINALS+=("${CADDY_APT_BACKUP_ORIGINALS[$index]}")
+    CADDY_APT_BOOTSTRAP_FILES+=("${CADDY_APT_BACKUP_FILES[$index]}")
+  done
+}
+
+restore_caddy_apt_bootstrap() {
+  [[ -n "${CADDY_APT_BOOTSTRAP_DIR:-}" ]] || return 0
+  CADDY_APT_BACKUP_ORIGINALS=()
+  CADDY_APT_BACKUP_FILES=()
+  local index bootstrap_count="${#CADDY_APT_BOOTSTRAP_ORIGINALS[@]}"
+  for ((index = 0; index < bootstrap_count; index += 1)); do
+    CADDY_APT_BACKUP_ORIGINALS+=("${CADDY_APT_BOOTSTRAP_ORIGINALS[$index]}")
+    CADDY_APT_BACKUP_FILES+=("${CADDY_APT_BOOTSTRAP_FILES[$index]}")
+  done
+  restore_caddy_apt_state "$CADDY_APT_BOOTSTRAP_DIR"
+  CADDY_APT_BOOTSTRAP_DIR=""
+  CADDY_APT_BOOTSTRAP_ORIGINALS=()
+  CADDY_APT_BOOTSTRAP_FILES=()
+}
+
+bootstrap_caddy_apt_before_dependencies() {
+  prepare_caddy_apt_bootstrap || return 1
+  if ! apt_update_or_die; then
+    restore_caddy_apt_bootstrap
+    return 1
+  fi
 }
 
 install_caddy_apt_source() {
-  reset_caddy_apt_source
+  (
+  local key_tmp source_tmp keyring_tmp source_install_tmp state_backup
+  local keyring_dir source_dir activated=0
+  keyring_dir="$(dirname "$CADDY_KEYRING")"
+  source_dir="$(dirname "$CADDY_APT_LIST")"
+  install -d -m 0755 "$keyring_dir" "$source_dir"
 
-  local key_tmp
-  local source_tmp
   key_tmp="$(mktemp "/tmp/caddy-key.XXXXXX")"
   source_tmp="$(mktemp "/tmp/caddy-source.XXXXXX")"
+  keyring_tmp="$(mktemp "$keyring_dir/.caddy-keyring.tmp.XXXXXX")"
+  source_install_tmp="$(mktemp "$source_dir/.caddy-source.tmp.XXXXXX")"
+  cleanup_caddy_apt_source() {
+    rm -f "$key_tmp" "$source_tmp" "$keyring_tmp" "$source_install_tmp"
+    if [[ "$activated" -eq 0 && -n "${state_backup:-}" ]]; then
+      restore_caddy_apt_state "$state_backup"
+    fi
+  }
+  trap cleanup_caddy_apt_source EXIT
 
   if ! curl -fsSL "$CADDY_GPG_URL" -o "$key_tmp"; then
-    rm -f "$key_tmp" "$source_tmp"
     die "Failed to download Caddy APT signing key"
   fi
 
   if ! curl -fsSL "$CADDY_APT_SOURCE_URL" -o "$source_tmp"; then
-    rm -f "$key_tmp" "$source_tmp"
     die "Failed to download the official Caddy APT source"
   fi
 
-  if ! gpg --batch --show-keys "$key_tmp" >/dev/null 2>&1; then
-    rm -f "$key_tmp" "$source_tmp"
-    die "Downloaded Caddy signing key is invalid"
+  if ! gpg --batch --show-keys --with-colons "$key_tmp" 2>/dev/null |
+    awk -F: -v expected="$CADDY_SIGNING_FINGERPRINT" \
+      '$1 == "fpr" && $10 == expected { found=1 } END { exit(found ? 0 : 1) }'
+  then
+    die "Downloaded Caddy signing key fingerprint mismatch"
   fi
 
-  rm -f "$CADDY_KEYRING"
-  if ! gpg --batch --yes --dearmor --output "$CADDY_KEYRING" "$key_tmp"; then
-    rm -f "$key_tmp" "$source_tmp"
+  validate_caddy_apt_source "$source_tmp" || die "Downloaded Caddy APT source is not the exact official repository entry"
+
+  if ! gpg --batch --yes --dearmor --output "$keyring_tmp" "$key_tmp"; then
     die "Failed to dearmor Caddy APT signing key"
   fi
-  chmod 0644 "$CADDY_KEYRING"
+  chmod 0644 "$keyring_tmp"
+  install -m 0644 "$source_tmp" "$source_install_tmp"
 
-  install -m 0644 "$source_tmp" "$CADDY_APT_LIST"
-  rm -f "$key_tmp" "$source_tmp"
+  state_backup="$(mktemp -d "$source_dir/.caddy-apt-state.XXXXXX")"
+  backup_caddy_apt_state "$state_backup" || die "Failed to safely back up existing Caddy APT configuration"
+  mv -f "$keyring_tmp" "$CADDY_KEYRING" || die "Failed to activate Caddy APT signing key"
+  mv -f "$source_install_tmp" "$CADDY_APT_LIST" || die "Failed to activate Caddy APT source"
+  activated=1
+  discard_caddy_apt_state_backup "$state_backup"
+  cleanup_caddy_apt_source
+  trap - EXIT
+  )
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
 }
 
 install_proxyctl() {
   log "Installing proxyctl"
+  PROXYCTL_VALIDATED_BIN=""
 
-  if command -v proxyctl >/dev/null 2>&1; then
-    return 0
+  local existing_sha recorded_sha existing_ver
+  if [[ -x "$PROXYCTL_BIN" && -f "${PROXYCTL_BIN}.sha256" ]]; then
+    existing_sha="$(sha256_file "$PROXYCTL_BIN" 2>/dev/null || true)"
+    recorded_sha="$(tr -d '[:space:]' < "${PROXYCTL_BIN}.sha256")"
+    if [[ -n "$existing_sha" && "$recorded_sha" == "$existing_sha" ]]; then
+      existing_ver="$("$PROXYCTL_BIN" version 2>/dev/null || true)"
+    else
+      existing_ver=""
+    fi
+    if [[ "$existing_ver" == "$PROXYCTL_VERSION" ]]; then
+      PROXYCTL_VALIDATED_BIN="$PROXYCTL_BIN"
+      return 0
+    fi
+    log "Installed proxyctl cannot be reused; downloading a verified replacement."
   fi
 
-  local arch asset url tmp
+  local arch asset url tmp chk_url chk_tmp expected_sha256 expected_count
   case "$(uname -m)" in
     x86_64|amd64) arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
     *)
+      PROXYCTL_VALIDATED_BIN=""
       log_warn "Unsupported proxyctl architecture; using shell renderer."
       return 1
       ;;
@@ -272,35 +395,50 @@ install_proxyctl() {
 
   if ! curl -fsSL "$url" -o "$tmp" || ! curl -fsSL "$chk_url" -o "$chk_tmp"; then
     rm -f "$tmp" "$chk_tmp"
+    PROXYCTL_VALIDATED_BIN=""
     log_warn "Failed to download proxyctl or checksums; using shell renderer."
     return 1
   fi
 
-  local expected_sha256 expected_line
-  expected_line="$(grep -E "^[A-Fa-f0-9]{64}[[:space:]]+\*?${asset}$" "$chk_tmp" | head -n 1)"
-  if [[ -z "$expected_line" ]]; then
+  expected_count="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
+  expected_sha256="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
+  if [[ "$expected_count" != "1" || -z "$expected_sha256" ]]; then
     rm -f "$tmp" "$chk_tmp"
+    PROXYCTL_VALIDATED_BIN=""
     log_warn "Checksum entry not found for $asset; using shell renderer."
     return 1
   fi
-  expected_sha256="${expected_line%%[[:space:]]*}"
-
-  if ! echo "$expected_sha256  $tmp" | sha256sum -c - >/dev/null 2>&1; then
+  if [[ "$(sha256_file "$tmp" 2>/dev/null || true)" != "$expected_sha256" ]]; then
     rm -f "$tmp" "$chk_tmp"
+    PROXYCTL_VALIDATED_BIN=""
     log_warn "proxyctl checksum mismatch; using shell renderer."
     return 1
   fi
   rm -f "$chk_tmp"
 
   chmod 0755 "$tmp"
-  if ! "$tmp" version >/dev/null 2>&1; then
+  local ver_out
+  ver_out="$("$tmp" version 2>/dev/null || true)"
+  if [[ "$ver_out" != "$PROXYCTL_VERSION" ]]; then
     rm -f "$tmp"
-    log_warn "Downloaded proxyctl binary failed verification; using shell renderer."
+    PROXYCTL_VALIDATED_BIN=""
+    log_warn "Downloaded proxyctl binary version mismatch ('$ver_out' != '$PROXYCTL_VERSION'); using shell renderer."
     return 1
   fi
 
-  install -m 0755 "$tmp" "$PROXYCTL_BIN"
+  local bin_dir bin_tmp sidecar_tmp
+  bin_dir="$(dirname "$PROXYCTL_BIN")"
+  install -d -m 0755 "$bin_dir"
+  bin_tmp="$(mktemp "$bin_dir/.proxyctl.tmp.XXXXXX")"
+  sidecar_tmp="$(mktemp "$bin_dir/.proxyctl.sha256.tmp.XXXXXX")"
+  install -m 0755 "$tmp" "$bin_tmp"
+  printf '%s\n' "$expected_sha256" > "$sidecar_tmp"
+  chmod 0644 "$sidecar_tmp"
+  mv -f "$bin_tmp" "$PROXYCTL_BIN"
+  mv -f "$sidecar_tmp" "${PROXYCTL_BIN}.sha256"
   rm -f "$tmp"
+  hash -r 2>/dev/null || true
+  PROXYCTL_VALIDATED_BIN="$PROXYCTL_BIN"
   return 0
 }
 
@@ -625,20 +763,11 @@ EOF
 run_proxyctl_merge() {
   local nodes_file="$1"
   local output_dir="$2"
-  local cli_arch
-  local root
 
-  cli_arch="$(arch)"
-  root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-  if command -v proxyctl >/dev/null 2>&1; then
-    proxyctl merge --nodes "$nodes_file" --output "$output_dir"
-  elif [[ -x "$root/bin/proxyctl-linux-$cli_arch" ]]; then
-    "$root/bin/proxyctl-linux-$cli_arch" merge --nodes "$nodes_file" --output "$output_dir"
-  elif command -v go >/dev/null 2>&1 && [[ -f "$root/go.mod" ]]; then
-    (cd "$root" && go run ./cmd/proxyctl merge --nodes "$nodes_file" --output "$output_dir")
+  if [[ -n "$PROXYCTL_VALIDATED_BIN" && -x "$PROXYCTL_VALIDATED_BIN" ]]; then
+    "$PROXYCTL_VALIDATED_BIN" merge --nodes "$nodes_file" --output "$output_dir"
   else
-    log_warn "proxyctl not found; using built-in shell renderer."
+    log_warn "Validated proxyctl unavailable; using built-in shell renderer."
     write_subscriptions_with_shell "$nodes_file" "$output_dir"
   fi
 }
@@ -751,9 +880,13 @@ mkdir -p "$OUT"
 # 6. Install Dependencies
 log "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
-reset_caddy_apt_source
-apt_update_or_die
-apt-get install -y curl wget tar openssl ca-certificates gnupg debian-keyring debian-archive-keyring apt-transport-https qrencode > /dev/null
+if ! bootstrap_caddy_apt_before_dependencies; then
+  die "apt-get update failed after quarantining the Caddy APT configuration"
+fi
+if ! apt-get install -y curl wget tar openssl ca-certificates gnupg debian-keyring debian-archive-keyring apt-transport-https qrencode > /dev/null; then
+  restore_caddy_apt_bootstrap
+  die "Failed to install dependencies after quarantining the Caddy APT configuration"
+fi
 
 log "Installing sing-box"
 SB_VERSION="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p' | head -1)"
@@ -770,8 +903,16 @@ if ! "$SB_NEW" version >/dev/null 2>&1; then
 fi
 
 log "Installing Caddy"
-install_caddy_apt_source
-apt_update_or_die
+if ! install_caddy_apt_source; then
+  restore_caddy_apt_bootstrap
+  die "Failed to install the verified Caddy APT configuration"
+fi
+if ! apt_update_or_die; then
+  restore_caddy_apt_bootstrap
+  die "apt-get update failed after installing the verified Caddy APT configuration"
+fi
+discard_caddy_apt_state_backup "$CADDY_APT_BOOTSTRAP_DIR"
+CADDY_APT_BOOTSTRAP_DIR=""
 if ! command -v caddy >/dev/null 2>&1; then
   apt-get install -y caddy > /dev/null
 fi

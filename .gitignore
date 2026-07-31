@@ -3,4 +3,5 @@ dist/
 *.log
 .env
 nodes.conf
+.agent/
 .DS_Store

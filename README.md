@@ -239,7 +239,14 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.2.1`（或由 `PROXYCTL_VERSION` 指定的）Release；安装脚本本身在下载失败时会使用内置 renderer 完成首次部署。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.2.2`（或由 `PROXYCTL_VERSION` 指定的）Release。
+
+`proxyctl` 校验与执行逻辑：
+- 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
+- 固定路径文件缺失或任一校验不匹配时，从 GitHub Release 下载对应架构二进制并校验 SHA256 及 `version` 输出；
+- PATH 中其他同名 `proxyctl` 不会被复用或执行；
+- `install-proxy.sh` 在下载/校验失败时会安全回退至内置 Shell 渲染器；
+- `merge-nodes.sh` 无内置渲染器回退，若无法获取校验通过的 `proxyctl` 会明确报错退出。
 
 两个命令都会覆盖生成：
 
@@ -288,13 +295,16 @@ singbox-sub-manager/
 ├── templates/
 ├── examples/
 │   └── nodes.conf.example
+├── tests/
+│   ├── test_install_proxyctl.sh
+│   └── test_caddy_apt.sh
 ├── docs/
 │   ├── aws.md
 │   └── troubleshooting.md
 └── .github/
     └── workflows/
-    ├── ci.yml
-    └── release.yml
+        ├── ci.yml
+        └── release.yml
 ```
 
 ## 主要文件位置
@@ -624,6 +634,17 @@ go vet ./...
 ```bash
 make build
 ```
+
+### 发布 SOP
+
+新版本（如 v0.2.2）发布标准流程：
+
+1. **工作区审查**：确认工作区状态并审查修改 (`git status --short` 与 `git diff`)；
+2. **本地测试**：在具备工具的环境中运行全部测试 (`bash -n install-proxy.sh`, `bash -n merge-nodes.sh`, `bash tests/test_install_proxyctl.sh`, `go test -v ./...`)；
+3. **代码提交**：获取用户明确授权后提交并推送至 `main` 分支；
+4. **打 Tag 推送**：获取用户明确授权后创建并推送 Tag (`git tag v0.2.2 && git push origin v0.2.2`)；
+5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Debian 12) 与 `release` 工作流全部成功通过；
+6. **发布校验**：在 GitHub Release 页面确认 `proxyctl-linux-amd64`、`proxyctl-linux-arm64` 及 `checksums.txt` 3 个 Asset 已发布，且 `./dist/proxyctl-linux-amd64 version` 正确输出 Tag 名称。
 
 ## 路线图
 
