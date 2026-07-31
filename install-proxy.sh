@@ -183,30 +183,37 @@ reset_caddy_apt_source() {
 }
 
 install_caddy_apt_source() {
-  local expected_source="deb [signed-by=$CADDY_KEYRING] $CADDY_APT_URL any-version main"
-
-  if [[ -f "$CADDY_KEYRING" && -f "$CADDY_APT_LIST" ]] && grep -Fxq "$expected_source" "$CADDY_APT_LIST" && gpg --show-keys --with-colons "$CADDY_KEYRING" 2>/dev/null | grep -q 'ABA1F9B8875A6661'; then
-    return
-  fi
-
   reset_caddy_apt_source
 
-  if ! curl -fsSL "$CADDY_GPG_URL" | gpg --dearmor --yes -o "$CADDY_KEYRING"; then
-    rm -f "$CADDY_KEYRING"
-    die "Failed to install Caddy APT signing key"
-  fi
-  chmod 0644 "$CADDY_KEYRING"
-  if ! gpg --show-keys --with-colons "$CADDY_KEYRING" 2>/dev/null | grep -q 'ABA1F9B8875A6661'; then
-    rm -f "$CADDY_KEYRING"
-    die "Downloaded Caddy APT key does not contain the active signing key"
+  local key_tmp
+  local source_tmp
+  key_tmp="$(mktemp "/tmp/caddy-key.XXXXXX")"
+  source_tmp="$(mktemp "/tmp/caddy-source.XXXXXX")"
+
+  if ! curl -fsSL "$CADDY_GPG_URL" -o "$key_tmp"; then
+    rm -f "$key_tmp" "$source_tmp"
+    die "Failed to download Caddy APT signing key"
   fi
 
-  if ! curl -fsSL "$CADDY_APT_SOURCE_URL" -o "$CADDY_APT_LIST"; then
-    rm -f "$CADDY_APT_LIST"
-    die "Failed to install the official Caddy APT source"
+  if ! curl -fsSL "$CADDY_APT_SOURCE_URL" -o "$source_tmp"; then
+    rm -f "$key_tmp" "$source_tmp"
+    die "Failed to download the official Caddy APT source"
   fi
-  chmod 0644 "$CADDY_APT_LIST"
-  grep -Fxq "$expected_source" "$CADDY_APT_LIST" || die "Official Caddy APT source is missing its signed-by configuration"
+
+  if ! gpg --batch --show-keys "$key_tmp" >/dev/null 2>&1; then
+    rm -f "$key_tmp" "$source_tmp"
+    die "Downloaded Caddy signing key is invalid"
+  fi
+
+  rm -f "$CADDY_KEYRING"
+  if ! gpg --batch --yes --dearmor --output "$CADDY_KEYRING" "$key_tmp"; then
+    rm -f "$key_tmp" "$source_tmp"
+    die "Failed to dearmor Caddy APT signing key"
+  fi
+  chmod 0644 "$CADDY_KEYRING"
+
+  install -m 0644 "$source_tmp" "$CADDY_APT_LIST"
+  rm -f "$key_tmp" "$source_tmp"
 }
 
 install_proxyctl_binary() {
