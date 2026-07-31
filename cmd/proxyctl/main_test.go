@@ -97,4 +97,3 @@ func TestRunInvalidFlags(t *testing.T) {
 		t.Errorf("expected exit code 2 for invalid flag in validate, got %d", code)
 	}
 }
-
