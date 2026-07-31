@@ -216,26 +216,39 @@ install_caddy_apt_source() {
   rm -f "$key_tmp" "$source_tmp"
 }
 
-install_proxyctl_binary() {
-  local cli_arch="$1"
-  local base_url="https://github.com/$PROXYCTL_REPOSITORY/releases/download/$PROXYCTL_VERSION"
-  local binary_name="proxyctl-linux-$cli_arch"
-  local tmp_dir expected actual
+install_proxyctl() {
+  log "Installing proxyctl"
 
-  tmp_dir="$(mktemp -d /tmp/proxyctl.XXXXXX)"
-  log "Downloading proxyctl $PROXYCTL_VERSION for linux-$cli_arch"
-  if ! curl -fsSL "$base_url/$binary_name" -o "$tmp_dir/$binary_name" || ! curl -fsSL "$base_url/checksums.txt" -o "$tmp_dir/checksums.txt"; then
-    rm -rf "$tmp_dir"
-    return 1
+  if command -v proxyctl >/dev/null 2>&1; then
+    return 0
   fi
-  expected="$(awk -v file="$binary_name" '$2 == file {print $1}' "$tmp_dir/checksums.txt")"
-  actual="$(sha256sum "$tmp_dir/$binary_name" | awk '{print $1}')"
-  if [[ -z "$expected" || "$expected" != "$actual" ]]; then
-    rm -rf "$tmp_dir"
-    return 1
-  fi
-  install -m 0755 "$tmp_dir/$binary_name" "$PROXYCTL_BIN"
-  rm -rf "$tmp_dir"
+
+  local arch asset url tmp
+  case "$(uname -m)" in
+    x86_64|amd64)
+      arch="amd64"
+      ;;
+    aarch64|arm64)
+      arch="arm64"
+      ;;
+    *)
+      die "Unsupported architecture: $(uname -m)"
+      ;;
+  esac
+
+  asset="proxyctl-linux-${arch}"
+  url="https://github.com/$PROXYCTL_REPOSITORY/releases/latest/download/${asset}"
+  tmp="$(mktemp)"
+
+  curl --fail --location --silent --show-error \
+    "$url" \
+    --output "$tmp" || die "Failed to download proxyctl"
+
+  install -m 0755 "$tmp" /usr/local/bin/proxyctl
+  rm -f "$tmp"
+
+  /usr/local/bin/proxyctl --help >/dev/null 2>&1 \
+    || die "proxyctl installation verification failed"
 }
 
 trim() {
@@ -539,10 +552,8 @@ run_proxyctl_merge() {
     "$root/bin/proxyctl-linux-$cli_arch" merge --nodes "$nodes_file" --output "$output_dir"
   elif command -v go >/dev/null 2>&1 && [[ -f "$root/go.mod" ]]; then
     (cd "$root" && go run ./cmd/proxyctl merge --nodes "$nodes_file" --output "$output_dir")
-  elif install_proxyctl_binary "$cli_arch"; then
-    "$PROXYCTL_BIN" merge --nodes "$nodes_file" --output "$output_dir"
   else
-    log_warn "proxyctl not found and automatic download failed; using built-in shell renderer."
+    log_warn "proxyctl not found; using built-in shell renderer."
     write_subscriptions_with_shell "$nodes_file" "$output_dir"
   fi
 }
@@ -795,6 +806,7 @@ else
   fi
 fi
 
+install_proxyctl
 run_proxyctl_merge "$NODES_CONF" "$OUT"
 
 # Caddy runs as the caddy user and must be able to traverse the subscription path.
