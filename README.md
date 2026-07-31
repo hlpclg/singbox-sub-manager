@@ -14,6 +14,7 @@
 - 自动生成 Shadowrocket 订阅
 - 支持多个 Hysteria2 节点合并为一个订阅
 - 自动保留订阅 token、Hysteria2 密码和混淆密码
+- 安装时自动修复旧版 Caddy APT source 与签名 key
 - 自动启用 BBR
 - 自动配置适合 macOS FlClash TUN 的规则
 - 优先代理 Google Play、Google、OpenAI、Claude、GitHub、YouTube 等服务
@@ -145,7 +146,7 @@ https://sub.example.com/<随机token>/sr.txt
 随机 token 保存于：
 
 ```text
-/etc/proxy-sub-token
+/var/lib/singbox-sub-manager/token
 ```
 
 重复运行安装脚本时，订阅地址默认不会改变。
@@ -153,7 +154,7 @@ https://sub.example.com/<随机token>/sr.txt
 Hysteria2 密钥保存于：
 
 ```text
-/etc/proxy-state/hy2-secret.env
+/etc/singbox-sub-manager/config.env
 ```
 
 重复运行安装脚本时，以下内容默认不会改变：
@@ -196,29 +197,25 @@ Hysteria2 密钥保存于：
 
 ## 合并多个节点
 
-在订阅中心服务器下载 `merge-nodes.sh`：
+订阅中心的节点列表保存在：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/merge-nodes.sh \
-  -o merge-nodes.sh
-
-chmod +x merge-nodes.sh
+/etc/singbox-sub-manager/nodes.conf
 ```
 
-编辑节点列表：
+在每台节点上安装完成后，收集该节点的公网 IP、Hysteria2 password、Salamander obfs password 和 SNI；然后在订阅中心编辑此文件：
 
 ```bash
-nano merge-nodes.sh
+nano /etc/singbox-sub-manager/nodes.conf
 ```
 
 格式：
 
-```bash
-NODES=(
-  "JP-HY2|1.1.1.1|443|PASSWORD|OBFS_PASSWORD|www.bing.com"
-  "SG-HY2|2.2.2.2|443|PASSWORD|OBFS_PASSWORD|www.bing.com"
-  "US-HY2|3.3.3.3|443|PASSWORD|OBFS_PASSWORD|www.bing.com"
-)
+```text
+# 注释行会被忽略
+JP-HY2|1.1.1.1|443|PASSWORD|OBFS_PASSWORD|www.bing.com
+SG-HY2|2.2.2.2|443|PASSWORD|OBFS_PASSWORD|www.bing.com
+US-HY2|3.3.3.3|443|PASSWORD|OBFS_PASSWORD|www.bing.com
 ```
 
 字段说明：
@@ -227,13 +224,31 @@ NODES=(
 节点名 | 服务器IP或域名 | 端口 | Hysteria2密码 | 混淆密码 | SNI
 ```
 
-然后运行：
+重新运行安装脚本会读取 `nodes.conf` 并生成订阅，同时保留当前节点的 token 和密钥：
 
 ```bash
-sudo bash merge-nodes.sh
+sudo ./install-proxy.sh sub.example.com admin@example.com
 ```
 
-脚本会覆盖生成：
+也可以单独运行 `merge-nodes.sh`，避免重装服务：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/merge-nodes.sh \
+  -o merge-nodes.sh
+chmod +x merge-nodes.sh
+sudo ./merge-nodes.sh
+```
+
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.2.2`（或由 `PROXYCTL_VERSION` 指定的）Release。
+
+`proxyctl` 校验与执行逻辑：
+- 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
+- 固定路径文件缺失或任一校验不匹配时，从 GitHub Release 下载对应架构二进制并校验 SHA256 及 `version` 输出；
+- PATH 中其他同名 `proxyctl` 不会被复用或执行；
+- `install-proxy.sh` 在下载/校验失败时会安全回退至内置 Shell 渲染器；
+- `merge-nodes.sh` 无内置渲染器回退，若无法获取校验通过的 `proxyctl` 会明确报错退出。
+
+两个命令都会覆盖生成：
 
 ```text
 /var/www/proxy-sub/<token>/clash.yaml
@@ -247,8 +262,8 @@ sudo bash merge-nodes.sh
 在每台 Hysteria2 节点服务器上执行：
 
 ```bash
-sudo cat /etc/proxy-state/hy2-secret.env
-curl -4 ifconfig.me
+sudo cat /etc/singbox-sub-manager/config.env
+curl -4 https://api.ipify.org
 ```
 
 输出类似：
@@ -280,12 +295,16 @@ singbox-sub-manager/
 ├── templates/
 ├── examples/
 │   └── nodes.conf.example
+├── tests/
+│   ├── test_install_proxyctl.sh
+│   └── test_caddy_apt.sh
 ├── docs/
 │   ├── aws.md
 │   └── troubleshooting.md
 └── .github/
     └── workflows/
-        └── ci.yml
+        ├── ci.yml
+        └── release.yml
 ```
 
 ## 主要文件位置
@@ -295,8 +314,8 @@ singbox-sub-manager/
 ```text
 /usr/local/bin/sing-box
 /etc/sing-box/config.json
-/etc/sing-box/cert/server.crt
-/etc/sing-box/cert/server.key
+/etc/singbox-sub-manager/certs/server.crt
+/etc/singbox-sub-manager/certs/server.key
 /etc/systemd/system/sing-box.service
 ```
 
@@ -309,8 +328,10 @@ singbox-sub-manager/
 ### 状态和密钥
 
 ```text
-/etc/proxy-sub-token
-/etc/proxy-state/hy2-secret.env
+/var/lib/singbox-sub-manager/token
+/etc/singbox-sub-manager/config.env
+/etc/singbox-sub-manager/nodes.conf
+/var/log/singbox-sub-manager/installer.log
 ```
 
 ### 订阅文件
@@ -479,7 +500,31 @@ sudo systemctl status caddy --no-pager
 sudo journalctl -u caddy -n 100 --no-pager
 ```
 
-### 4. Google Play 在规则模式无法下载
+如果本机检查返回 `403`，确认 Caddy 可以遍历订阅目录：
+
+```bash
+sudo namei -l /var/www/proxy-sub/<token>/clash.yaml
+sudo ls -ld /var/www /var/www/proxy-sub /var/www/proxy-sub/<token>
+```
+
+正常情况下 `/var/www` 和订阅目录应对 Caddy 服务用户可遍历；重新运行安装脚本会修正订阅目录的属主和权限。
+
+### 4. 安装 Caddy 时出现 `NO_PUBKEY`
+
+先确认正在运行最新版 `install-proxy.sh`。脚本会在安装 Caddy 前删除旧的纯 Caddy source，下载官方 source 与 keyring，并验证 active key `ABA1F9B8875A6661`。
+
+若仍失败，检查实际生效的文件：
+
+```bash
+sudo cat /etc/apt/sources.list.d/caddy-stable.list
+sudo gpg --show-keys --with-colons /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+  | awk -F: '$1 == "fpr" {print $10}'
+sudo apt-get update
+```
+
+source 应包含 `signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg`，输出的指纹中应包含以 `ABA1F9B8875A6661` 结尾的一项。
+
+### 5. Google Play 在规则模式无法下载
 
 本项目已将以下 Google Play 相关域名放在中国直连规则之前：
 
@@ -508,7 +553,7 @@ google.com
 4. 确认当前模式为 `Rule`
 5. 确认 Google Play 流量命中了 `节点选择`
 
-### 5. 全局模式正常，规则模式异常
+### 6. 全局模式正常，规则模式异常
 
 这通常说明：
 
@@ -518,7 +563,7 @@ google.com
 
 查看 FlClash 日志，确认目标域名最终匹配了哪一条规则。
 
-### 6. MetaCubeX 规则下载失败
+### 7. MetaCubeX 规则下载失败
 
 客户端需要能访问 GitHub Raw。首次加载规则时，如果当前网络无法直连 GitHub，可能下载失败。
 
@@ -533,8 +578,8 @@ google.com
 
 公开仓库中不得提交：
 
-- `/etc/proxy-state/hy2-secret.env`
-- `/etc/proxy-sub-token`
+- `/etc/singbox-sub-manager/config.env`
+- `/var/lib/singbox-sub-manager/token`
 - 真实的 `nodes.conf`
 - Hysteria2 password
 - obfs password
@@ -589,6 +634,17 @@ go vet ./...
 ```bash
 make build
 ```
+
+### 发布 SOP
+
+新版本（如 v0.2.2）发布标准流程：
+
+1. **工作区审查**：确认工作区状态并审查修改 (`git status --short` 与 `git diff`)；
+2. **本地测试**：在具备工具的环境中运行全部测试 (`bash -n install-proxy.sh`, `bash -n merge-nodes.sh`, `bash tests/test_install_proxyctl.sh`, `go test -v ./...`)；
+3. **代码提交**：获取用户明确授权后提交并推送至 `main` 分支；
+4. **打 Tag 推送**：获取用户明确授权后创建并推送 Tag (`git tag v0.2.2 && git push origin v0.2.2`)；
+5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Debian 12) 与 `release` 工作流全部成功通过；
+6. **发布校验**：在 GitHub Release 页面确认 `proxyctl-linux-amd64`、`proxyctl-linux-arm64` 及 `checksums.txt` 3 个 Asset 已发布，且 `./dist/proxyctl-linux-amd64 version` 正确输出 Tag 名称。
 
 ## 路线图
 
