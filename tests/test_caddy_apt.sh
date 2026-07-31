@@ -69,6 +69,36 @@ declare -F restore_caddy_apt_bootstrap >/dev/null
 declare -F bootstrap_caddy_apt_before_dependencies >/dev/null
 declare -F install_caddy_apt_source >/dev/null
 
+# Regression: cloudsmith now ships a `deb-src` line alongside `deb` in
+# debian.deb.txt. validate_caddy_apt_source must accept that exact pair,
+# stay backward compatible with a lone `deb`, and still reject anything else.
+validate_source_regression() {
+  local dir="$TEST_DIR/validate-source" f
+  mkdir -p "$dir"
+  local deb="deb [signed-by=$CADDY_KEYRING] $EXPECTED_CADDY_REPOSITORY_URL any-version main"
+  local deb_src="deb-src [signed-by=$CADDY_KEYRING] $EXPECTED_CADDY_REPOSITORY_URL any-version main"
+  local rogue="deb [signed-by=$CADDY_KEYRING] https://evil.example.com/x any-version main"
+
+  f="$dir/deb-and-deb-src.list"
+  printf '# Source: Caddy\n\n%s\n\n%s\n' "$deb" "$deb_src" > "$f"
+  validate_caddy_apt_source "$f" || { echo "validate rejected official deb+deb-src" >&2; exit 1; }
+
+  f="$dir/deb-only.list"
+  printf '%s\n' "$deb" > "$f"
+  validate_caddy_apt_source "$f" || { echo "validate rejected legacy deb-only" >&2; exit 1; }
+
+  f="$dir/deb-src-rogue.list"
+  printf '%s\n%s\n%s\n' "$deb" "$deb_src" "$rogue" > "$f"
+  ! validate_caddy_apt_source "$f" || { echo "validate accepted rogue entry" >&2; exit 1; }
+
+  f="$dir/deb-src-only.list"
+  printf '%s\n' "$deb_src" > "$f"
+  ! validate_caddy_apt_source "$f" || { echo "validate accepted deb-src without deb" >&2; exit 1; }
+
+  echo "validate-source-accepts-official-deb-src PASSED"
+}
+validate_source_regression
+
 run_failure_scenario() {
   local name="$1"
   local failure="$2"

@@ -192,17 +192,24 @@ apt_update_or_die() {
 }
 
 validate_caddy_apt_source() {
-  local source_file="$1" line normalized active_count=0
-  local expected="deb [signed-by=$CADDY_KEYRING] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+  local source_file="$1" line normalized deb_count=0
+  local repo="https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+  local expected_deb="deb [signed-by=$CADDY_KEYRING] $repo"
+  local expected_deb_src="deb-src [signed-by=$CADDY_KEYRING] $repo"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
     normalized="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/[[:space:]][[:space:]]*/ /g')"
-    [[ "$normalized" == "$expected" ]] || return 1
-    ((active_count += 1))
+    if [[ "$normalized" == "$expected_deb" ]]; then
+      ((deb_count += 1))
+    elif [[ "$normalized" == "$expected_deb_src" ]]; then
+      : # official source-package entry; cloudsmith now ships this alongside deb
+    else
+      return 1
+    fi
   done < "$source_file"
 
-  [[ "$active_count" -eq 1 ]]
+  [[ "$deb_count" -eq 1 ]]
 }
 
 backup_caddy_apt_state() {
