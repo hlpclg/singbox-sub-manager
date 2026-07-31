@@ -1,3 +1,17 @@
-# 节点名|服务器IP或域名|端口|password|obfs-password|sni
-JP-HY2|203.0.113.10|443|CHANGE_ME_PASSWORD|CHANGE_ME_OBFS|www.bing.com
-SG-HY2|198.51.100.20|443|CHANGE_ME_PASSWORD|CHANGE_ME_OBFS|www.bing.com
+# 每个节点一个 [名称] 段。名称仅允许字母/数字/. _ -
+# 用 proxyctl 管理：proxyctl node add / edit / remove / enable / disable / list
+[JP-HY2]
+SERVER=203.0.113.10
+PORT=443
+PASSWORD=CHANGE_ME_PASSWORD
+OBFS_PASSWORD=CHANGE_ME_OBFS
+SNI=www.bing.com
+ENABLED=true
+
+[SG-HY2]
+SERVER=198.51.100.20
+PORT=443
+PASSWORD=CHANGE_ME_PASSWORD
+OBFS_PASSWORD=CHANGE_ME_OBFS
+SNI=www.bing.com
+ENABLED=true

@@ -257,6 +257,44 @@ sudo ./merge-nodes.sh
 
 不需要重启 Caddy，客户端更新订阅即可。
 
+## 节点管理（proxyctl node）
+
+v0.3 起可用 `proxyctl` 管理 `/etc/singbox-sub-manager/nodes.conf`，无需手改文件。
+
+```bash
+# 列出所有节点（含启用状态）
+proxyctl node list
+
+# 新增节点（缺省字段在交互终端下会追问；密码不回显）
+proxyctl node add --name JP-HY2 --server 1.2.3.4 --port 443 \
+  --password 'xxx' --obfs-password 'yyy' --sni www.bing.com
+
+# 修改字段（只改传入项；--name 可改名）
+proxyctl node edit JP-HY2 --port 8443
+
+# 启用 / 禁用（禁用的节点保留在文件中，但不进订阅）
+proxyctl node enable JP-HY2
+proxyctl node disable JP-HY2
+
+# 删除
+proxyctl node remove JP-HY2
+
+# 生成订阅（仅包含启用节点）
+proxyctl subscription build --nodes /etc/singbox-sub-manager/nodes.conf --output DIR
+```
+
+节点文件权限为 `0600`，每次修改前自动备份为 `nodes.conf.bak`。
+
+### 从旧格式迁移
+
+v0.2 的竖线格式（`名称|服务器|端口|密码|obfs|sni`）仍可被 `subscription build` 读取，但节点管理命令要求先迁移一次：
+
+```bash
+proxyctl node migrate
+```
+
+迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。
+
 ## 获取其他节点的连接信息
 
 在每台 Hysteria2 节点服务器上执行：
