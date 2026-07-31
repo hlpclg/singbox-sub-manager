@@ -98,11 +98,42 @@ EXAMPLES_DIR="/usr/share/singbox-sub-manager/examples"
 CADDY_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
 CADDY_APT_LIST="/etc/apt/sources.list.d/caddy-stable.list"
 CADDY_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
-CADDY_APT_URL="https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
 CADDY_APT_SOURCE_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
 PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.2.1}"
+
+# 1. OS & Root Check (Safe Early Exit)
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "ERROR: Please run as root (sudo)" >&2
+  exit 1
+fi
+
+if [[ -f /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  OS="${ID:-}"
+  VER="${VERSION_ID:-}"
+  if [[ "$OS" == "ubuntu" ]]; then
+    if [[ "$VER" != "22.04" && "$VER" != "24.04" ]]; then
+      echo "ERROR: Only Ubuntu 22.04 and 24.04 are supported" >&2
+      exit 1
+    fi
+  elif [[ "$OS" == "debian" ]]; then
+    if [[ "$VER" != "12" ]]; then
+      echo "ERROR: Only Debian 12 is supported" >&2
+      exit 1
+    fi
+  else
+    echo "ERROR: Only Ubuntu and Debian are supported" >&2
+    exit 1
+  fi
+else
+  echo "ERROR: Could not determine OS" >&2
+  exit 1
+fi
+
+arch(){ case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) echo "ERROR: Unsupported architecture" >&2; exit 1;; esac; }
 
 mkdir -p "$BASE_DIR" "$CERTS_DIR" "$STATE_DIR" "$LOG_DIR" "$SUB_ROOT" "$TEMPLATE_DIR" "$EXAMPLES_DIR"
 
@@ -225,30 +256,52 @@ install_proxyctl() {
 
   local arch asset url tmp
   case "$(uname -m)" in
-    x86_64|amd64)
-      arch="amd64"
-      ;;
-    aarch64|arm64)
-      arch="arm64"
-      ;;
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
     *)
-      die "Unsupported architecture: $(uname -m)"
+      log_warn "Unsupported proxyctl architecture; using shell renderer."
+      return 1
       ;;
   esac
 
   asset="proxyctl-linux-${arch}"
-  url="https://github.com/$PROXYCTL_REPOSITORY/releases/latest/download/${asset}"
-  tmp="$(mktemp)"
+  url="https://github.com/${PROXYCTL_REPOSITORY}/releases/download/${PROXYCTL_VERSION}/${asset}"
+  chk_url="https://github.com/${PROXYCTL_REPOSITORY}/releases/download/${PROXYCTL_VERSION}/checksums.txt"
+  tmp="$(mktemp "/tmp/proxyctl.XXXXXX")"
+  chk_tmp="$(mktemp "/tmp/proxyctl.checksums.XXXXXX")"
 
-  curl --fail --location --silent --show-error \
-    "$url" \
-    --output "$tmp" || die "Failed to download proxyctl"
+  if ! curl -fsSL "$url" -o "$tmp" || ! curl -fsSL "$chk_url" -o "$chk_tmp"; then
+    rm -f "$tmp" "$chk_tmp"
+    log_warn "Failed to download proxyctl or checksums; using shell renderer."
+    return 1
+  fi
 
-  install -m 0755 "$tmp" /usr/local/bin/proxyctl
+  local expected_sha256 expected_line
+  expected_line="$(grep -E "^[A-Fa-f0-9]{64}[[:space:]]+\*?${asset}$" "$chk_tmp" | head -n 1)"
+  if [[ -z "$expected_line" ]]; then
+    rm -f "$tmp" "$chk_tmp"
+    log_warn "Checksum entry not found for $asset; using shell renderer."
+    return 1
+  fi
+  expected_sha256="${expected_line%%[[:space:]]*}"
+
+  if ! echo "$expected_sha256  $tmp" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$tmp" "$chk_tmp"
+    log_warn "proxyctl checksum mismatch; using shell renderer."
+    return 1
+  fi
+  rm -f "$chk_tmp"
+
+  chmod 0755 "$tmp"
+  if ! "$tmp" version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    log_warn "Downloaded proxyctl binary failed verification; using shell renderer."
+    return 1
+  fi
+
+  install -m 0755 "$tmp" "$PROXYCTL_BIN"
   rm -f "$tmp"
-
-  /usr/local/bin/proxyctl --help >/dev/null 2>&1 \
-    || die "proxyctl installation verification failed"
+  return 0
 }
 
 trim() {
@@ -260,9 +313,17 @@ trim() {
 
 yaml_quote() {
   local value="$1"
+  if [[ "$value" =~ [[:cntrl:]] ]]; then
+    die "Invalid configuration value: contains control characters."
+  fi
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
   printf '"%s"' "$value"
+}
+
+contains_control_chars() {
+  local value="$1"
+  [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *$'\t'* ]]
 }
 
 url_encode_component() {
@@ -288,9 +349,33 @@ validate_node_fields() {
   local obfs_password="$6"
   local sni="$7"
 
+  for value in "$name" "$server" "$port" "$password" "$obfs_password" "$sni"; do
+    if contains_control_chars "$value"; then
+      die "nodes.conf line $line_no: control characters are not allowed"
+    fi
+  done
+
   if [[ -z "$name" || -z "$server" || -z "$port" || -z "$password" || -z "$obfs_password" || -z "$sni" ]]; then
     die "nodes.conf line $line_no: empty field"
   fi
+
+  case "$name" in
+    DIRECT|自动选择|节点选择)
+      die "nodes.conf line $line_no: reserved node name: $name"
+      ;;
+    *"|"*)
+      die "nodes.conf line $line_no: node name cannot contain pipe character"
+      ;;
+  esac
+
+  if [[ "$server" == *" "* || "$server" == *"/"* || "$server" == *":"* || "$server" == *"|"* ]]; then
+    die "nodes.conf line $line_no: server contains invalid characters"
+  fi
+
+  if [[ "$sni" == *" "* || "$sni" == *"/"* || "$sni" == *":"* || "$sni" == *"|"* ]]; then
+    die "nodes.conf line $line_no: sni contains invalid characters"
+  fi
+
   if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
     die "nodes.conf line $line_no: invalid port"
   fi
@@ -558,29 +643,7 @@ run_proxyctl_merge() {
   fi
 }
 
-# 1. OS & Root Check
-[[ $(id -u) -eq 0 ]] || die "Please run as root (sudo)"
-if [[ -f /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  OS="${ID:-}"
-  VER="${VERSION_ID:-}"
-  if [[ "$OS" == "ubuntu" ]]; then
-    if [[ "$VER" != "22.04" && "$VER" != "24.04" ]]; then
-      die "Only Ubuntu 22.04 and 24.04 are supported"
-    fi
-  elif [[ "$OS" == "debian" ]]; then
-    if [[ "$VER" != "12" ]]; then
-      die "Only Debian 12 is supported"
-    fi
-  else
-    die "Only Ubuntu and Debian are supported"
-  fi
-else
-  die "Could not determine OS"
-fi
 
-arch(){ case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) die "Unsupported architecture";; esac; }
 
 # 2. Disk Check
 check_disk() {
@@ -647,9 +710,13 @@ if [[ ! -f "$MIGRATION_FILE" ]]; then
     chmod 600 "$TOKEN_FILE"
     migrated=true
   fi
-  if [ "$migrated" = true ]; then
-    date > "$MIGRATION_FILE"
-  fi
+  migration_tmp="$(mktemp "$STATE_DIR/.migration.tmp.XXXXXX")"
+  {
+    printf 'completed_at=%s\n' "$(date -Is)"
+    printf 'migrated=%s\n' "$migrated"
+  } > "$migration_tmp"
+  chmod 0600 "$migration_tmp"
+  mv "$migration_tmp" "$MIGRATION_FILE"
 fi
 
 # 5. Load or Generate Secrets
@@ -669,8 +736,8 @@ fi
 
 if [[ -f "$TOKEN_FILE" ]]; then
   TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
-  if [[ -z "$TOKEN" ]]; then
-    die "Invalid token file: empty. Please repair or remove it."
+  if [[ ! "$TOKEN" =~ ^[A-Fa-f0-9]{32}$ ]]; then
+    die "Invalid token file: must be a 32-character hex string. Please repair or remove it."
   fi
 else
   TOKEN="$(openssl rand -hex 16)"
@@ -694,7 +761,13 @@ SB_VERSION="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases
 TMP="$(mktemp -d "/tmp/sb.tmp.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 wget -qO "$TMP/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-$(arch).tar.gz"
 tar -xzf "$TMP/sb.tgz" -C "$TMP"
-install -m 0755 "$TMP/sing-box-${SB_VERSION}-linux-$(arch)/sing-box" /usr/local/bin/sing-box
+SB_NEW="/usr/local/bin/sing-box.new"
+install -m 0755 "$TMP/sing-box-${SB_VERSION}-linux-$(arch)/sing-box" "$SB_NEW"
+
+if ! "$SB_NEW" version >/dev/null 2>&1; then
+  rm -f "$SB_NEW"
+  die "sing-box binary is invalid or corrupted."
+fi
 
 log "Installing Caddy"
 install_caddy_apt_source
@@ -705,9 +778,11 @@ fi
 
 # 7. Generate Hysteria2 Certificates
 log "Checking Hysteria2 certificates"
-if [[ ! -f "$CERTS_DIR/server.crt" || ! -f "$CERTS_DIR/server.key" ]]; then
+if [[ ! -f "$CERTS_DIR/server.crt" && ! -f "$CERTS_DIR/server.key" ]]; then
   log "Generating new self-signed certificate"
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=$SNI" -keyout "$CERTS_DIR/server.key" -out "$CERTS_DIR/server.crt" >/dev/null 2>&1
+elif [[ ! -f "$CERTS_DIR/server.crt" || ! -f "$CERTS_DIR/server.key" ]]; then
+  die "Certificate is incomplete. Both server.crt and server.key must be present or absent. Please repair."
 else
   # Verify if cert and key match
   CERT_PUB="$(openssl x509 -in "$CERTS_DIR/server.crt" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | sha256sum)"
@@ -739,12 +814,17 @@ cat > "$SB_TMP" <<EOF
 }
 EOF
 
-if ! sing-box check -c "$SB_TMP"; then
-  rm -f "$SB_TMP"
-  die "sing-box check failed."
+if ! "$SB_NEW" check -c "$SB_TMP"; then
+  rm -f "$SB_TMP" "$SB_NEW"
+  die "sing-box config check failed with new binary."
 fi
 
 TS="$(date +%Y%m%d%H%M%S)"
+if [[ -f "/usr/local/bin/sing-box" ]]; then
+  mv "/usr/local/bin/sing-box" "/usr/local/bin/sing-box.previous.$TS"
+fi
+mv "$SB_NEW" "/usr/local/bin/sing-box"
+
 if [[ -f "$CONF_DIR/config.json" ]]; then
   cp -p "$CONF_DIR/config.json" "$CONF_DIR/config.json.previous.$TS"
 fi
@@ -770,16 +850,29 @@ systemctl restart sing-box
 # Check sing-box health
 sleep 1
 if ! systemctl is-active --quiet sing-box || ! ss -lnup | grep -qE "[:.]${HY2_PORT}[[:space:]]"; then
-  log_error "sing-box failed to start or bind port, restoring previous config"
+  log_error "sing-box failed to start or bind UDP port $HY2_PORT. Restoring previous binary and config."
+  if [[ -f "/usr/local/bin/sing-box.previous.$TS" ]]; then
+    mv "/usr/local/bin/sing-box.previous.$TS" "/usr/local/bin/sing-box"
+  else
+    rm -f "/usr/local/bin/sing-box"
+  fi
   if [[ -f "$CONF_DIR/config.json.previous.$TS" ]]; then
     mv "$CONF_DIR/config.json.previous.$TS" "$CONF_DIR/config.json"
+  else
+    rm -f "$CONF_DIR/config.json"
+  fi
+  systemctl daemon-reload
+  if [[ -f "/usr/local/bin/sing-box" ]]; then
     systemctl restart sing-box || true
     sleep 1
     if ! systemctl is-active --quiet sing-box; then
-      die "sing-box health check failed even after rollback."
+      systemctl disable --now sing-box || true
+      die "sing-box health check failed even after full rollback."
     fi
+  else
+    systemctl disable --now sing-box || true
   fi
-  die "sing-box health check failed."
+  die "sing-box health check failed. Full rollback performed."
 fi
 
 # 9. Configure Nodes
@@ -796,17 +889,48 @@ EOF
 else
   # Update existing managed node or append
   if grep -q "# managed-by: installer" "$NODES_CONF"; then
-    # Modify the first line after managed-by: installer, or simplistic approach: replace it
-    # We will let Go proxyctl handle updates more cleanly, but for now we won't overwrite blindly
     log "nodes.conf exists. Checking if IP needs update..."
-    if ! grep -q "|$PUBLIC_IP|" "$NODES_CONF"; then
-       log_warn "Public IP changed to $PUBLIC_IP but we only append/update managed nodes in Go tool (planned)."
-       sed -i "s/^$NODE_NAME|.*/$NODE_NAME|$PUBLIC_IP|$HY2_PORT|$PASSWORD|$OBFS_PASSWORD|$SNI/" "$NODES_CONF"
-    fi
+    nodes_tmp="$(mktemp "$BASE_DIR/.nodes.conf.tmp.XXXXXX")"
+
+    awk -F'|' -v OFS='|' \
+      -v target="$NODE_NAME" \
+      -v server="$PUBLIC_IP" \
+      -v port="$HY2_PORT" \
+      -v password="$PASSWORD" \
+      -v obfs="$OBFS_PASSWORD" \
+      -v sni="$SNI" '
+      BEGIN { updated = 0 }
+
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ {
+        print
+        next
+      }
+
+      $1 == target && updated == 0 {
+        print target, server, port, password, obfs, sni
+        updated = 1
+        next
+      }
+
+      {
+        print
+      }
+
+      END {
+        if (updated == 0) {
+          print target, server, port, password, obfs, sni
+        }
+      }
+    ' "$NODES_CONF" > "$nodes_tmp"
+
+    chmod 0600 "$nodes_tmp"
+    mv "$nodes_tmp" "$NODES_CONF"
   fi
 fi
 
-install_proxyctl
+if ! install_proxyctl; then
+  log_warn "proxyctl is unavailable; built-in shell renderer will be used."
+fi
 run_proxyctl_merge "$NODES_CONF" "$OUT"
 
 # Caddy runs as the caddy user and must be able to traverse the subscription path.
@@ -860,17 +984,65 @@ if systemctl is-active --quiet caddy; then
     die "Failed to reload caddy with new config."
   fi
 else
-  systemctl enable --now caddy
+  if ! systemctl enable --now caddy; then
+    log_error "Failed to start caddy with new config."
+    if [[ -f "/etc/caddy/Caddyfile.previous.$TS" ]]; then
+      mv "/etc/caddy/Caddyfile.previous.$TS" "/etc/caddy/Caddyfile"
+      systemctl restart caddy || true
+    else
+      rm -f /etc/caddy/Caddyfile
+      systemctl stop caddy || true
+    fi
+    die "Caddy failed to start. Configuration reverted."
+  fi
 fi
 
 # Check external & local access
-sleep 1
-LOCAL_SUBSCRIPTION_STATUS="$(curl -sk -o /dev/null -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" --connect-timeout 5 "https://$DOMAIN/$TOKEN/clash.yaml" || true)"
-if [[ "$LOCAL_SUBSCRIPTION_STATUS" == "403" ]]; then
-  log_error "Caddy returned HTTP 403 for the subscription after permissions were applied. Check /etc/caddy/Caddyfile and the requested token path."
-  die "Local Caddy subscription check returned HTTP 403."
-elif [[ "$LOCAL_SUBSCRIPTION_STATUS" != "200" ]]; then
-  log_warn "Local Caddy subscription check returned HTTP ${LOCAL_SUBSCRIPTION_STATUS:-000}. Check Caddy logs and DNS."
+status="000"
+curl_err=""
+for i in $(seq 1 24); do
+  curl_out="$(
+    curl -sk \
+      -o /dev/null \
+      -w '%{http_code}' \
+      --resolve "$DOMAIN:443:127.0.0.1" \
+      --connect-timeout 5 \
+      "https://$DOMAIN/$TOKEN/clash.yaml" 2>&1 || true
+  )"
+  
+  if [[ "$curl_out" =~ ^[0-9]{3}$ ]]; then
+    status="$curl_out"
+    curl_err=""
+  else
+    status="000"
+    curl_err="$curl_out"
+  fi
+
+  [[ "$status" == "200" ]] && break
+  
+  if [[ "$status" == "403" ]]; then
+    log_error "Caddy returned HTTP 403. Check /etc/caddy/Caddyfile and the requested token path."
+    break
+  fi
+  sleep 5
+done
+
+if [[ "$status" != "200" ]]; then
+  if [[ -n "$curl_err" ]]; then
+    log_error "Local Caddy health check failed. Last curl error: $curl_err"
+  else
+    log_error "Local Caddy health check failed with HTTP $status."
+  fi
+  log_error "Restoring previous Caddyfile."
+  if [[ -f "/etc/caddy/Caddyfile.previous.$TS" ]]; then
+    mv "/etc/caddy/Caddyfile.previous.$TS" "/etc/caddy/Caddyfile"
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || log_warn "Restored Caddyfile failed validation"
+    systemctl restart caddy || true
+  else
+    rm -f /etc/caddy/Caddyfile
+    systemctl stop caddy || true
+  fi
+  die "Caddy health check failed."
 fi
 
 if ! curl -sf --connect-timeout 10 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/null; then
