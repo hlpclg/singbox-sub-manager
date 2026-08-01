@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -35,10 +36,20 @@ func (c httpsSubscriptionCheckImpl) Run(ctx context.Context, cfg Config) Result 
 	reqCtx, cancel := context.WithTimeout(ctx, timeouts.HTTP)
 	defer cancel()
 	transport := &http.Transport{
-		TLSClientConfig:     tlsConfig(cfg),
-		TLSHandshakeTimeout: timeouts.TLS,
-		DialContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
-			return tlsDial(dialCtx, cfg, timeouts.TCPConnect)
+		TLSClientConfig: tlsConfig(cfg),
+		DialTLSContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			conn, err := tlsDial(dialCtx, cfg, timeouts.TCPConnect)
+			if err != nil {
+				return nil, err
+			}
+			tlsConn := tls.Client(conn, tlsConfig(cfg))
+			handshakeCtx, cancelHandshake := context.WithTimeout(dialCtx, timeouts.TLS)
+			defer cancelHandshake()
+			if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+				_ = tlsConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
 		},
 	}
 	defer transport.CloseIdleConnections()
@@ -182,6 +193,12 @@ func tlsErrorMessage(err error) string {
 
 func httpErrorMessage(err error) string {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "timeout or cancelled"
+	}
+	// net/http exposes TLSHandshakeTimeout as an unexported error type. Its
+	// stable standard-library text is inspected only to map it to our fixed,
+	// non-sensitive public diagnostic.
+	if strings.Contains(err.Error(), "TLS handshake timeout") {
 		return "timeout or cancelled"
 	}
 	return "request failed"
