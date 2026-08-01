@@ -3,8 +3,13 @@ package health
 import (
 	"context"
 	"crypto/x509"
+	"net"
 	"time"
 )
+
+// dialContextFunc is the function signature for context-aware TCP dials.
+// Production code uses (*net.Dialer).DialContext; tests inject a fake.
+type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // Status is a single check's outcome.
 type Status string
@@ -80,6 +85,14 @@ type Config struct {
 	Runner     CommandRunner
 	LookupHost func(ctx context.Context, host string) ([]string, error)
 	DiskFree   func(path string) (uint64, error)
+
+	// DialContext, when non-nil, overrides the TCP dialer used by TCP port
+	// checks. Tests inject a fake; production defaults to net.Dialer{}.
+	DialContext dialContextFunc
+
+	// procReader, when non-nil, overrides /proc/net/udp* file reading.
+	// Tests inject in-memory content; production uses os.ReadFile.
+	procReader func(path string) (string, error)
 
 	Timeouts Timeouts
 }
