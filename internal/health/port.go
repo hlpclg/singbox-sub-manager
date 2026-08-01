@@ -3,11 +3,10 @@ package health
 import (
 	"bufio"
 	"context"
-	"fmt"
+	"errors"
 	"net"
 	"os"
 	"strings"
-	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -158,63 +157,28 @@ func (c tcpPortCheck) Run(ctx context.Context, cfg Config) Result {
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	dial := cfg.DialContext
+	dial := cfg.dialContext
 	if dial == nil {
-		d := &net.Dialer{Timeout: timeout}
+		d := &net.Dialer{}
 		dial = d.DialContext
 	}
 
 	conn, err := dial(dialCtx, "tcp", addr)
 	if err != nil {
-		return Result{ID: c.id, Name: c.name, Status: StatusFail, Message: dialErrMessage(err)}
+		return Result{ID: c.id, Name: c.name, Status: StatusFail, Message: tcpDialErrMessage(err)}
 	}
 	conn.Close()
 	return Result{ID: c.id, Name: c.name, Status: StatusPass, Message: "reachable"}
 }
 
-// dialErrMessage returns a stable, non-sensitive failure message for TCP dial
-// errors. It deliberately does not include the address or underlying OS detail
-// so callers cannot extract configuration from error text.
-func dialErrMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	switch {
-	case isContextErr(err):
+// tcpDialErrMessage returns a fixed, stable, non-sensitive failure message.
+// Context cancellation and deadline errors are detected via errors.Is so that
+// wrapped errors are handled correctly and no error text is forwarded.
+func tcpDialErrMessage(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return "timeout or cancelled"
-	default:
-		return fmt.Sprintf("connection failed: %s", sanitiseDialErr(err))
 	}
+	// All other errors (connection refused, network unreachable, etc.) get a
+	// fixed message so no address, port, or OS detail is leaked.
+	return "connection failed"
 }
-
-// isContextErr reports whether err signals context cancellation or deadline.
-func isContextErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "context") ||
-		strings.Contains(msg, "deadline") ||
-		strings.Contains(msg, "canceled") ||
-		strings.Contains(msg, "cancelled")
-}
-
-// sanitiseDialErr strips the address portion from net.OpError messages to
-// avoid leaking configuration in error output.
-func sanitiseDialErr(err error) string {
-	if ne, ok := err.(*net.OpError); ok {
-		return ne.Op + " error"
-	}
-	// For context errors and other cases return a generic string.
-	s := err.Error()
-	if idx := strings.Index(s, ":"); idx > 0 {
-		// Trim after first colon to avoid including addresses.
-		s = strings.TrimSpace(s[:idx])
-	}
-	return s
-}
-
-// ---------------------------------------------------------------------------
-// Ensure unused import (time) is used; used implicitly via net.Dialer.Timeout.
-// ---------------------------------------------------------------------------
-var _ = time.Second // suppress "imported and not used" if compiler opts differ

@@ -86,9 +86,10 @@ type Config struct {
 	LookupHost func(ctx context.Context, host string) ([]string, error)
 	DiskFree   func(path string) (uint64, error)
 
-	// DialContext, when non-nil, overrides the TCP dialer used by TCP port
-	// checks. Tests inject a fake; production defaults to net.Dialer{}.
-	DialContext dialContextFunc
+	// dialContext, when non-nil, overrides the TCP dialer used by TCP port
+	// checks. Tests (same package) inject a fake; production defaults to
+	// net.Dialer{}.
+	dialContext dialContextFunc
 
 	// procReader, when non-nil, overrides /proc/net/udp* file reading.
 	// Tests inject in-memory content; production uses os.ReadFile.
