@@ -69,12 +69,16 @@ func srCheck() Check {
 func (c fileCheck) ID() string   { return c.id }
 func (c fileCheck) Name() string { return c.name }
 
+// Run executes the file check.
+// Local file opens and reads are synchronous stdlib operations that cannot be
+// interrupted by a context. We check context.Err() before starting I/O, rather
+// than inventing a timeout goroutine that would leak if blocked on a stuck mount.
 func (c fileCheck) Run(ctx context.Context, cfg Config) Result {
 	if ctx.Err() != nil {
 		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "cancelled"}
 	}
-	if !ValidToken(cfg.Token) {
-		// Cascade failure when token is unavailable.
+	if cfg.TokenErr != nil || !ValidToken(cfg.Token) {
+		// Cascade failure when token is unavailable or errored out.
 		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "token unavailable"}
 	}
 
@@ -91,6 +95,19 @@ func (c fileCheck) Run(ctx context.Context, cfg Config) Result {
 	}
 	if info.Size() == 0 {
 		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "empty"}
+	}
+
+	// Must actually open and read at least one byte to verify readability.
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "unreadable"}
+	}
+	defer f.Close()
+
+	var buf [1]byte
+	_, err = f.Read(buf[:])
+	if err != nil {
+		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "unreadable"}
 	}
 
 	return Result{ID: c.ID(), Name: c.Name(), Status: StatusPass, Message: fmt.Sprintf("present, %s", formatSize(info.Size()))}

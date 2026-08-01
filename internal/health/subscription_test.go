@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,10 +56,10 @@ func TestTokenCheck(t *testing.T) {
 		assertResult(t, r, "subscription.token", "subscription token", StatusFail, "invalid or missing")
 	})
 
-	t.Run("token_err", func(t *testing.T) {
-		cfg := Config{TokenErr: os.ErrNotExist}
+	t.Run("token_err_with_valid_string", func(t *testing.T) {
+		// Even if string is valid, if TokenErr is present it should fail
+		cfg := Config{Token: strings.Repeat("a", 16), TokenErr: errors.New("read error")}
 		r := c.Run(context.Background(), cfg)
-		// Should fail, and not leak token.
 		if r.Status != StatusFail {
 			t.Errorf("Status = %q, want fail", r.Status)
 		}
@@ -76,101 +77,125 @@ func TestTokenCheck(t *testing.T) {
 	})
 }
 
-func TestFileChecks(t *testing.T) {
-	root := t.TempDir()
-	validToken := strings.Repeat("a", 16)
-	tokenDir := filepath.Join(root, validToken)
-	if err := os.Mkdir(tokenDir, 0755); err != nil {
-		t.Fatal(err)
+func TestFileChecksMatrix(t *testing.T) {
+	checks := []struct {
+		check    Check
+		filename string
+		sizeMsg  string
+		size     int
+	}{
+		{clashCheck(), "clash.yaml", "8.2 KB", 8192},
+		{srCheck(), "sr.txt", "312 B", 312},
 	}
 
-	clashPath := filepath.Join(tokenDir, "clash.yaml")
-	if err := os.WriteFile(clashPath, make([]byte, 8192), 0644); err != nil {
-		t.Fatal(err)
+	for _, tc := range checks {
+		t.Run(tc.filename, func(t *testing.T) {
+			root := t.TempDir()
+			validToken := strings.Repeat("a", 16)
+			tokenDir := filepath.Join(root, validToken)
+			if err := os.Mkdir(tokenDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			// Pre-create the valid file
+			targetPath := filepath.Join(tokenDir, tc.filename)
+			if err := os.WriteFile(targetPath, make([]byte, tc.size), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg := Config{
+				SubscriptionRoot: root,
+				Token:            validToken,
+			}
+
+			t.Run("present", func(t *testing.T) {
+				r := tc.check.Run(context.Background(), cfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusPass, "present, "+tc.sizeMsg)
+			})
+
+			t.Run("token_unavailable_cascade", func(t *testing.T) {
+				badCfg := Config{SubscriptionRoot: root, Token: "invalid!"}
+				r := tc.check.Run(context.Background(), badCfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "token unavailable")
+			})
+
+			t.Run("token_err_cascade", func(t *testing.T) {
+				badCfg := Config{SubscriptionRoot: root, Token: validToken, TokenErr: errors.New("err")}
+				r := tc.check.Run(context.Background(), badCfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "token unavailable")
+			})
+
+			t.Run("missing_file", func(t *testing.T) {
+				missingToken := strings.Repeat("b", 16)
+				missingDir := filepath.Join(root, missingToken)
+				if err := os.Mkdir(missingDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				badCfg := Config{SubscriptionRoot: root, Token: missingToken}
+				r := tc.check.Run(context.Background(), badCfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "missing")
+			})
+
+			t.Run("empty_file", func(t *testing.T) {
+				emptyToken := strings.Repeat("c", 16)
+				dir := filepath.Join(root, emptyToken)
+				if err := os.Mkdir(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				emptyPath := filepath.Join(dir, tc.filename)
+				if err := os.WriteFile(emptyPath, []byte{}, 0644); err != nil {
+					t.Fatal(err)
+				}
+				badCfg := Config{SubscriptionRoot: root, Token: emptyToken}
+				r := tc.check.Run(context.Background(), badCfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "empty")
+			})
+
+			t.Run("unreadable_file_dir", func(t *testing.T) {
+				// unreadable due to being a directory
+				unreadableToken := strings.Repeat("d", 16)
+				dir := filepath.Join(root, unreadableToken)
+				if err := os.Mkdir(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				unreadablePath := filepath.Join(dir, tc.filename)
+				if err := os.Mkdir(unreadablePath, 0755); err != nil {
+					t.Fatal(err)
+				}
+				badCfg := Config{SubscriptionRoot: root, Token: unreadableToken}
+				r := tc.check.Run(context.Background(), badCfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "unreadable")
+				if strings.Contains(r.Message, unreadableToken) || strings.Contains(r.Message, root) {
+					t.Errorf("Error message leaks path/token: %s", r.Message)
+				}
+			})
+
+			t.Run("unreadable_file_perms", func(t *testing.T) {
+				if os.Getuid() == 0 {
+					t.Skip("skipping permission test as root")
+				}
+				// unreadable due to permissions
+				unreadableToken := strings.Repeat("e", 16)
+				dir := filepath.Join(root, unreadableToken)
+				if err := os.Mkdir(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				unreadablePath := filepath.Join(dir, tc.filename)
+				// Create file with 000 permissions
+				if err := os.WriteFile(unreadablePath, make([]byte, 10), 0000); err != nil {
+					t.Fatal(err)
+				}
+				badCfg := Config{SubscriptionRoot: root, Token: unreadableToken}
+				r := tc.check.Run(context.Background(), badCfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "unreadable")
+			})
+
+			t.Run("cancelled", func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				r := tc.check.Run(ctx, cfg)
+				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "cancelled")
+			})
+		})
 	}
-
-	srPath := filepath.Join(tokenDir, "sr.txt")
-	if err := os.WriteFile(srPath, make([]byte, 312), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := Config{
-		SubscriptionRoot: root,
-		Token:            validToken,
-	}
-
-	t.Run("clash_present", func(t *testing.T) {
-		c := clashCheck()
-		r := c.Run(context.Background(), cfg)
-		assertResult(t, r, "subscription.clash", "clash.yaml", StatusPass, "present, 8.2 KB")
-	})
-
-	t.Run("sr_present", func(t *testing.T) {
-		c := srCheck()
-		r := c.Run(context.Background(), cfg)
-		assertResult(t, r, "subscription.sr", "sr.txt", StatusPass, "present, 312 B")
-	})
-
-	t.Run("token_unavailable_cascade", func(t *testing.T) {
-		badCfg := Config{SubscriptionRoot: root, Token: "invalid!"}
-		c := clashCheck()
-		r := c.Run(context.Background(), badCfg)
-		assertResult(t, r, "subscription.clash", "clash.yaml", StatusFail, "token unavailable")
-	})
-
-	t.Run("missing_file", func(t *testing.T) {
-		emptyDir := filepath.Join(root, "empty")
-		if err := os.Mkdir(emptyDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-		badCfg := Config{SubscriptionRoot: root, Token: strings.Repeat("b", 16)}
-		c := clashCheck()
-		r := c.Run(context.Background(), badCfg)
-		assertResult(t, r, "subscription.clash", "clash.yaml", StatusFail, "missing")
-	})
-
-	t.Run("empty_file", func(t *testing.T) {
-		emptyToken := strings.Repeat("c", 16)
-		dir := filepath.Join(root, emptyToken)
-		if err := os.Mkdir(dir, 0755); err != nil {
-			t.Fatal(err)
-		}
-		clashPath := filepath.Join(dir, "clash.yaml")
-		if err := os.WriteFile(clashPath, []byte{}, 0644); err != nil {
-			t.Fatal(err)
-		}
-		badCfg := Config{SubscriptionRoot: root, Token: emptyToken}
-		c := clashCheck()
-		r := c.Run(context.Background(), badCfg)
-		assertResult(t, r, "subscription.clash", "clash.yaml", StatusFail, "empty")
-	})
-
-	t.Run("unreadable_file", func(t *testing.T) {
-		unreadableToken := strings.Repeat("d", 16)
-		dir := filepath.Join(root, unreadableToken)
-		if err := os.Mkdir(dir, 0755); err != nil {
-			t.Fatal(err)
-		}
-		// Make a directory where a file should be, causing IsRegular() to fail,
-		// simulating an unreadable/invalid file type.
-		clashPath := filepath.Join(dir, "clash.yaml")
-		if err := os.Mkdir(clashPath, 0755); err != nil {
-			t.Fatal(err)
-		}
-		badCfg := Config{SubscriptionRoot: root, Token: unreadableToken}
-		c := clashCheck()
-		r := c.Run(context.Background(), badCfg)
-		assertResult(t, r, "subscription.clash", "clash.yaml", StatusFail, "unreadable")
-		if strings.Contains(r.Message, unreadableToken) || strings.Contains(r.Message, root) {
-			t.Errorf("Error message leaks path/token: %s", r.Message)
-		}
-	})
-
-	t.Run("cancelled", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		c := clashCheck()
-		r := c.Run(ctx, cfg)
-		assertResult(t, r, "subscription.clash", "clash.yaml", StatusFail, "cancelled")
-	})
 }
