@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // fakeRunner returns a canned CommandResult and records the last call.
@@ -15,6 +16,18 @@ type fakeRunner struct {
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) CommandResult {
 	f.lastName, f.lastArgs = name, args
 	return f.res
+}
+
+// blockingRunner waits for cancellation so timeout behavior can be tested
+// without invoking a real command.
+type blockingRunner struct {
+	cancelled chan struct{}
+}
+
+func (f *blockingRunner) Run(ctx context.Context, name string, args ...string) CommandResult {
+	<-ctx.Done()
+	close(f.cancelled)
+	return CommandResult{Err: ctx.Err()}
 }
 
 func TestServiceCheck(t *testing.T) {
@@ -39,5 +52,27 @@ func TestServiceCheck(t *testing.T) {
 				t.Fatalf("unexpected command: %s %v", fr.lastName, fr.lastArgs)
 			}
 		})
+	}
+}
+
+func TestServiceCheckCommandTimeout(t *testing.T) {
+	runner := &blockingRunner{cancelled: make(chan struct{})}
+	cfg := Config{
+		Runner:   runner,
+		Timeouts: Timeouts{Command: 20 * time.Millisecond},
+	}
+
+	start := time.Now()
+	got := singboxServiceCheck().Run(context.Background(), cfg)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("check returned after %s, want prompt return after command timeout", elapsed)
+	}
+	if got.Status != StatusFail {
+		t.Fatalf("status = %q, want %q", got.Status, StatusFail)
+	}
+	select {
+	case <-runner.cancelled:
+	default:
+		t.Fatal("runner did not observe context cancellation")
 	}
 }

@@ -48,7 +48,8 @@ type CommandResult struct {
 }
 
 // CommandRunner runs external commands. Production uses ExecRunner; tests
-// inject a fake.
+// inject a fake. Run must respond to ctx.Done() and return promptly after
+// context cancellation.
 type CommandRunner interface {
 	Run(ctx context.Context, name string, args ...string) CommandResult
 }

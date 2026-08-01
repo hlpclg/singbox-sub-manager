@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestConfigCheck(t *testing.T) {
@@ -39,5 +40,27 @@ func TestConfigCheck(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("caddy validate missing --adapter caddyfile: %v", joined)
+	}
+}
+
+func TestConfigCheckCommandTimeout(t *testing.T) {
+	runner := &blockingRunner{cancelled: make(chan struct{})}
+	cfg := Config{
+		Runner:   runner,
+		Timeouts: Timeouts{Command: 20 * time.Millisecond},
+	}
+
+	start := time.Now()
+	got := singboxConfigCheck().Run(context.Background(), cfg)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("check returned after %s, want prompt return after command timeout", elapsed)
+	}
+	if got.Status != StatusFail {
+		t.Fatalf("status = %q, want %q", got.Status, StatusFail)
+	}
+	select {
+	case <-runner.cancelled:
+	default:
+		t.Fatal("runner did not observe context cancellation")
 	}
 }
