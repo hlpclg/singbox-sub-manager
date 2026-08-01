@@ -10,6 +10,19 @@ import (
 
 var tokenRegex = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 
+// readCloser is an internal seam for testing file I/O errors and closure.
+type readCloser interface {
+	Read(p []byte) (n int, err error)
+	Close() error
+}
+
+var (
+	osStat = os.Stat
+	osOpen = func(name string) (readCloser, error) {
+		return os.Open(name)
+	}
+)
+
 // ValidToken enforces the exact regex in the design for subscription tokens.
 func ValidToken(token string) bool {
 	return tokenRegex.MatchString(token)
@@ -83,7 +96,7 @@ func (c fileCheck) Run(ctx context.Context, cfg Config) Result {
 	}
 
 	path := filepath.Join(cfg.SubscriptionRoot, cfg.Token, c.filename)
-	info, err := os.Stat(path)
+	info, err := osStat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "missing"}
@@ -98,7 +111,7 @@ func (c fileCheck) Run(ctx context.Context, cfg Config) Result {
 	}
 
 	// Must actually open and read at least one byte to verify readability.
-	f, err := os.Open(path)
+	f, err := osOpen(path)
 	if err != nil {
 		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "unreadable"}
 	}
