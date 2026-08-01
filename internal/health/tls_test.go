@@ -106,14 +106,23 @@ func (l *trackingListener) Accept() (net.Conn, error) {
 
 type trackingConn struct {
 	net.Conn
-	closed *atomic.Int32
-	once   sync.Once
+	closed       *atomic.Int32
+	once         sync.Once
+	writeStarted chan struct{}
+	writeOnce    sync.Once
 }
 
 func (c *trackingConn) Close() error {
 	var err error
 	c.once.Do(func() { err = c.Conn.Close(); c.closed.Add(1) })
 	return err
+}
+
+func (c *trackingConn) Write(p []byte) (int, error) {
+	if c.writeStarted != nil {
+		c.writeOnce.Do(func() { close(c.writeStarted) })
+	}
+	return c.Conn.Write(p)
 }
 
 func (f *tlsFixture) cfg(now time.Time) Config {
@@ -192,7 +201,13 @@ func TestHTTPSSubscriptionFailuresAreRedacted(t *testing.T) {
 
 func TestHTTPSSubscriptionTimeoutAndCancellationCloseIdleConnections(t *testing.T) {
 	blocked := make(chan struct{})
-	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 20 * time.Millisecond, HTTP: 20 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	deadlineObserved := make(chan time.Duration, 1)
+	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 20 * time.Millisecond, TLS: 200 * time.Millisecond, HTTP: 400 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("TCP dial context has no deadline")
+		}
+		deadlineObserved <- time.Until(deadline)
 		<-ctx.Done()
 		close(blocked)
 		return nil, ctx.Err()
@@ -202,6 +217,14 @@ func TestHTTPSSubscriptionTimeoutAndCancellationCloseIdleConnections(t *testing.
 	case <-blocked:
 	case <-time.After(time.Second):
 		t.Fatal("dial did not observe deadline")
+	}
+	select {
+	case remaining := <-deadlineObserved:
+		if remaining <= 0 || remaining > 100*time.Millisecond {
+			t.Fatalf("TCP deadline remaining = %s", remaining)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial deadline was not observed")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -234,7 +257,7 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 			var cfg Config
 			var fixture *tlsFixture
 			if tc.phase == "handshake" {
-				cfg = Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: time.Second, TLS: 25 * time.Millisecond, HTTP: 25 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				cfg = Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 200 * time.Millisecond, TLS: 25 * time.Millisecond, HTTP: 400 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					server, client := net.Pipe()
 					t.Cleanup(func() { _ = server.Close() })
 					return &trackingConn{Conn: client, closed: &clientClosed}, nil
@@ -257,8 +280,13 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 					<-release
 				})
 				cfg = f.cfg(now)
-				cfg.Timeouts.HTTP = 25 * time.Millisecond
-				cfg.Timeouts.TLS = 25 * time.Millisecond
+				cfg.Timeouts.TCPConnect = 200 * time.Millisecond
+				cfg.Timeouts.TLS = 200 * time.Millisecond
+				if tc.cancelParent {
+					cfg.Timeouts.HTTP = 400 * time.Millisecond
+				} else {
+					cfg.Timeouts.HTTP = 25 * time.Millisecond
+				}
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -397,6 +425,43 @@ func TestTLSExpiryTimeoutAndParentCancellationCloseClient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assertTLSResult(t, tlsExpiryCheck().Run(ctx, cfg), "tls.expiry", "TLS expiry", StatusFail, "timeout or cancelled")
+}
+
+func TestTLSCertificateAndExpiryParentCancellationDuringHandshake(t *testing.T) {
+	for _, tc := range []struct {
+		check    Check
+		id, name string
+	}{
+		{tlsCertificateCheck(), "tls.certificate", "TLS certificate"}, {tlsExpiryCheck(), "tls.expiry", "TLS expiry"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			var clientClosed atomic.Int32
+			writeStarted := make(chan struct{})
+			cfg := Config{Domain: tlsTestDomain, Timeouts: Timeouts{TCPConnect: 200 * time.Millisecond, TLS: 400 * time.Millisecond, HTTP: 800 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				server, client := net.Pipe()
+				t.Cleanup(func() { _ = server.Close() })
+				return &trackingConn{Conn: client, closed: &clientClosed, writeStarted: writeStarted}, nil
+			}}
+			ctx, cancel := context.WithCancel(context.Background())
+			resultCh := make(chan Result, 1)
+			go func() { resultCh <- tc.check.Run(ctx, cfg) }()
+			select {
+			case <-writeStarted:
+			case <-time.After(time.Second):
+				t.Fatal("TLS handshake did not start")
+			}
+			cancel()
+			select {
+			case r := <-resultCh:
+				assertTLSResult(t, r, tc.id, tc.name, StatusFail, "timeout or cancelled")
+			case <-time.After(time.Second):
+				t.Fatal("Run did not return after cancellation")
+			}
+			if clientClosed.Load() == 0 {
+				t.Fatal("client connection was not closed before Run returned")
+			}
+		})
+	}
 }
 
 func TestTLSExpiryUsesInjectedClockAtExactBoundary(t *testing.T) {

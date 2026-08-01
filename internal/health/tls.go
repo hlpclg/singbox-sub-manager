@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,9 +36,15 @@ func (c httpsSubscriptionCheckImpl) Run(ctx context.Context, cfg Config) Result 
 	timeouts := tlsTimeouts(cfg)
 	reqCtx, cancel := context.WithTimeout(ctx, timeouts.HTTP)
 	defer cancel()
+	dialStarted := make(chan struct{})
+	dialFinished := make(chan struct{})
+	var dialOnce sync.Once
+	var dialFinishedOnce sync.Once
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig(cfg),
 		DialTLSContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+			dialOnce.Do(func() { close(dialStarted) })
+			defer dialFinishedOnce.Do(func() { close(dialFinished) })
 			conn, err := tlsDial(dialCtx, cfg, timeouts.TCPConnect)
 			if err != nil {
 				return nil, err
@@ -52,20 +59,36 @@ func (c httpsSubscriptionCheckImpl) Run(ctx context.Context, cfg Config) Result 
 			return tlsConn, nil
 		},
 	}
-	defer transport.CloseIdleConnections()
+	finishDial := func() {
+		transport.CloseIdleConnections()
+		// Transport starts DialTLSContext asynchronously. If it acquired a
+		// connection, it signals before doing so; wait for its explicit close
+		// on failure or completion before Run returns. A callback that starts
+		// only after this point sees the cancelled request context and cannot
+		// acquire a connection through tlsDial.
+		select {
+		case <-dialStarted:
+			<-dialFinished
+		default:
+		}
+	}
 	client := &http.Client{Transport: transport, Timeout: timeouts.HTTP}
 	target := (&url.URL{Scheme: "https", Host: cfg.Domain, Path: "/" + cfg.Token + "/clash.yaml"}).String()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
 	if err != nil {
+		finishDial()
 		return tlsResult(c.ID(), c.Name(), StatusFail, "request failed")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		finishDial()
 		return tlsResult(c.ID(), c.Name(), StatusFail, httpErrorMessage(err))
 	}
-	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return tlsResult(c.ID(), c.Name(), StatusFail, httpErrorMessage(err))
+	_, readErr := io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	finishDial()
+	if readErr != nil {
+		return tlsResult(c.ID(), c.Name(), StatusFail, httpErrorMessage(readErr))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return tlsResult(c.ID(), c.Name(), StatusFail, "HTTP status not 200")
