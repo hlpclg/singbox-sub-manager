@@ -92,6 +92,14 @@ type Config struct {
 	// net.Dialer{}.
 	dialContext dialContextFunc
 
+	// tlsDialContext is the instance-level TCP seam used by HTTPS and TLS
+	// checks. It remains package-visible to keep the public Config surface
+	// stable while allowing deterministic lifecycle tests.
+	tlsDialContext dialContextFunc
+
+	// now is an instance-level clock seam for certificate-expiry boundaries.
+	now func() time.Time
+
 	// procReader, when non-nil, overrides /proc/net/udp* file reading.
 	// Tests inject in-memory content; production uses os.ReadFile.
 	procReader func(path string) (string, error)
