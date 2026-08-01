@@ -11,6 +11,26 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func assertResult(t *testing.T, r Result, id, name string, status Status, msg string) {
+	t.Helper()
+	if r.ID != id {
+		t.Errorf("ID = %q, want %q", r.ID, id)
+	}
+	if r.Name != name {
+		t.Errorf("Name = %q, want %q", r.Name, name)
+	}
+	if r.Status != status {
+		t.Errorf("Status = %q, want %q", r.Status, status)
+	}
+	if r.Message != msg {
+		t.Errorf("Message = %q, want %q", r.Message, msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // UDP 443 tests
 // ---------------------------------------------------------------------------
 
@@ -49,18 +69,7 @@ func TestUDP443_IPv4RowPasses(t *testing.T) {
 	c := udp443Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.ID != "port.udp443" {
-		t.Errorf("ID = %q, want port.udp443", r.ID)
-	}
-	if r.Name != "UDP 443" {
-		t.Errorf("Name = %q, want UDP 443", r.Name)
-	}
-	if r.Status != StatusPass {
-		t.Errorf("Status = %q, want pass", r.Status)
-	}
-	if r.Message != "listening" {
-		t.Errorf("Message = %q, want listening", r.Message)
-	}
+	assertResult(t, r, "port.udp443", "UDP 443", StatusPass, "listening")
 }
 
 func TestUDP443_IPv6RowPassesWhenIPv4Missing(t *testing.T) {
@@ -70,9 +79,8 @@ func TestUDP443_IPv6RowPassesWhenIPv4Missing(t *testing.T) {
 	cfg := udpCfg(map[string]string{"/proc/net/udp6": ipv6Content})
 	c := udp443Check()
 	r := c.Run(context.Background(), cfg)
-	if r.Status != StatusPass {
-		t.Errorf("Status = %q, want pass; message = %q", r.Status, r.Message)
-	}
+
+	assertResult(t, r, "port.udp443", "UDP 443", StatusPass, "listening")
 }
 
 func TestUDP443_RemoteAddrPortDoesNotPass(t *testing.T) {
@@ -81,9 +89,8 @@ func TestUDP443_RemoteAddrPortDoesNotPass(t *testing.T) {
 	cfg := udpCfg(map[string]string{"/proc/net/udp": content})
 	c := udp443Check()
 	r := c.Run(context.Background(), cfg)
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail (remote-only match should not pass)", r.Status)
-	}
+
+	assertResult(t, r, "port.udp443", "UDP 443", StatusFail, "not listening")
 }
 
 func TestUDP443_MalformedPortsDoNotPass(t *testing.T) {
@@ -105,9 +112,8 @@ func TestUDP443_MalformedPortsDoNotPass(t *testing.T) {
 			cfg := udpCfg(map[string]string{"/proc/net/udp": tc.content})
 			c := udp443Check()
 			r := c.Run(context.Background(), cfg)
-			if r.Status == StatusPass {
-				t.Errorf("Status = pass unexpectedly for %q; message = %q", tc.name, r.Message)
-			}
+
+			assertResult(t, r, "port.udp443", "UDP 443", StatusFail, "not listening")
 		})
 	}
 }
@@ -119,18 +125,7 @@ func TestUDP443_NoMatch_ReturnsNotListening(t *testing.T) {
 	c := udp443Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.ID != "port.udp443" {
-		t.Errorf("ID = %q, want port.udp443", r.ID)
-	}
-	if r.Name != "UDP 443" {
-		t.Errorf("Name = %q, want UDP 443", r.Name)
-	}
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail", r.Status)
-	}
-	if r.Message != "not listening" {
-		t.Errorf("Message = %q, want \"not listening\"", r.Message)
-	}
+	assertResult(t, r, "port.udp443", "UDP 443", StatusFail, "not listening")
 }
 
 func TestUDP443_AllSourcesUnreadable_StableMessage(t *testing.T) {
@@ -143,19 +138,8 @@ func TestUDP443_AllSourcesUnreadable_StableMessage(t *testing.T) {
 	c := udp443Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.ID != "port.udp443" {
-		t.Errorf("ID = %q, want port.udp443", r.ID)
-	}
-	if r.Name != "UDP 443" {
-		t.Errorf("Name = %q, want UDP 443", r.Name)
-	}
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail", r.Status)
-	}
-	// Message must be the stable fixed string and must not contain OS detail.
-	if r.Message != "proc source unavailable" {
-		t.Errorf("Message = %q, want \"proc source unavailable\"", r.Message)
-	}
+	assertResult(t, r, "port.udp443", "UDP 443", StatusFail, "proc source unavailable")
+
 	if strings.Contains(r.Message, "permission") {
 		t.Errorf("Message = %q: must not contain sensitive OS detail", r.Message)
 	}
@@ -183,19 +167,8 @@ func TestUDP443_PreCancelledContext_ReturnsPromptly(t *testing.T) {
 		t.Fatal("Run did not return promptly after pre-cancelled context")
 	}
 
-	// Exact field assertions.
-	if r.ID != "port.udp443" {
-		t.Errorf("ID = %q, want port.udp443", r.ID)
-	}
-	if r.Name != "UDP 443" {
-		t.Errorf("Name = %q, want UDP 443", r.Name)
-	}
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail", r.Status)
-	}
-	if r.Message != "cancelled" {
-		t.Errorf("Message = %q, want cancelled", r.Message)
-	}
+	assertResult(t, r, "port.udp443", "UDP 443", StatusFail, "cancelled")
+
 	// procReader must never be called when context is already cancelled.
 	if n := atomic.LoadInt64(&readerCalls); n != 0 {
 		t.Errorf("procReader called %d time(s), want 0", n)
@@ -214,9 +187,8 @@ func TestUDP443_FirstSourceMissingSecondReadable(t *testing.T) {
 	cfg.ProcNetUDP = []string{"/proc/net/udp", "/proc/net/udp6"}
 	c := udp443Check()
 	r := c.Run(context.Background(), cfg)
-	if r.Status != StatusPass {
-		t.Errorf("Status = %q, want pass when first source missing but second readable", r.Status)
-	}
+
+	assertResult(t, r, "port.udp443", "UDP 443", StatusPass, "listening")
 }
 
 // ---------------------------------------------------------------------------
@@ -243,18 +215,7 @@ func TestTCP443_SuccessAgainstEphemeralListener(t *testing.T) {
 	c := tcp443Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.ID != "port.tcp443" {
-		t.Errorf("ID = %q, want port.tcp443", r.ID)
-	}
-	if r.Name != "TCP 443" {
-		t.Errorf("Name = %q, want TCP 443", r.Name)
-	}
-	if r.Status != StatusPass {
-		t.Errorf("Status = %q, want pass; message = %q", r.Status, r.Message)
-	}
-	if r.Message != "reachable" {
-		t.Errorf("Message = %q, want reachable", r.Message)
-	}
+	assertResult(t, r, "port.tcp443", "TCP 443", StatusPass, "reachable")
 }
 
 func TestTCP80_UsesOwnAddress(t *testing.T) {
@@ -270,18 +231,7 @@ func TestTCP80_UsesOwnAddress(t *testing.T) {
 	c := tcp80Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.ID != "port.tcp80" {
-		t.Errorf("ID = %q, want port.tcp80", r.ID)
-	}
-	if r.Name != "TCP 80" {
-		t.Errorf("Name = %q, want TCP 80", r.Name)
-	}
-	if r.Status != StatusPass {
-		t.Errorf("Status = %q, want pass; message = %q", r.Status, r.Message)
-	}
-	if r.Message != "reachable" {
-		t.Errorf("Message = %q, want reachable", r.Message)
-	}
+	assertResult(t, r, "port.tcp80", "TCP 80", StatusPass, "reachable")
 }
 
 func TestTCP443_ClosedAddress_Fails(t *testing.T) {
@@ -297,27 +247,15 @@ func TestTCP443_ClosedAddress_Fails(t *testing.T) {
 	c := tcp443Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.ID != "port.tcp443" {
-		t.Errorf("ID = %q, want port.tcp443", r.ID)
-	}
-	if r.Name != "TCP 443" {
-		t.Errorf("Name = %q, want TCP 443", r.Name)
-	}
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail against closed port", r.Status)
-	}
-	if r.Message != "connection failed" {
-		t.Errorf("Message = %q, want \"connection failed\"", r.Message)
-	}
+	assertResult(t, r, "port.tcp443", "TCP 443", StatusFail, "connection failed")
 }
 
 // fakeDial is a context-aware dial that blocks until ctx is cancelled and
-// records the address it was called with and the deadline set on ctx.
+// records the address it was called with.
 type fakeDial struct {
 	called    chan struct{}
 	cancelled chan struct{}
 	dialAddr  chan string
-	deadline  chan time.Time
 }
 
 func newFakeDial() *fakeDial {
@@ -325,7 +263,6 @@ func newFakeDial() *fakeDial {
 		called:    make(chan struct{}, 1),
 		cancelled: make(chan struct{}, 1),
 		dialAddr:  make(chan string, 1),
-		deadline:  make(chan time.Time, 1),
 	}
 }
 
@@ -338,12 +275,6 @@ func (f *fakeDial) dial(ctx context.Context, network, addr string) (net.Conn, er
 	case f.dialAddr <- addr:
 	default:
 	}
-	if dl, ok := ctx.Deadline(); ok {
-		select {
-		case f.deadline <- dl:
-		default:
-		}
-	}
 	<-ctx.Done()
 	select {
 	case f.cancelled <- struct{}{}:
@@ -352,7 +283,7 @@ func (f *fakeDial) dial(ctx context.Context, network, addr string) (net.Conn, er
 	return nil, ctx.Err()
 }
 
-func TestTCP443_ContextAwareDial_TimesOut(t *testing.T) {
+func TestTCP443_ContextAwareDial_ObservesCancellation(t *testing.T) {
 	fd := newFakeDial()
 	cfg := tcpCfg(fd.dial, "127.0.0.1:443", "")
 	cfg.Timeouts.TCPConnect = 50 * time.Millisecond
@@ -362,19 +293,7 @@ func TestTCP443_ContextAwareDial_TimesOut(t *testing.T) {
 	r := c.Run(context.Background(), cfg)
 	elapsed := time.Since(start)
 
-	// Exact field assertions.
-	if r.ID != "port.tcp443" {
-		t.Errorf("ID = %q, want port.tcp443", r.ID)
-	}
-	if r.Name != "TCP 443" {
-		t.Errorf("Name = %q, want TCP 443", r.Name)
-	}
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail on timeout", r.Status)
-	}
-	if r.Message != "timeout or cancelled" {
-		t.Errorf("Message = %q, want \"timeout or cancelled\"", r.Message)
-	}
+	assertResult(t, r, "port.tcp443", "TCP 443", StatusFail, "timeout or cancelled")
 
 	// Must return within generous margin of the timeout.
 	if elapsed > 2*time.Second {
@@ -386,23 +305,39 @@ func TestTCP443_ContextAwareDial_TimesOut(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("fake dial did not observe cancellation")
 	}
-	// The deadline set on ctx must be consistent with cfg.Timeouts.TCPConnect.
-	select {
-	case dl := <-fd.deadline:
-		remaining := time.Until(dl)
-		// Allow generous margin: deadline must be within [0, 2×timeout] from now.
-		// At this point elapsed time has passed, so we check it was in the future
-		// relative to start (i.e., deadline > start).
-		if dl.Before(start) {
-			t.Errorf("dial deadline %v was before test start %v", dl, start)
+}
+
+func TestTCP443_ContextAwareDial_DeadlineInterval(t *testing.T) {
+	var capturedDeadline time.Time
+
+	dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if dl, ok := ctx.Deadline(); ok {
+			capturedDeadline = dl
 		}
-		// And must not be more than 2× the configured timeout from test start.
-		maxDeadline := start.Add(2 * cfg.Timeouts.TCPConnect)
-		if dl.After(maxDeadline) {
-			t.Errorf("dial deadline %v exceeds 2× TCPConnect from start; remaining from now = %v", dl, remaining)
-		}
-	case <-time.After(time.Second):
-		t.Error("fake dial did not report a deadline")
+		// Return immediately so we can accurately measure before/after.
+		return nil, context.Canceled
+	}
+
+	cfg := tcpCfg(dialCtx, "127.0.0.1:443", "")
+	cfg.Timeouts.TCPConnect = 50 * time.Millisecond
+
+	before := time.Now()
+	c := tcp443Check()
+	c.Run(context.Background(), cfg)
+	after := time.Now()
+
+	if capturedDeadline.IsZero() {
+		t.Fatal("no deadline was set on context")
+	}
+
+	minDeadline := before.Add(cfg.Timeouts.TCPConnect)
+	maxDeadline := after.Add(cfg.Timeouts.TCPConnect)
+
+	if capturedDeadline.Before(minDeadline) {
+		t.Errorf("deadline %v is before min %v", capturedDeadline, minDeadline)
+	}
+	if capturedDeadline.After(maxDeadline) {
+		t.Errorf("deadline %v is after max %v", capturedDeadline, maxDeadline)
 	}
 }
 
@@ -415,19 +350,8 @@ func TestTCP443_PreCancelledContext_NoDial(t *testing.T) {
 	c := tcp443Check()
 	r := c.Run(ctx, cfg)
 
-	// Exact field assertions.
-	if r.ID != "port.tcp443" {
-		t.Errorf("ID = %q, want port.tcp443", r.ID)
-	}
-	if r.Name != "TCP 443" {
-		t.Errorf("Name = %q, want TCP 443", r.Name)
-	}
-	if r.Status != StatusFail {
-		t.Errorf("Status = %q, want fail", r.Status)
-	}
-	if r.Message != "cancelled" {
-		t.Errorf("Message = %q, want \"cancelled\"", r.Message)
-	}
+	assertResult(t, r, "port.tcp443", "TCP 443", StatusFail, "cancelled")
+
 	// Dial must NOT have been called since ctx was already cancelled.
 	select {
 	case <-fd.called:
@@ -471,9 +395,8 @@ func TestTCP443_SuccessfulDial_ClosesCalled(t *testing.T) {
 	c := tcp443Check()
 	r := c.Run(context.Background(), cfg)
 
-	if r.Status != StatusPass {
-		t.Errorf("Status = %q, want pass", r.Status)
-	}
+	assertResult(t, r, "port.tcp443", "TCP 443", StatusPass, "reachable")
+
 	select {
 	case <-closed:
 	case <-time.After(time.Second):
@@ -510,15 +433,7 @@ func TestPortChecks_DefaultAddresses(t *testing.T) {
 		if rec.addr != "127.0.0.1:443" {
 			t.Errorf("dialled %q, want 127.0.0.1:443", rec.addr)
 		}
-		if r.ID != "port.tcp443" {
-			t.Errorf("ID = %q, want port.tcp443", r.ID)
-		}
-		if r.Name != "TCP 443" {
-			t.Errorf("Name = %q, want TCP 443", r.Name)
-		}
-		if r.Status != StatusFail {
-			t.Errorf("Status = %q, want fail", r.Status)
-		}
+		assertResult(t, r, "port.tcp443", "TCP 443", StatusFail, "timeout or cancelled")
 	})
 
 	t.Run("tcp80_default_addr", func(t *testing.T) {
@@ -535,15 +450,7 @@ func TestPortChecks_DefaultAddresses(t *testing.T) {
 		if rec.addr != "127.0.0.1:80" {
 			t.Errorf("dialled %q, want 127.0.0.1:80", rec.addr)
 		}
-		if r.ID != "port.tcp80" {
-			t.Errorf("ID = %q, want port.tcp80", r.ID)
-		}
-		if r.Name != "TCP 80" {
-			t.Errorf("Name = %q, want TCP 80", r.Name)
-		}
-		if r.Status != StatusFail {
-			t.Errorf("Status = %q, want fail", r.Status)
-		}
+		assertResult(t, r, "port.tcp80", "TCP 80", StatusFail, "timeout or cancelled")
 	})
 
 	t.Run("udp443_identity", func(t *testing.T) {
