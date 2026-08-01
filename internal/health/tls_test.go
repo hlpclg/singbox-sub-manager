@@ -199,10 +199,20 @@ func TestHTTPSSubscriptionFailuresAreRedacted(t *testing.T) {
 	}
 }
 
+func TestHTTPSSubscriptionRedirectIsNotFollowed(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	f := newTLSFixture(t, tlsTestDomain, now.Add(-time.Hour), now.Add(30*24*time.Hour), http.StatusFound, "redirect")
+	f.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://"+tlsTestDomain+"/other")
+		w.WriteHeader(http.StatusFound)
+	})
+	assertTLSResult(t, httpsSubscriptionCheck().Run(context.Background(), f.cfg(now)), "http.subscription", "clash subscription", StatusFail, "HTTP status not 200")
+}
+
 func TestHTTPSSubscriptionTimeoutAndCancellationCloseIdleConnections(t *testing.T) {
 	blocked := make(chan struct{})
 	deadlineObserved := make(chan time.Duration, 1)
-	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 20 * time.Millisecond, TLS: 200 * time.Millisecond, HTTP: 400 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 100 * time.Millisecond, TLS: 500 * time.Millisecond, HTTP: time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			t.Fatal("TCP dial context has no deadline")
@@ -220,7 +230,7 @@ func TestHTTPSSubscriptionTimeoutAndCancellationCloseIdleConnections(t *testing.
 	}
 	select {
 	case remaining := <-deadlineObserved:
-		if remaining <= 0 || remaining > 100*time.Millisecond {
+		if remaining < 70*time.Millisecond || remaining > 120*time.Millisecond {
 			t.Fatalf("TCP deadline remaining = %s", remaining)
 		}
 	case <-time.After(time.Second):
@@ -243,6 +253,63 @@ func TestHTTPSSubscriptionDefaultLoopbackAddress(t *testing.T) {
 	}
 }
 
+func TestHTTPSSubscriptionParentCancellationDuringTCPDial(t *testing.T) {
+	started := make(chan struct{})
+	var closed atomic.Int32
+	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: time.Second, TLS: time.Second, HTTP: 2 * time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		closed.Add(1)
+		return nil, ctx.Err()
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan Result, 1)
+	go func() { results <- httpsSubscriptionCheck().Run(ctx, cfg) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("TCP dial did not start")
+	}
+	cancel()
+	select {
+	case r := <-results:
+		assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "timeout or cancelled")
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after TCP cancellation")
+	}
+	if closed.Load() != 1 {
+		t.Fatalf("cancelled TCP dial completions = %d", closed.Load())
+	}
+}
+
+func TestHTTPSSubscriptionParentCancellationDuringTLSHandshake(t *testing.T) {
+	writeStarted := make(chan struct{})
+	var clientClosed atomic.Int32
+	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: time.Second, TLS: 2 * time.Second, HTTP: 3 * time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		server, client := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		return &trackingConn{Conn: client, closed: &clientClosed, writeStarted: writeStarted}, nil
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan Result, 1)
+	go func() { results <- httpsSubscriptionCheck().Run(ctx, cfg) }()
+	select {
+	case <-writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("TLS handshake did not start")
+	}
+	cancel()
+	select {
+	case r := <-results:
+		assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "timeout or cancelled")
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after TLS cancellation")
+	}
+	if clientClosed.Load() == 0 {
+		t.Fatal("TLS client connection was not closed before Run returned")
+	}
+}
+
 func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -257,7 +324,7 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 			var cfg Config
 			var fixture *tlsFixture
 			if tc.phase == "handshake" {
-				cfg = Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 200 * time.Millisecond, TLS: 25 * time.Millisecond, HTTP: 400 * time.Millisecond}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				cfg = Config{Domain: tlsTestDomain, Token: tlsTestToken, Timeouts: Timeouts{TCPConnect: 500 * time.Millisecond, TLS: 100 * time.Millisecond, HTTP: time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					server, client := net.Pipe()
 					t.Cleanup(func() { _ = server.Close() })
 					return &trackingConn{Conn: client, closed: &clientClosed}, nil
@@ -280,12 +347,12 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 					<-release
 				})
 				cfg = f.cfg(now)
-				cfg.Timeouts.TCPConnect = 200 * time.Millisecond
-				cfg.Timeouts.TLS = 200 * time.Millisecond
+				cfg.Timeouts.TCPConnect = time.Second
+				cfg.Timeouts.TLS = 500 * time.Millisecond
 				if tc.cancelParent {
-					cfg.Timeouts.HTTP = 400 * time.Millisecond
+					cfg.Timeouts.HTTP = time.Second
 				} else {
-					cfg.Timeouts.HTTP = 25 * time.Millisecond
+					cfg.Timeouts.HTTP = 200 * time.Millisecond
 				}
 			}
 			ctx, cancel := context.WithCancel(context.Background())

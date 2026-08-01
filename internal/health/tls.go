@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,9 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -36,59 +35,52 @@ func (c httpsSubscriptionCheckImpl) Run(ctx context.Context, cfg Config) Result 
 	timeouts := tlsTimeouts(cfg)
 	reqCtx, cancel := context.WithTimeout(ctx, timeouts.HTTP)
 	defer cancel()
-	dialStarted := make(chan struct{})
-	dialFinished := make(chan struct{})
-	var dialOnce sync.Once
-	var dialFinishedOnce sync.Once
-	transport := &http.Transport{
-		TLSClientConfig: tlsConfig(cfg),
-		DialTLSContext: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
-			dialOnce.Do(func() { close(dialStarted) })
-			defer dialFinishedOnce.Do(func() { close(dialFinished) })
-			conn, err := tlsDial(dialCtx, cfg, timeouts.TCPConnect)
-			if err != nil {
-				return nil, err
-			}
-			tlsConn := tls.Client(conn, tlsConfig(cfg))
-			handshakeCtx, cancelHandshake := context.WithTimeout(dialCtx, timeouts.TLS)
-			defer cancelHandshake()
-			if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-				_ = tlsConn.Close()
-				return nil, err
-			}
-			return tlsConn, nil
-		},
-	}
-	finishDial := func() {
-		transport.CloseIdleConnections()
-		// Transport starts DialTLSContext asynchronously. If it acquired a
-		// connection, it signals before doing so; wait for its explicit close
-		// on failure or completion before Run returns. A callback that starts
-		// only after this point sees the cancelled request context and cannot
-		// acquire a connection through tlsDial.
-		select {
-		case <-dialStarted:
-			<-dialFinished
-		default:
-		}
-	}
-	client := &http.Client{Transport: transport, Timeout: timeouts.HTTP}
-	target := (&url.URL{Scheme: "https", Host: cfg.Domain, Path: "/" + cfg.Token + "/clash.yaml"}).String()
+	target := "https://" + cfg.Domain + "/" + cfg.Token + "/clash.yaml"
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
 	if err != nil {
-		finishDial()
 		return tlsResult(c.ID(), c.Name(), StatusFail, "request failed")
 	}
-	resp, err := client.Do(req)
+	conn, err := tlsDial(reqCtx, cfg, timeouts.TCPConnect)
 	if err != nil {
-		finishDial()
-		return tlsResult(c.ID(), c.Name(), StatusFail, httpErrorMessage(err))
+		return tlsResult(c.ID(), c.Name(), StatusFail, httpContextError(reqCtx, err))
+	}
+	tlsConn := tls.Client(conn, tlsConfig(cfg))
+	defer tlsConn.Close()
+	handshakeCtx, cancelHandshake := context.WithTimeout(reqCtx, timeouts.TLS)
+	err = tlsConn.HandshakeContext(handshakeCtx)
+	cancelHandshake()
+	if err != nil {
+		return tlsResult(c.ID(), c.Name(), StatusFail, httpContextError(reqCtx, err))
+	}
+
+	// A parent context without a deadline must still interrupt a blocked HTTP
+	// write/read. The watcher owns no work after stop is closed, and Run waits
+	// for it before returning.
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-reqCtx.Done():
+			_ = tlsConn.Close()
+		case <-stopWatch:
+		}
+	}()
+	defer func() { close(stopWatch); <-watchDone }()
+	if deadline, ok := reqCtx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(deadline)
+	}
+	if err := req.Write(tlsConn); err != nil {
+		return tlsResult(c.ID(), c.Name(), StatusFail, httpContextError(reqCtx, err))
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
+	if err != nil {
+		return tlsResult(c.ID(), c.Name(), StatusFail, httpContextError(reqCtx, err))
 	}
 	_, readErr := io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	finishDial()
 	if readErr != nil {
-		return tlsResult(c.ID(), c.Name(), StatusFail, httpErrorMessage(readErr))
+		return tlsResult(c.ID(), c.Name(), StatusFail, httpContextError(reqCtx, readErr))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return tlsResult(c.ID(), c.Name(), StatusFail, "HTTP status not 200")
@@ -218,6 +210,10 @@ func httpErrorMessage(err error) string {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return "timeout or cancelled"
 	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout or cancelled"
+	}
 	// net/http exposes TLSHandshakeTimeout as an unexported error type. Its
 	// stable standard-library text is inspected only to map it to our fixed,
 	// non-sensitive public diagnostic.
@@ -225,6 +221,13 @@ func httpErrorMessage(err error) string {
 		return "timeout or cancelled"
 	}
 	return "request failed"
+}
+
+func httpContextError(ctx context.Context, err error) string {
+	if ctx.Err() != nil {
+		return "timeout or cancelled"
+	}
+	return httpErrorMessage(err)
 }
 
 func tlsResult(id, name string, status Status, message string) Result {
