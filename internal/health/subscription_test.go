@@ -80,15 +80,19 @@ func TestTokenCheck(t *testing.T) {
 
 // fakeFile implements readCloser for verifying file operations.
 type fakeFile struct {
-	readErr   error
-	closeChan chan struct{}
+	readCloser readCloser
+	readErr    error
+	closeChan  chan struct{}
 }
 
 func (f *fakeFile) Read(p []byte) (n int, err error) {
 	if f.readErr != nil {
 		return 0, f.readErr
 	}
-	// Simulate reading 1 byte successfully
+	if f.readCloser != nil {
+		return f.readCloser.Read(p)
+	}
+	// Simulate reading 1 byte successfully if no real file
 	if len(p) > 0 {
 		p[0] = 'a'
 		return 1, nil
@@ -97,11 +101,15 @@ func (f *fakeFile) Read(p []byte) (n int, err error) {
 }
 
 func (f *fakeFile) Close() error {
+	var err error
+	if f.readCloser != nil {
+		err = f.readCloser.Close()
+	}
 	select {
 	case f.closeChan <- struct{}{}:
 	default:
 	}
-	return nil
+	return err
 }
 
 func TestFileChecksMatrix(t *testing.T) {
@@ -120,31 +128,23 @@ func TestFileChecksMatrix(t *testing.T) {
 			var statCalls int64
 			var openCalls int64
 
-			// Save original seams and restore after test
-			origStat := osStat
-			origOpen := osOpen
-			defer func() {
-				osStat = origStat
-				osOpen = origOpen
-			}()
-
 			// Setup fakes per test
 			var fakeStat func(name string) (os.FileInfo, error)
 			var fakeOpen func(name string) (readCloser, error)
 
-			osStat = func(name string) (os.FileInfo, error) {
+			cfgStat := func(name string) (os.FileInfo, error) {
 				atomic.AddInt64(&statCalls, 1)
 				if fakeStat != nil {
 					return fakeStat(name)
 				}
-				return origStat(name)
+				return os.Stat(name)
 			}
-			osOpen = func(name string) (readCloser, error) {
+			cfgOpen := func(name string) (readCloser, error) {
 				atomic.AddInt64(&openCalls, 1)
 				if fakeOpen != nil {
 					return fakeOpen(name)
 				}
-				return origOpen(name)
+				return os.Open(name)
 			}
 
 			root := t.TempDir()
@@ -162,6 +162,8 @@ func TestFileChecksMatrix(t *testing.T) {
 			cfg := Config{
 				SubscriptionRoot: root,
 				Token:            validToken,
+				osStat:           cfgStat,
+				osOpen:           cfgOpen,
 			}
 
 			t.Run("present", func(t *testing.T) {
@@ -169,8 +171,21 @@ func TestFileChecksMatrix(t *testing.T) {
 				atomic.StoreInt64(&openCalls, 0)
 
 				closed := make(chan struct{}, 1)
+				fakeStat = func(name string) (os.FileInfo, error) {
+					if name != targetPath {
+						t.Errorf("Stat name = %q, want %q", name, targetPath)
+					}
+					return os.Stat(name)
+				}
 				fakeOpen = func(name string) (readCloser, error) {
-					return &fakeFile{closeChan: closed}, nil
+					if name != targetPath {
+						t.Errorf("Open name = %q, want %q", name, targetPath)
+					}
+					f, err := os.Open(name)
+					if err != nil {
+						return nil, err
+					}
+					return &fakeFile{readCloser: f, closeChan: closed}, nil
 				}
 
 				r := tc.check.Run(context.Background(), cfg)
@@ -182,13 +197,20 @@ func TestFileChecksMatrix(t *testing.T) {
 				default:
 					t.Error("Close was not called on successful read")
 				}
+
+				if atomic.LoadInt64(&statCalls) != 1 {
+					t.Errorf("statCalls = %d, want 1", atomic.LoadInt64(&statCalls))
+				}
+				if atomic.LoadInt64(&openCalls) != 1 {
+					t.Errorf("openCalls = %d, want 1", atomic.LoadInt64(&openCalls))
+				}
 			})
 
 			t.Run("token_unavailable_cascade", func(t *testing.T) {
 				atomic.StoreInt64(&statCalls, 0)
 				atomic.StoreInt64(&openCalls, 0)
 
-				badCfg := Config{SubscriptionRoot: root, Token: "invalid!"}
+				badCfg := Config{SubscriptionRoot: root, Token: "invalid!", osStat: cfgStat, osOpen: cfgOpen}
 				r := tc.check.Run(context.Background(), badCfg)
 				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "token unavailable")
 
@@ -201,7 +223,7 @@ func TestFileChecksMatrix(t *testing.T) {
 				atomic.StoreInt64(&statCalls, 0)
 				atomic.StoreInt64(&openCalls, 0)
 
-				badCfg := Config{SubscriptionRoot: root, Token: validToken, TokenErr: errors.New("err")}
+				badCfg := Config{SubscriptionRoot: root, Token: validToken, TokenErr: errors.New("err"), osStat: cfgStat, osOpen: cfgOpen}
 				r := tc.check.Run(context.Background(), badCfg)
 				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "token unavailable")
 
@@ -222,7 +244,7 @@ func TestFileChecksMatrix(t *testing.T) {
 				if err := os.Mkdir(missingDir, 0755); err != nil {
 					t.Fatal(err)
 				}
-				badCfg := Config{SubscriptionRoot: root, Token: missingToken}
+				badCfg := Config{SubscriptionRoot: root, Token: missingToken, osStat: cfgStat, osOpen: cfgOpen}
 				r := tc.check.Run(context.Background(), badCfg)
 				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "missing")
 
@@ -244,7 +266,7 @@ func TestFileChecksMatrix(t *testing.T) {
 				if err := os.WriteFile(emptyPath, []byte{}, 0644); err != nil {
 					t.Fatal(err)
 				}
-				badCfg := Config{SubscriptionRoot: root, Token: emptyToken}
+				badCfg := Config{SubscriptionRoot: root, Token: emptyToken, osStat: cfgStat, osOpen: cfgOpen}
 				r := tc.check.Run(context.Background(), badCfg)
 				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "empty")
 
@@ -266,7 +288,7 @@ func TestFileChecksMatrix(t *testing.T) {
 				if err := os.Mkdir(unreadablePath, 0755); err != nil {
 					t.Fatal(err)
 				}
-				badCfg := Config{SubscriptionRoot: root, Token: unreadableToken}
+				badCfg := Config{SubscriptionRoot: root, Token: unreadableToken, osStat: cfgStat, osOpen: cfgOpen}
 				r := tc.check.Run(context.Background(), badCfg)
 				assertResult(t, r, tc.check.ID(), tc.check.Name(), StatusFail, "unreadable")
 				if strings.Contains(r.Message, unreadableToken) || strings.Contains(r.Message, root) {
@@ -281,6 +303,9 @@ func TestFileChecksMatrix(t *testing.T) {
 			t.Run("open_failure", func(t *testing.T) {
 				fakeStat = nil
 				fakeOpen = func(name string) (readCloser, error) {
+					if name != targetPath {
+						t.Errorf("Open name = %q, want %q", name, targetPath)
+					}
 					return nil, errors.New("permission denied")
 				}
 
@@ -292,6 +317,9 @@ func TestFileChecksMatrix(t *testing.T) {
 				closed := make(chan struct{}, 1)
 				fakeStat = nil
 				fakeOpen = func(name string) (readCloser, error) {
+					if name != targetPath {
+						t.Errorf("Open name = %q, want %q", name, targetPath)
+					}
 					return &fakeFile{readErr: errors.New("i/o error"), closeChan: closed}, nil
 				}
 

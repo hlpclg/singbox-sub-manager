@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"net"
+	"os"
 	"time"
 )
 
@@ -94,6 +95,11 @@ type Config struct {
 	// procReader, when non-nil, overrides /proc/net/udp* file reading.
 	// Tests inject in-memory content; production uses os.ReadFile.
 	procReader func(path string) (string, error)
+
+	// osStat and osOpen are unexported internal seams for fileCheck to allow
+	// testing file I/O deterministically without affecting the public Config.
+	osStat func(name string) (os.FileInfo, error)
+	osOpen func(name string) (readCloser, error)
 
 	Timeouts Timeouts
 }

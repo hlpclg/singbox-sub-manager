@@ -16,13 +16,6 @@ type readCloser interface {
 	Close() error
 }
 
-var (
-	osStat = os.Stat
-	osOpen = func(name string) (readCloser, error) {
-		return os.Open(name)
-	}
-)
-
 // ValidToken enforces the exact regex in the design for subscription tokens.
 func ValidToken(token string) bool {
 	return tokenRegex.MatchString(token)
@@ -96,7 +89,12 @@ func (c fileCheck) Run(ctx context.Context, cfg Config) Result {
 	}
 
 	path := filepath.Join(cfg.SubscriptionRoot, cfg.Token, c.filename)
-	info, err := osStat(path)
+
+	statFn := cfg.osStat
+	if statFn == nil {
+		statFn = os.Stat
+	}
+	info, err := statFn(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "missing"}
@@ -111,7 +109,13 @@ func (c fileCheck) Run(ctx context.Context, cfg Config) Result {
 	}
 
 	// Must actually open and read at least one byte to verify readability.
-	f, err := osOpen(path)
+	openFn := cfg.osOpen
+	if openFn == nil {
+		openFn = func(name string) (readCloser, error) {
+			return os.Open(name)
+		}
+	}
+	f, err := openFn(path)
 	if err != nil {
 		return Result{ID: c.ID(), Name: c.Name(), Status: StatusFail, Message: "unreadable"}
 	}
