@@ -34,7 +34,7 @@ type tlsFixture struct {
 	handler  http.Handler
 }
 
-func newTLSFixture(t *testing.T, domain string, notBefore, notAfter time.Time, status int, body string) *tlsFixture {
+func newTLSTestCertificate(t *testing.T, domain string, notBefore, notAfter time.Time) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -58,15 +58,22 @@ func newTLSFixture(t *testing.T, domain string, notBefore, notAfter time.Time, s
 	if err != nil {
 		t.Fatal(err)
 	}
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
+	return cert, roots
+}
+
+func newTLSFixture(t *testing.T, domain string, notBefore, notAfter time.Time, status int, body string) *tlsFixture {
+	t.Helper()
+	cert, roots := newTLSTestCertificate(t, domain, notBefore, notAfter)
 	baseTLS := &tls.Config{Certificates: []tls.Certificate{cert}}
 	rawListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &tlsFixture{roots: x509.NewCertPool(), requests: make(chan *http.Request, 8), sni: make(chan string, 8)}
+	f := &tlsFixture{roots: roots, requests: make(chan *http.Request, 8), sni: make(chan string, 8)}
 	ln := tls.NewListener(rawListener, &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) { f.sni <- hello.ServerName; return baseTLS, nil }})
 	f.ln = ln
-	f.roots.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
 	f.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.requests <- r
 		w.WriteHeader(status)
@@ -125,6 +132,58 @@ func (c *trackingConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+var errInjectedWrite = errors.New("injected write failure")
+
+// closeAuditConn counts every Close call without deduplication. Run's own
+// deferred tlsConn.Close must be the only Close observed before Run returns;
+// a second Close after Run's internal reqCtx cancel proves the cancellation
+// watcher outlived Run.
+type closeAuditConn struct {
+	net.Conn
+	closes atomic.Int32
+}
+
+func (c *closeAuditConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
+}
+
+// writeFailConn fails writes once armed. Run calls SetDeadline exactly once,
+// after HandshakeContext and before req.Write, so handshake writes pass
+// through and the request write fails deterministically with no timing
+// dependency.
+type writeFailConn struct {
+	*closeAuditConn
+	armed atomic.Bool
+}
+
+func (c *writeFailConn) SetDeadline(d time.Time) error {
+	c.armed.Store(true)
+	return c.closeAuditConn.SetDeadline(d)
+}
+
+func (c *writeFailConn) Write(p []byte) (int, error) {
+	if c.armed.Load() {
+		return 0, errInjectedWrite
+	}
+	return c.closeAuditConn.Write(p)
+}
+
+// assertConnectionClosedAndWatcherExited proves the connection was closed
+// exactly once before Run returned and that the cancellation watcher had
+// already exited: a leaked watcher would react to Run's internal reqCtx
+// cancel with a second Close.
+func assertConnectionClosedAndWatcherExited(t *testing.T, c *closeAuditConn) {
+	t.Helper()
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := c.closes.Load(); got != 1 {
+			t.Fatalf("connection Close calls = %d, want exactly 1 (watcher must exit before Run returns)", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (f *tlsFixture) cfg(now time.Time) Config {
 	return Config{Domain: tlsTestDomain, Token: tlsTestToken, LoopbackTLSAddr: f.ln.Addr().String(), RootCAs: f.roots, Timeouts: Timeouts{TCPConnect: time.Second, TLS: time.Second, HTTP: time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		f.mu.Lock()
@@ -138,7 +197,7 @@ func (f *tlsFixture) cfg(now time.Time) Config {
 func assertTLSResult(t *testing.T, r Result, id, name string, status Status, message string) {
 	t.Helper()
 	assertResult(t, r, id, name, status, message)
-	for _, secret := range []string{tlsTestToken, tlsSecret, "https://" + tlsTestDomain} {
+	for _, secret := range []string{tlsTestToken, tlsSecret, "https://" + tlsTestDomain, "clash.yaml"} {
 		if strings.Contains(r.Message, secret) {
 			t.Errorf("message leaked %q: %q", secret, r.Message)
 		}
@@ -311,12 +370,24 @@ func TestHTTPSSubscriptionParentCancellationDuringTLSHandshake(t *testing.T) {
 }
 
 func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *testing.T) {
+	// minElapsed/maxElapsed mechanically prove which configured bound fired:
+	// the run must last at least the specific timeout (it really waited) and
+	// less than every other timeout present in the config, so a wrong bound
+	// (TCP 500ms, TLS 500ms, HTTP 1s) or an instant failure is caught.
 	for _, tc := range []struct {
 		name         string
 		phase        string
 		cancelParent bool
+		minElapsed   time.Duration
+		maxElapsed   time.Duration
 	}{
-		{"handshake", "handshake", false}, {"headers", "headers", false}, {"body", "body", false}, {"parent_cancel", "headers", true},
+		// TLS = 100ms; must exclude TCP 500ms and HTTP 1s.
+		{"handshake", "handshake", false, 80 * time.Millisecond, 400 * time.Millisecond},
+		// HTTP = 200ms; must exclude TLS 500ms and TCP 1s.
+		{"headers", "headers", false, 180 * time.Millisecond, 450 * time.Millisecond},
+		{"body", "body", false, 180 * time.Millisecond, 450 * time.Millisecond},
+		// Parent cancel after arrival must return promptly, not at HTTP 1s.
+		{"parent_cancel", "headers", true, 0, 500 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			arrived, release := make(chan struct{}), make(chan struct{})
@@ -357,8 +428,15 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			resultCh := make(chan Result, 1)
-			go func() { resultCh <- httpsSubscriptionCheck().Run(ctx, cfg) }()
+			type timedResult struct {
+				r       Result
+				elapsed time.Duration
+			}
+			resultCh := make(chan timedResult, 1)
+			go func() {
+				start := time.Now()
+				resultCh <- timedResult{r: httpsSubscriptionCheck().Run(ctx, cfg), elapsed: time.Since(start)}
+			}()
 			if tc.phase != "handshake" {
 				select {
 				case <-arrived:
@@ -370,9 +448,12 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 				cancel()
 			}
 			select {
-			case r := <-resultCh:
-				assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "timeout or cancelled")
-			case <-time.After(time.Second):
+			case tr := <-resultCh:
+				assertTLSResult(t, tr.r, "http.subscription", "clash subscription", StatusFail, "timeout or cancelled")
+				if tr.elapsed < tc.minElapsed || tr.elapsed > tc.maxElapsed {
+					t.Fatalf("Run elapsed = %s, want within [%s, %s]", tr.elapsed, tc.minElapsed, tc.maxElapsed)
+				}
+			case <-time.After(2 * time.Second):
 				t.Fatal("Run did not return")
 			}
 			close(release)
@@ -383,6 +464,72 @@ func TestHTTPSSubscriptionHandshakeHeaderBodyTimeoutAndParentCancellation(t *tes
 				waitTLSClosed(t, fixture)
 			}
 		})
+	}
+}
+
+func TestHTTPSSubscriptionRequestWriteFailureIsRedactedClosedAndWatcherExits(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	f := newTLSFixture(t, tlsTestDomain, now.Add(-time.Hour), now.Add(30*24*time.Hour), http.StatusOK, "ok")
+	var wconn *writeFailConn
+	cfg := f.cfg(now)
+	cfg.tlsDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := (&net.Dialer{}).DialContext(ctx, network, f.ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		wconn = &writeFailConn{closeAuditConn: &closeAuditConn{Conn: raw}}
+		return wconn, nil
+	}
+	r := httpsSubscriptionCheck().Run(context.Background(), cfg)
+	assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "request failed")
+	assertConnectionClosedAndWatcherExited(t, wconn.closeAuditConn)
+	select {
+	case req := <-f.requests:
+		t.Fatalf("server received a request despite the write failure: %s", req.URL.Path)
+	default:
+	}
+	waitTLSClosed(t, f)
+}
+
+func TestHTTPSSubscriptionMalformedResponseIsRedactedClosedAndWatcherExits(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	cert, roots := newTLSTestCertificate(t, tlsTestDomain, now.Add(-time.Hour), now.Add(30*24*time.Hour))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		srv := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err := srv.Handshake(); err != nil {
+			_ = raw.Close()
+			return
+		}
+		_, _ = srv.Write([]byte("not an http response\r\n"))
+		_ = srv.Close()
+	}()
+	var aconn *closeAuditConn
+	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, LoopbackTLSAddr: ln.Addr().String(), RootCAs: roots, Timeouts: Timeouts{TCPConnect: time.Second, TLS: time.Second, HTTP: time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		aconn = &closeAuditConn{Conn: raw}
+		return aconn, nil
+	}}
+	r := httpsSubscriptionCheck().Run(context.Background(), cfg)
+	assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "request failed")
+	assertConnectionClosedAndWatcherExited(t, aconn)
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("malformed-response server did not finish")
 	}
 }
 
