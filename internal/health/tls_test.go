@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -169,10 +170,33 @@ func (c *writeFailConn) Write(p []byte) (int, error) {
 	return c.closeAuditConn.Write(p)
 }
 
+// blockingCloseConn blocks its first Close call until the test releases it.
+// The underlying connection is closed first so pending I/O fails, which lets
+// Run reach its deferred watcher wait while the watcher is still inside
+// Close. The first Close on the Run path is always the cancellation
+// watcher's: Run's own deferred Close can only run after the watcher exits.
+type blockingCloseConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingCloseConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		close(c.entered)
+		<-c.release
+	})
+	return err
+}
+
 // assertConnectionClosedAndWatcherExited proves the connection was closed
-// exactly once before Run returned and that the cancellation watcher had
-// already exited: a leaked watcher would react to Run's internal reqCtx
-// cancel with a second Close.
+// exactly once before Run returned and that no late watcher Close followed
+// Run's internal reqCtx cancel. That Run actually waits for the watcher is
+// proven separately by TestHTTPSSubscriptionRunWaitsForWatcherCloseOnCancel;
+// combined with Run having returned, no second Close means the watcher had
+// already exited.
 func assertConnectionClosedAndWatcherExited(t *testing.T, c *closeAuditConn) {
 	t.Helper()
 	deadline := time.Now().Add(300 * time.Millisecond)
@@ -500,6 +524,8 @@ func TestHTTPSSubscriptionMalformedResponseIsRedactedClosedAndWatcherExits(t *te
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	served := make(chan struct{})
+	requests := make(chan *http.Request, 1)
+	readErrs := make(chan error, 1)
 	go func() {
 		defer close(served)
 		raw, err := ln.Accept()
@@ -511,11 +537,21 @@ func TestHTTPSSubscriptionMalformedResponseIsRedactedClosedAndWatcherExits(t *te
 			_ = raw.Close()
 			return
 		}
+		// Read the complete request first: a well-formed request observed
+		// server-side proves the client's req.Write succeeded, so the client
+		// failure below can only come from http.ReadResponse.
+		req, err := http.ReadRequest(bufio.NewReader(srv))
+		if err != nil {
+			readErrs <- err
+			_ = srv.Close()
+			return
+		}
+		requests <- req
 		_, _ = srv.Write([]byte("not an http response\r\n"))
 		_ = srv.Close()
 	}()
 	var aconn *closeAuditConn
-	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, LoopbackTLSAddr: ln.Addr().String(), RootCAs: roots, Timeouts: Timeouts{TCPConnect: time.Second, TLS: time.Second, HTTP: time.Second}, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+	cfg := Config{Domain: tlsTestDomain, Token: tlsTestToken, LoopbackTLSAddr: ln.Addr().String(), RootCAs: roots, Timeouts: Timeouts{TCPConnect: time.Second, TLS: time.Second, HTTP: time.Second}, now: func() time.Time { return now }, tlsDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		raw, err := (&net.Dialer{}).DialContext(ctx, network, ln.Addr().String())
 		if err != nil {
 			return nil, err
@@ -527,10 +563,75 @@ func TestHTTPSSubscriptionMalformedResponseIsRedactedClosedAndWatcherExits(t *te
 	assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "request failed")
 	assertConnectionClosedAndWatcherExited(t, aconn)
 	select {
+	case req := <-requests:
+		if req.Method != http.MethodGet || req.URL.Path != "/"+tlsTestToken+"/clash.yaml" || req.Host != tlsTestDomain {
+			t.Fatalf("server read request = %s %s (Host %q)", req.Method, req.URL.Path, req.Host)
+		}
+	case err := <-readErrs:
+		t.Fatalf("server failed to read the request: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("server did not read a complete request")
+	}
+	select {
 	case <-served:
 	case <-time.After(time.Second):
 		t.Fatal("malformed-response server did not finish")
 	}
+}
+
+func TestHTTPSSubscriptionRunWaitsForWatcherCloseOnCancel(t *testing.T) {
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	f := newTLSFixture(t, tlsTestDomain, now.Add(-time.Hour), now.Add(30*24*time.Hour), http.StatusOK, "ok")
+	arrived := make(chan struct{})
+	respond := make(chan struct{})
+	var respondOnce sync.Once
+	releaseRespond := func() { respondOnce.Do(func() { close(respond) }) }
+	f.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		<-respond
+	})
+	t.Cleanup(releaseRespond)
+	bconn := &blockingCloseConn{entered: make(chan struct{}), release: make(chan struct{})}
+	cfg := f.cfg(now)
+	cfg.tlsDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := (&net.Dialer{}).DialContext(ctx, network, f.ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		bconn.Conn = raw
+		return bconn, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan Result, 1)
+	go func() { resultCh <- httpsSubscriptionCheck().Run(ctx, cfg) }()
+	select {
+	case <-arrived:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive request")
+	}
+	cancel()
+	select {
+	case <-bconn.entered:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not close the connection after cancel")
+	}
+	// The watcher is now blocked inside Close. If Run did not wait for the
+	// watcher, its read has already failed (the underlying connection is
+	// closed) and it would return here.
+	select {
+	case <-resultCh:
+		t.Fatal("Run returned while the watcher Close was still blocked")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(bconn.release)
+	select {
+	case r := <-resultCh:
+		assertTLSResult(t, r, "http.subscription", "clash subscription", StatusFail, "timeout or cancelled")
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after the watcher Close completed")
+	}
+	releaseRespond()
+	waitTLSClosed(t, f)
 }
 
 func TestTLSCertificateValidatesChainHostnameSNIAndLoopback(t *testing.T) {
