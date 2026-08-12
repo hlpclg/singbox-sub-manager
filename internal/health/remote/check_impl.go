@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"time"
 )
 
 var runCheckNode = CheckNode
@@ -25,7 +26,9 @@ func (c *NodeCheck) Name() string {
 }
 
 func (c *NodeCheck) Run(ctx context.Context, cfg health.Config) health.Result {
-	err := runCheckNode(ctx, c.node)
+	nodeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	err := runCheckNode(nodeCtx, c.node)
 	if err != nil {
 		return health.Result{
 			Status:  health.StatusFail,

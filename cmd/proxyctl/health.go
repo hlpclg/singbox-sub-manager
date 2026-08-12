@@ -41,6 +41,7 @@ func cmdHealth(args []string, stdout, stderr io.Writer) int {
 	concurrentIDs := health.ConcurrentIDs()
 
 	if *remoteHealth {
+		cfg.Timeouts.Overall = 60 * time.Second
 		ns, _, err := nodes.Load(*nodesPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "error: failed to load remote nodes: %v\n", err)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -184,8 +185,12 @@ func TestHealth_RemoteFlagError(t *testing.T) {
 	}
 	healthAllChecks = func() []health.Check { return nil }
 
+	tmpDir := t.TempDir()
+	badNodesPath := tmpDir + "/bad-nodes.conf"
+	os.WriteFile(badNodesPath, []byte("[bad]\nSERVER=1\nPORT=abc\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s"), 0644)
+
 	var stdout, stderr bytes.Buffer
-	exitCode := cmdHealth([]string{"--remote", "--nodes", "/tmp/bad-nodes.conf"}, &stdout, &stderr)
+	exitCode := cmdHealth([]string{"--remote", "--nodes", badNodesPath}, &stdout, &stderr)
 	if exitCode != 3 {
 		t.Errorf("expected exit code 3, got %d", exitCode)
 	}
