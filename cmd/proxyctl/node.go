@@ -11,6 +11,9 @@ import (
 	"text/tabwriter"
 
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
+	"context"
+	"time"
 	"golang.org/x/term"
 )
 
@@ -38,6 +41,8 @@ func cmdNode(args []string, stdout, stderr io.Writer) int {
 		return cmdNodeAdd(args[1:], stdout, stderr)
 	case "edit":
 		return cmdNodeEdit(args[1:], stdout, stderr)
+	case "test":
+		return cmdNodeTest(args[1:], stdout, stderr)
 	case "migrate":
 		return cmdNodeMigrate(args[1:], stdout, stderr)
 	default:
@@ -366,5 +371,36 @@ func cmdNodeMigrate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "migrated %d node(s); backup at %s.bak\n", len(ns), *path)
+	return 0
+}
+
+func cmdNodeTest(args []string, stdout, stderr io.Writer) int {
+	path, rest, ok := extractNodesFlag(args, stderr)
+	if !ok {
+		return 2
+	}
+	if len(rest) < 1 {
+		fmt.Fprintln(stderr, "error: node name required")
+		return 2
+	}
+	name := rest[0]
+	ns, err := nodes.ParseFile(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 3
+	}
+	idx, found := nodes.Find(ns, name)
+	if !found {
+		fmt.Fprintf(stderr, "error: node %q not found\n", name)
+		return 3
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = remote.CheckNode(ctx, ns[idx])
+	if err != nil {
+		fmt.Fprintf(stdout, "FAIL  %s  %v\n", ns[idx].Name, err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "PASS  %s  available\n", ns[idx].Name)
 	return 0
 }
