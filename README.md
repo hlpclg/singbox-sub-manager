@@ -239,7 +239,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.3.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.4.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
@@ -294,6 +294,64 @@ proxyctl node migrate
 ```
 
 迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。
+
+## 健康检查（proxyctl health）
+
+v0.4 起提供订阅中心本机健康检查（只读），帮助及时发现服务、配置、文件或网络层面的故障。
+
+### 检查命令
+
+```bash
+# 默认文本输出
+proxyctl health
+
+# 查看耗时等详细诊断信息
+proxyctl health --verbose
+
+# 机器可读 JSON 输出（适合监控/告警接入）
+proxyctl health --json
+
+# 显式指定域名进行检查
+proxyctl health --domain sub.example.com
+```
+
+### 检查项（共 15 项）
+
+1. **sing-box service**：systemd 服务 active 状态
+2. **caddy service**：systemd 服务 active 状态
+3. **UDP 443**：本地端口监听状态
+4. **TCP 443**：本地 Loopback 建连验证
+5. **TCP 80**：本地 Loopback 建连验证
+6. **sing-box config**：配置文件合法性校验
+7. **caddy config**：Caddyfile 合法性校验
+8. **subscription token**：验证 token 文件与格式
+9. **clash.yaml**：验证生成订阅文件可读且非空
+10. **sr.txt**：验证生成订阅文件可读且非空
+11. **clash subscription**：通过本机 Loopback HTTPS 访问订阅，要求 HTTP 200
+12. **TLS certificate**：验证 SNI/主机名匹配及证书有效性
+13. **TLS expiry**：证书过期预警（少于 14 天则 WARN）
+14. **DNS**：解析当前配置域名，要求至少返回一个 IP
+15. **disk space**：检查订阅根目录所在分区空间（少于 500 MB 则 WARN）
+
+### 状态与退出码
+
+- **HEALTHY (0)**: 全部检查 PASS
+- **DEGRADED (2)**: 至少一个 WARN，无 FAIL
+- **UNHEALTHY (1)**: 至少一个 FAIL
+- **Error (3)**: 传参错误或内部运行异常
+
+### 配置与只读声明
+
+健康检查仅读取系统状态、发起本机连接并生成报告，**绝不会修改系统状态**，亦不会泄露敏感 Token 与密码信息。
+
+检查运行所需的配置（如域名、订阅路径）按以下优先级推断：
+1. 命令行传入的 `--domain`
+2. `/etc/singbox-sub-manager/install.json` 状态文件
+3. 从 `/etc/caddy/Caddyfile` 回退推导（兼容旧版安装）
+
+### 远程节点探测说明
+
+当前的健康检查专注于**订阅中心本机（Local）**，探测 `nodes.conf` 中外部 Hysteria2 节点是否真实可用的功能（Remote Health）计划于 **v0.5** 引入，本阶段不包含远程探测与自动禁用节点逻辑。
 
 ## 获取其他节点的连接信息
 

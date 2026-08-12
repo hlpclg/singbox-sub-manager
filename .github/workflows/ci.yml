@@ -28,6 +28,11 @@ jobs:
           shellcheck merge-nodes.sh
       - name: Go fmt
         run: if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then echo "Go code is not formatted"; exit 1; fi
+      - name: Shell tests
+        run: |
+          bash tests/test_install_proxyctl.sh
+          bash tests/test_install_json.sh
+
       - name: Go test
         run: go test -v ./...
       - name: Go vet

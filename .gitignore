@@ -5,3 +5,7 @@ dist/
 nodes.conf
 .agent/
 .DS_Store
+
+.workbuddy/
+/proxyctl
+plan.md

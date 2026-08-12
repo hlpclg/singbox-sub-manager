@@ -33,6 +33,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdValidate(args[1:], stdout, stderr)
 	case "subscription":
 		return cmdSubscription(args[1:], stdout, stderr)
+	case "health":
+		return cmdHealth(args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, Version)
 		return 0
@@ -48,6 +50,7 @@ func usage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "  merge    --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  validate --nodes nodes.conf")
 	fmt.Fprintln(stderr, "  subscription build --nodes nodes.conf --output DIR")
+	fmt.Fprintln(stderr, "  health   [--json] [--verbose] [--domain DOMAIN]")
 	fmt.Fprintln(stderr, "  version  -- show version")
 	return 2
 }
