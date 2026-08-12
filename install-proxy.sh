@@ -106,7 +106,7 @@ CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.3.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.4.0}"
 PROXYCTL_VALIDATED_BIN=""
 
 # 1. OS & Root Check (Safe Early Exit)
@@ -1203,6 +1203,22 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 sysctl --system >/dev/null 2>&1 || true
+
+# 12. Write install state
+INSTALL_JSON="$BASE_DIR/install.json"
+INSTALL_JSON_TMP="$(mktemp "$BASE_DIR/.install.json.tmp.XXXXXX")"
+trap 'rm -rf "$TMP" "$INSTALL_JSON_TMP"' EXIT
+cat > "$INSTALL_JSON_TMP" <<EOF2
+{
+  "domain": "$DOMAIN",
+  "singbox_config": "/etc/sing-box/config.json",
+  "caddy_config": "/etc/caddy/Caddyfile",
+  "subscription_root": "$SUB_ROOT",
+  "token_file": "$TOKEN_FILE"
+}
+EOF2
+chmod 0644 "$INSTALL_JSON_TMP"
+mv "$INSTALL_JSON_TMP" "$INSTALL_JSON"
 
 # Masked Token for log
 MASKED_TOKEN="${TOKEN:0:4}****${TOKEN: -4}"

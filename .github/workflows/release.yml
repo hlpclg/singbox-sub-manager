@@ -49,6 +49,7 @@ jobs:
             -o dist/proxyctl-linux-arm64 ./cmd/proxyctl
           test "$(./dist/proxyctl-linux-amd64 version)" = "$GITHUB_REF_NAME"
           bash tests/test_install_proxyctl.sh
+          bash tests/test_install_json.sh
           cd dist
           sha256sum proxyctl-linux-* > checksums.txt
       - name: Publish release assets
