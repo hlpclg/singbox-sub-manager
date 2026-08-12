@@ -25,7 +25,7 @@ func TestGenerateConfig(t *testing.T) {
 	if err := json.Unmarshal(cfgData, &parsed); err != nil {
 		t.Fatalf("invalid json: %v", err)
 	}
-	
+
 	// Ensure log level is error or fatal
 	logMap, _ := parsed["log"].(map[string]interface{})
 	if logMap["level"] != "error" && logMap["level"] != "fatal" {

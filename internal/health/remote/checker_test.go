@@ -2,15 +2,15 @@ package remote
 
 import (
 	"context"
-	"strings"
 	"fmt"
-	"testing"
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"strings"
+	"testing"
 )
 
 func TestCheckNode_Success(t *testing.T) {
 	node := nodes.Node{Name: "test"}
-	
+
 	oldRun := runSingbox
 	oldTest := testProxy
 	oldGetPort := getFreePort
@@ -38,7 +38,7 @@ func TestCheckNode_Success(t *testing.T) {
 
 func TestCheckNode_ProxyFail(t *testing.T) {
 	node := nodes.Node{Name: "test"}
-	
+
 	oldRun := runSingbox
 	oldTest := testProxy
 	oldGetPort := getFreePort

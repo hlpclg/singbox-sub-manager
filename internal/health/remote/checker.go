@@ -3,13 +3,13 @@ package remote
 import (
 	"context"
 	"fmt"
+	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"time"
-	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 )
 
 var runSingbox = defaultRunSingbox
@@ -59,7 +59,7 @@ func defaultTestProxy(ctx context.Context, port int) error {
 	if !ok {
 		deadline = time.Now().Add(10 * time.Second)
 	}
-	
+
 	var lastErr error
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequestWithContext(ctx, "GET", "http://cp.cloudflare.com/generate_204", nil)

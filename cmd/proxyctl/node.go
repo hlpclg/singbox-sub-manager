@@ -10,11 +10,11 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
-	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
 	"context"
-	"time"
+	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
+	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 	"golang.org/x/term"
+	"time"
 )
 
 const defaultNodesPath = "/etc/singbox-sub-manager/nodes.conf"

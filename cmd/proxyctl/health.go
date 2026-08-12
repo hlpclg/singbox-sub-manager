@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
-	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
+	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 )
 
 var (

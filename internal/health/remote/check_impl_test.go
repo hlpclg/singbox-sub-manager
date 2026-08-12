@@ -2,17 +2,17 @@ package remote
 
 import (
 	"context"
-	"testing"
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"testing"
 )
 
 func TestNodeCheck_Run(t *testing.T) {
 	node := nodes.Node{Name: "test-node"}
-	
+
 	oldCheck := runCheckNode
 	defer func() { runCheckNode = oldCheck }()
-	
+
 	runCheckNode = func(ctx context.Context, n nodes.Node) error {
 		return nil // Success
 	}
