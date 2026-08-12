@@ -63,3 +63,24 @@ func TestCheckNode_ProxyFail(t *testing.T) {
 		t.Fatalf("expected proxy test failed error, got %v", err)
 	}
 }
+
+func TestDefaultTestProxy_ContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	err := defaultTestProxy(ctx, 12345)
+	if err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("expected context canceled error, got %v", err)
+	}
+}
+
+func TestDefaultRunSingbox_ContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Should fail immediately to start or context canceled
+	_, err := defaultRunSingbox(ctx, "/tmp/nonexistent.json")
+	if err == nil {
+		t.Errorf("expected error, got nil")
+	}
+}

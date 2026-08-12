@@ -42,13 +42,15 @@ func cmdHealth(args []string, stdout, stderr io.Writer) int {
 
 	if *remoteHealth {
 		ns, _, err := nodes.Load(*nodesPath)
-		if err == nil {
-			enabledNodes := nodes.Enabled(ns)
-			for _, n := range enabledNodes {
-				c := remote.NewNodeCheck(n)
-				checks = append(checks, c)
-				concurrentIDs[c.ID()] = true
-			}
+		if err != nil {
+			fmt.Fprintf(stderr, "error: failed to load remote nodes: %v\n", err)
+			return 3
+		}
+		enabledNodes := nodes.Enabled(ns)
+		for _, n := range enabledNodes {
+			c := remote.NewNodeCheck(n)
+			checks = append(checks, c)
+			concurrentIDs[c.ID()] = true
 		}
 	}
 

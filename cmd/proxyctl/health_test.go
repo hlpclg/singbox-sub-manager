@@ -168,3 +168,28 @@ func TestHealthNoSecretInOutput(t *testing.T) {
 		}
 	}
 }
+
+func TestHealth_RemoteFlagError(t *testing.T) {
+	oldResolve := healthResolveConfig
+	oldChecks := healthAllChecks
+	defer func() {
+		healthResolveConfig = oldResolve
+		healthAllChecks = oldChecks
+	}()
+
+	healthResolveConfig = func(domain string, readFile func(string) ([]byte, error)) health.Config {
+		return health.Config{
+			Timeouts: health.DefaultTimeouts(),
+		}
+	}
+	healthAllChecks = func() []health.Check { return nil }
+
+	var stdout, stderr bytes.Buffer
+	exitCode := cmdHealth([]string{"--remote", "--nodes", "/tmp/bad-nodes.conf"}, &stdout, &stderr)
+	if exitCode != 3 {
+		t.Errorf("expected exit code 3, got %d", exitCode)
+	}
+	if !strings.Contains(stderr.String(), "error: failed to load remote nodes") {
+		t.Errorf("expected error about remote nodes, got %s", stderr.String())
+	}
+}

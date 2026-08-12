@@ -170,3 +170,22 @@ func TestNodeMigrateLegacyToSectioned(t *testing.T) {
 		t.Fatalf("second migrate code=%d err=%s", code, errb.String())
 	}
 }
+
+func TestNodeTest_Error(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	// Test without node name
+	code := cmdNode([]string{"test"}, &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("expected 2, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "error: node name required") {
+		t.Errorf("expected name required error, got %s", stderr.String())
+	}
+
+	// Test missing file
+	stderr.Reset()
+	code = cmdNode([]string{"test", "missing", "--nodes", "/tmp/nonexistent-nodes.conf"}, &stdout, &stderr)
+	if code != 3 {
+		t.Errorf("expected 3, got %d", code)
+	}
+}

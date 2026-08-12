@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,17 +18,26 @@ var testProxy = defaultTestProxy
 
 var getFreePort = defaultGetFreePort
 
+var nextPort int32 = 40000
+
 func defaultGetFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+	for i := 0; i < 1000; i++ {
+		p := int(atomic.AddInt32(&nextPort, 1))
+		if p > 50000 {
+			atomic.StoreInt32(&nextPort, 40000)
+			p = 40001
+		}
+		addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			continue
+		}
+		l, err := net.ListenTCP("tcp", addr)
+		if err == nil {
+			l.Close()
+			return p, nil
+		}
 	}
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return 0, fmt.Errorf("no free ports")
 }
 
 func defaultRunSingbox(ctx context.Context, configPath string) (func(), error) {
@@ -68,10 +78,11 @@ func defaultTestProxy(ctx context.Context, port int) error {
 		}
 		resp, err := client.Do(req)
 		if err == nil {
-			defer resp.Body.Close()
 			if resp.StatusCode == 204 {
+				resp.Body.Close()
 				return nil
 			}
+			resp.Body.Close()
 			lastErr = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		} else {
 			lastErr = err
@@ -96,7 +107,7 @@ func CheckNode(ctx context.Context, n nodes.Node) error {
 		return fmt.Errorf("generate config: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp("", "singbox-*.json")
+	tmpFile, err := os.CreateTemp("/tmp", "singbox-*.json")
 	if err != nil {
 		return fmt.Errorf("create temp config: %w", err)
 	}
