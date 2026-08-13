@@ -1205,8 +1205,9 @@ if ! curl -sf --connect-timeout 10 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/nul
 fi
 
 # 11. Monitor
-MONITOR_SVC_TMP="$(mktemp "/etc/systemd/system/.proxyctl-monitor.service.tmp.XXXXXX")"
-MONITOR_TIMER_TMP="$(mktemp "/etc/systemd/system/.proxyctl-monitor.timer.tmp.XXXXXX")"
+MONITOR_UNIT_DIR="${MONITOR_UNIT_DIR:-/etc/systemd/system}"
+MONITOR_SVC_TMP="$(mktemp "$MONITOR_UNIT_DIR/.proxyctl-monitor.service.tmp.XXXXXX")"
+MONITOR_TIMER_TMP="$(mktemp "$MONITOR_UNIT_DIR/.proxyctl-monitor.timer.tmp.XXXXXX")"
 
 cat > "$MONITOR_SVC_TMP" <<'EOF2'
 [Unit]
@@ -1238,12 +1239,12 @@ MONITOR_HAD_SVC=false
 MONITOR_HAD_TIMER=false
 MONITOR_WAS_ENABLED=false
 MONITOR_WAS_ACTIVE=false
-if [[ -e /etc/systemd/system/proxyctl-monitor.service ]]; then
-  cp -a /etc/systemd/system/proxyctl-monitor.service "$MONITOR_BACKUP_DIR/service"
+if [[ -e "$MONITOR_UNIT_DIR/proxyctl-monitor.service" ]]; then
+  cp -a "$MONITOR_UNIT_DIR/proxyctl-monitor.service" "$MONITOR_BACKUP_DIR/service"
   MONITOR_HAD_SVC=true
 fi
-if [[ -e /etc/systemd/system/proxyctl-monitor.timer ]]; then
-  cp -a /etc/systemd/system/proxyctl-monitor.timer "$MONITOR_BACKUP_DIR/timer"
+if [[ -e "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" ]]; then
+  cp -a "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" "$MONITOR_BACKUP_DIR/timer"
   MONITOR_HAD_TIMER=true
   [[ "$(systemctl is-enabled proxyctl-monitor.timer 2>/dev/null || true)" == "enabled" ]] && MONITOR_WAS_ENABLED=true
   [[ "$(systemctl is-active proxyctl-monitor.timer 2>/dev/null || true)" == "active" ]] && MONITOR_WAS_ACTIVE=true
@@ -1252,14 +1253,14 @@ fi
 restore_monitor_units() {
   systemctl disable --now proxyctl-monitor.timer >/dev/null 2>&1 || true
   if [[ "$MONITOR_HAD_SVC" == true ]]; then
-    mv -f "$MONITOR_BACKUP_DIR/service" /etc/systemd/system/proxyctl-monitor.service
+    mv -f "$MONITOR_BACKUP_DIR/service" "$MONITOR_UNIT_DIR/proxyctl-monitor.service"
   else
-    rm -f /etc/systemd/system/proxyctl-monitor.service
+    rm -f "$MONITOR_UNIT_DIR/proxyctl-monitor.service"
   fi
   if [[ "$MONITOR_HAD_TIMER" == true ]]; then
-    mv -f "$MONITOR_BACKUP_DIR/timer" /etc/systemd/system/proxyctl-monitor.timer
+    mv -f "$MONITOR_BACKUP_DIR/timer" "$MONITOR_UNIT_DIR/proxyctl-monitor.timer"
   else
-    rm -f /etc/systemd/system/proxyctl-monitor.timer
+    rm -f "$MONITOR_UNIT_DIR/proxyctl-monitor.timer"
   fi
   systemctl daemon-reload || true
   if [[ "$MONITOR_HAD_TIMER" == true ]]; then
@@ -1277,8 +1278,8 @@ restore_monitor_units() {
   rm -rf "$MONITOR_BACKUP_DIR"
 }
 
-if ! mv "$MONITOR_SVC_TMP" /etc/systemd/system/proxyctl-monitor.service ||
-   ! mv "$MONITOR_TIMER_TMP" /etc/systemd/system/proxyctl-monitor.timer ||
+if ! mv "$MONITOR_SVC_TMP" "$MONITOR_UNIT_DIR/proxyctl-monitor.service" ||
+   ! mv "$MONITOR_TIMER_TMP" "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" ||
    ! systemctl daemon-reload ||
    ! systemctl enable --now proxyctl-monitor.timer; then
   log_error "Failed to activate proxyctl-monitor units; restoring previous units."

@@ -19,5 +19,6 @@ grep -Fq 'systemctl is-active proxyctl-monitor.timer' "$SCRIPT"
 grep -Fq 'systemctl disable proxyctl-monitor.timer' "$SCRIPT"
 grep -Fq 'systemctl stop proxyctl-monitor.timer' "$SCRIPT"
 grep -Fq 'Failed to activate proxyctl-monitor timer.' "$SCRIPT"
+grep -Fq 'MONITOR_UNIT_DIR="${MONITOR_UNIT_DIR:-/etc/systemd/system}"' "$SCRIPT"
 
 echo "monitor installer contract passed"
