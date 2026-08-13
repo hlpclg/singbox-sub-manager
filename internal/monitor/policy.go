@@ -11,7 +11,7 @@ var (
 
 func Decide(state State, checks map[string]string, now time.Time, paused bool) (State, map[string]string) {
 	actions := make(map[string]string)
-	
+
 	processService := func(svc string, triggers []string) {
 		if state.Services == nil {
 			state.Services = make(map[string]*ServiceState)
@@ -20,7 +20,7 @@ func Decide(state State, checks map[string]string, now time.Time, paused bool) (
 			state.Services[svc] = &ServiceState{}
 		}
 		svcState := state.Services[svc]
-		
+
 		hasFail := false
 		for _, t := range triggers {
 			if checks[t] == "fail" {
@@ -28,7 +28,7 @@ func Decide(state State, checks map[string]string, now time.Time, paused bool) (
 				break
 			}
 		}
-		
+
 		svcState.LastCheckAt = now
 		if hasFail {
 			svcState.LastCheckResult = "fail"
@@ -51,9 +51,9 @@ func Decide(state State, checks map[string]string, now time.Time, paused bool) (
 			}
 		}
 	}
-	
+
 	processService("sing-box", singboxTriggers)
 	processService("caddy", caddyTriggers)
-	
+
 	return state, actions
 }

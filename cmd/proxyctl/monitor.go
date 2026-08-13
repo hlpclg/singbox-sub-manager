@@ -59,7 +59,7 @@ func cmdMonitorStatus(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error loading state: %v\n", err)
 		return 3
 	}
-	
+
 	status := struct {
 		Paused bool          `json:"paused"`
 		State  monitor.State `json:"state"`
@@ -67,7 +67,7 @@ func cmdMonitorStatus(stdout, stderr io.Writer) int {
 		Paused: repo.IsPaused(),
 		State:  state,
 	}
-	
+
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(status); err != nil {
