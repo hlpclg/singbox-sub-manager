@@ -17,16 +17,47 @@ type Orchestrator struct {
 	CheckTimeout time.Duration
 }
 
-func (o *Orchestrator) RunOnce(ctx context.Context) (int, error) {
-	state, err := o.Repo.Load()
-	if err != nil {
-		return 3, fmt.Errorf("load state: %w", err)
+type OrchestratorResult struct {
+	ExitCode int
+	Report   Report
+}
+
+type Report struct {
+	Status        string            `json:"status"`
+	Timestamp     string            `json:"timestamp"`
+	DurationMS    int64             `json:"duration_ms"`
+	Checks        []health.Result   `json:"checks"`
+	Actions       map[string]string `json:"actions,omitempty"`
+	Rechecks      []health.Result   `json:"rechecks,omitempty"`
+	RemoteSummary string            `json:"remote_summary,omitempty"`
+}
+
+func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
+	start := o.Now()
+
+	if o.CheckTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, o.CheckTimeout)
+		defer cancel()
 	}
 
-	paused := o.Repo.IsPaused()
+	report := Report{
+		Timestamp: start.Format(time.RFC3339),
+		Actions:   make(map[string]string),
+	}
 
-	// Run all checks
+	state, stateErr := o.Repo.Load()
+
+	paused, pauseErr := o.Repo.IsPaused()
+	if pauseErr != nil {
+		// If we can't determine pause state reliably, we treat it as an error to prevent accidental recovery.
+		stateErr = fmt.Errorf("pause marker error: %v", pauseErr)
+	}
+
+	// Always run checks even if state is corrupt
 	results := o.RunChecks(ctx)
+	report.Checks = results
+
 	checksMap := make(map[string]string)
 	hasFail := false
 	hasWarn := false
@@ -39,9 +70,14 @@ func (o *Orchestrator) RunOnce(ctx context.Context) (int, error) {
 		}
 	}
 
-	now := o.Now()
+	if stateErr != nil {
+		report.Status = "internal_error"
+		report.DurationMS = o.Now().Sub(start).Milliseconds()
+		return OrchestratorResult{ExitCode: 3, Report: report}
+	}
 
-	newState, actions := Decide(state, checksMap, now, paused)
+	newState, actions := Decide(state, checksMap, start, paused)
+	report.Actions = actions
 
 	recoveryFailed := false
 
@@ -50,32 +86,39 @@ func (o *Orchestrator) RunOnce(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// Check eligibility
+		if ctx.Err() != nil {
+			// Cancelled, do not attempt recovery
+			report.Actions[svc] = "cancelled"
+			continue
+		}
+
+		// Pre-flight
 		if o.Checker != nil {
 			if err := o.Checker.CheckEligibility(ctx, svc); err != nil {
-				// Eligibility failed, skip recovery but record it as degraded
-				hasWarn = true // treated as degraded
+				report.Actions[svc] = "preflight_failed"
+				hasWarn = true
 				continue
 			}
 		}
 
-		// Pre-commit
 		newState.Services[svc].RecoveryInProgress = true
-		newState.Services[svc].LastRecoveryAt = now
-		newState.Services[svc].CooldownUntil = now.Add(30 * time.Minute)
+		newState.Services[svc].LastRecoveryAt = start
+		newState.Services[svc].CooldownUntil = start.Add(30 * time.Minute)
 
 		if err := o.Repo.Save(newState); err != nil {
-			return 3, fmt.Errorf("pre-commit save state: %w", err)
+			report.Status = "internal_error"
+			report.DurationMS = o.Now().Sub(start).Milliseconds()
+			return OrchestratorResult{ExitCode: 3, Report: report}
 		}
 
-		// Restart
+		// Restart with its own timeout bounds if needed, but bounded by ctx
 		restartErr := o.Restart(ctx, svc)
 
 		if restartErr != nil {
 			newState.Services[svc].LastRecoveryResult = "fail"
+			report.Actions[svc] = "restart_failed"
 			recoveryFailed = true
 		} else {
-			// Re-check
 			var triggers []string
 			if svc == "sing-box" {
 				triggers = singboxTriggers
@@ -84,38 +127,59 @@ func (o *Orchestrator) RunOnce(ctx context.Context) (int, error) {
 			}
 
 			rechecks := o.RunChecks(ctx, triggers...)
+			report.Rechecks = append(report.Rechecks, rechecks...)
+
 			recheckFailed := false
+			recheckMissing := false
+			recheckMap := make(map[string]string)
 			for _, r := range rechecks {
-				if r.Status == health.StatusFail {
+				recheckMap[r.ID] = string(r.Status)
+			}
+			for _, t := range triggers {
+				if st, ok := recheckMap[t]; !ok || st != "pass" {
 					recheckFailed = true
-					break
+					if !ok {
+						recheckMissing = true
+					}
 				}
 			}
 
 			if recheckFailed {
 				newState.Services[svc].LastRecoveryResult = "fail"
+				if recheckMissing {
+					report.Actions[svc] = "recheck_missing"
+				} else {
+					report.Actions[svc] = "recheck_failed"
+				}
 				recoveryFailed = true
 			} else {
 				newState.Services[svc].LastRecoveryResult = "pass"
 				newState.Services[svc].FailureCount = 0
+				report.Actions[svc] = "recovered"
 			}
 		}
 
-		// Clear in progress
 		newState.Services[svc].RecoveryInProgress = false
 	}
 
-	// Final save
 	if err := o.Repo.Save(newState); err != nil {
-		return 3, fmt.Errorf("final save state: %w", err)
+		report.Status = "internal_error"
+		report.DurationMS = o.Now().Sub(start).Milliseconds()
+		return OrchestratorResult{ExitCode: 3, Report: report}
 	}
+
+	report.DurationMS = o.Now().Sub(start).Milliseconds()
 
 	if recoveryFailed {
-		return 1, nil
-	}
-	if hasFail || hasWarn || paused || len(actions) > 0 {
-		return 2, nil
+		report.Status = "recovery_failed"
+		return OrchestratorResult{ExitCode: 1, Report: report}
 	}
 
-	return 0, nil
+	if hasFail || hasWarn || paused || len(actions) > 0 {
+		report.Status = "degraded"
+		return OrchestratorResult{ExitCode: 2, Report: report}
+	}
+
+	report.Status = "healthy"
+	return OrchestratorResult{ExitCode: 0, Report: report}
 }

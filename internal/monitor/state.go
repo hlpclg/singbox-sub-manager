@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -32,7 +33,7 @@ type StateRepo interface {
 	Save(State) error
 	Pause() error
 	Resume() error
-	IsPaused() bool
+	IsPaused() (bool, error)
 }
 
 type fileStateRepo struct {
@@ -44,9 +45,15 @@ func NewStateRepo(jsonPath, pausePath string) StateRepo {
 	return &fileStateRepo{jsonPath: jsonPath, pausePath: pausePath}
 }
 
-func (r *fileStateRepo) IsPaused() bool {
+func (r *fileStateRepo) IsPaused() (bool, error) {
 	_, err := os.Stat(r.pausePath)
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("failed to check pause marker: %w", err)
 }
 
 func (r *fileStateRepo) Pause() error {
@@ -60,16 +67,17 @@ func (r *fileStateRepo) Pause() error {
 
 func (r *fileStateRepo) Resume() error {
 	state, err := r.Load()
-	if err == nil {
-		for _, s := range state.Services {
-			s.FailureCount = 0
-		}
-		if err := r.Save(state); err != nil {
-			return err
-		}
+	if err != nil {
+		return fmt.Errorf("load state failed: %w", err)
+	}
+	for _, s := range state.Services {
+		s.FailureCount = 0
+	}
+	if err := r.Save(state); err != nil {
+		return fmt.Errorf("save state failed: %w", err)
 	}
 	if err := os.Remove(r.pausePath); err != nil && !os.IsNotExist(err) {
-		return err
+		return fmt.Errorf("remove pause marker failed: %w", err)
 	}
 	return syncDir(filepath.Dir(r.pausePath))
 }
@@ -83,10 +91,13 @@ func (r *fileStateRepo) Load() (State, error) {
 			s.SchemaVersion = 1
 			return s, nil
 		}
-		return s, err
+		return s, fmt.Errorf("read state file: %w", err)
 	}
 	if err := json.Unmarshal(data, &s); err != nil {
-		return s, err
+		return s, fmt.Errorf("unmarshal state: %w", err)
+	}
+	if s.SchemaVersion != 1 {
+		return s, fmt.Errorf("unsupported schema version: %d", s.SchemaVersion)
 	}
 	if s.Services == nil {
 		s.Services = make(map[string]*ServiceState)
@@ -101,13 +112,20 @@ func (r *fileStateRepo) Save(s State) error {
 		return err
 	}
 	tmp := r.jsonPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(tmp, os.O_RDWR, 0600)
-	if err == nil {
-		f.Sync()
+	if _, err := f.Write(data); err != nil {
 		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
 	}
 	if err := os.Rename(tmp, r.jsonPath); err != nil {
 		return err

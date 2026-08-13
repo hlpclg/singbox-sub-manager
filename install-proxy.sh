@@ -106,7 +106,7 @@ CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.4.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.6.0}"
 PROXYCTL_VALIDATED_BIN=""
 
 # 1. OS & Root Check (Safe Early Exit)
@@ -1198,7 +1198,10 @@ if ! curl -sf --connect-timeout 10 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/nul
 fi
 
 # 11. Monitor
-cat > /etc/systemd/system/proxyctl-monitor.service <<'EOF2'
+MONITOR_SVC_TMP="$(mktemp "/etc/systemd/system/.proxyctl-monitor.service.tmp.XXXXXX")"
+MONITOR_TIMER_TMP="$(mktemp "/etc/systemd/system/.proxyctl-monitor.timer.tmp.XXXXXX")"
+
+cat > "$MONITOR_SVC_TMP" <<'EOF2'
 [Unit]
 Description=Proxyctl Health Monitor
 
@@ -1208,7 +1211,7 @@ ExecStart=/usr/local/bin/proxyctl monitor
 SuccessExitStatus=2
 EOF2
 
-cat > /etc/systemd/system/proxyctl-monitor.timer <<'EOF2'
+cat > "$MONITOR_TIMER_TMP" <<'EOF2'
 [Unit]
 Description=Proxyctl Health Monitor Timer
 
@@ -1221,6 +1224,10 @@ RandomizedDelaySec=15s
 [Install]
 WantedBy=timers.target
 EOF2
+
+chmod 0644 "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
+mv "$MONITOR_SVC_TMP" /etc/systemd/system/proxyctl-monitor.service
+mv "$MONITOR_TIMER_TMP" /etc/systemd/system/proxyctl-monitor.timer
 
 systemctl daemon-reload
 systemctl enable --now proxyctl-monitor.timer

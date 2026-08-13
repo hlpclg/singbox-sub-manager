@@ -5,15 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
+	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
 	"github.com/hlpclg/singbox-sub-manager/internal/monitor"
+	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 )
 
 func cmdMonitor(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		return runMonitorOrchestrator(stdout, stderr)
+	}
+	if len(args) > 1 {
+		fmt.Fprintln(stderr, "usage: proxyctl monitor [pause|resume|status]")
+		return 3
 	}
 	switch args[0] {
 	case "pause":
@@ -33,6 +40,13 @@ func getRepo() monitor.StateRepo {
 }
 
 func cmdMonitorPause(stdout, stderr io.Writer) int {
+	lock := monitor.NewFileLock("/run/lock/singbox-sub-manager-monitor.lock")
+	if err := lock.TryLock(); err != nil {
+		fmt.Fprintf(stderr, "error acquiring lock: %v\n", err)
+		return 3
+	}
+	defer lock.Unlock()
+
 	repo := getRepo()
 	if err := repo.Pause(); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -43,6 +57,13 @@ func cmdMonitorPause(stdout, stderr io.Writer) int {
 }
 
 func cmdMonitorResume(stdout, stderr io.Writer) int {
+	lock := monitor.NewFileLock("/run/lock/singbox-sub-manager-monitor.lock")
+	if err := lock.TryLock(); err != nil {
+		fmt.Fprintf(stderr, "error acquiring lock: %v\n", err)
+		return 3
+	}
+	defer lock.Unlock()
+
 	repo := getRepo()
 	if err := repo.Resume(); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -53,6 +74,7 @@ func cmdMonitorResume(stdout, stderr io.Writer) int {
 }
 
 func cmdMonitorStatus(stdout, stderr io.Writer) int {
+	// Status reads without lock as per spec
 	repo := getRepo()
 	state, err := repo.Load()
 	if err != nil {
@@ -60,11 +82,13 @@ func cmdMonitorStatus(stdout, stderr io.Writer) int {
 		return 3
 	}
 
+	paused, _ := repo.IsPaused()
+
 	status := struct {
 		Paused bool          `json:"paused"`
 		State  monitor.State `json:"state"`
 	}{
-		Paused: repo.IsPaused(),
+		Paused: paused,
 		State:  state,
 	}
 
@@ -76,17 +100,49 @@ func cmdMonitorStatus(stdout, stderr io.Writer) int {
 	return 0
 }
 
+func checkPortOwner(ctx context.Context, cfg health.Config, svc string) error {
+	var portArgs []string
+	if svc == "sing-box" {
+		portArgs = []string{"-lnup"}
+	} else {
+		portArgs = []string{"-lnpt"}
+	}
+
+	res := cfg.Runner.Run(ctx, "ss", portArgs...)
+	if res.ExitCode != 0 {
+		return fmt.Errorf("ss command failed")
+	}
+
+	out := res.Stdout
+	if svc == "sing-box" {
+		// check UDP 443
+		if !strings.Contains(out, ":443 ") {
+			return nil // no one owns it, safe to restart
+		}
+		if !strings.Contains(out, "sing-box") {
+			return fmt.Errorf("port udp 443 not owned by sing-box")
+		}
+	} else {
+		// check TCP 80, 443
+		if !strings.Contains(out, ":80 ") && !strings.Contains(out, ":443 ") {
+			return nil // no one owns it
+		}
+		if (strings.Contains(out, ":80 ") || strings.Contains(out, ":443 ")) && !strings.Contains(out, "caddy") {
+			return fmt.Errorf("port tcp 80/443 not owned by caddy")
+		}
+	}
+	return nil
+}
+
 func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 	lock := monitor.NewFileLock("/run/lock/singbox-sub-manager-monitor.lock")
 	if err := lock.TryLock(); err != nil {
-		// Log and return 3 (internal error) if another instance is running
 		fmt.Fprintf(stderr, "error acquiring lock: %v\n", err)
 		return 3
 	}
 	defer lock.Unlock()
 
 	repo := getRepo()
-
 	cfg := healthResolveConfig("", nil)
 
 	checker := &monitor.EligibilityChecker{
@@ -105,10 +161,11 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 			return nil
 		},
 		CheckPortOwner: func(ctx context.Context, svc string) error {
-			// This is just a placeholder, returning nil for now
-			return nil
+			return checkPortOwner(ctx, cfg, svc)
 		},
 	}
+
+	now := time.Now()
 
 	o := &monitor.Orchestrator{
 		Repo:    repo,
@@ -118,8 +175,24 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 			var checks []health.Check
 			if len(svcs) == 0 {
 				checks = allChecks
+
+				// Add remote checks if past 30m
+				state, err := repo.Load()
+				if err == nil {
+					// Also, run remote checks if it's the first time
+					if state.Remote.LastCheckAt.IsZero() || now.Sub(state.Remote.LastCheckAt) >= 30*time.Minute {
+						// Include remote checks
+						if ns, _, err := nodes.Load(defaultNodesPath); err == nil {
+							for _, n := range nodes.Enabled(ns) {
+								checks = append(checks, remote.NewNodeCheck(n))
+							}
+						}
+						// Update last check time
+						state.Remote.LastCheckAt = now
+						_ = repo.Save(state)
+					}
+				}
 			} else {
-				// filtered
 				want := make(map[string]bool)
 				for _, s := range svcs {
 					want[s] = true
@@ -130,24 +203,29 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 					}
 				}
 			}
-			return health.RunAll(ctx, cfg, checks, health.ConcurrentIDs())
+			concurrent := health.ConcurrentIDs()
+			for _, c := range checks {
+				if strings.HasPrefix(c.ID(), "remote.") {
+					concurrent[c.ID()] = true
+				}
+			}
+			return health.RunAll(ctx, cfg, checks, concurrent)
 		},
-		Restart: monitor.RestartService,
-		Now:     time.Now,
+		Restart:      monitor.RestartService,
+		Now:          time.Now,
+		CheckTimeout: 60 * time.Second,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
-	code, err := o.RunOnce(ctx)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
+	result := o.RunOnce(ctx)
+
+	// Build JSON
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(result.Report); err != nil {
 		return 3
 	}
 
-	// Output minimal report (the design says output a JSON result to stdout)
-	// We'll skip complex formatting here to focus on the exit code as requested.
-	fmt.Fprintln(stdout, `{"status": "completed"}`)
-
-	return code
+	return result.ExitCode
 }

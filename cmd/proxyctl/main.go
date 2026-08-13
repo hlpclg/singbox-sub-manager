@@ -53,6 +53,7 @@ func usage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "  validate --nodes nodes.conf")
 	fmt.Fprintln(stderr, "  subscription build --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  health   [--json] [--verbose] [--domain DOMAIN]")
+	fmt.Fprintln(stderr, "  monitor  [pause|resume|status]")
 	fmt.Fprintln(stderr, "  version  -- show version")
 	return 2
 }

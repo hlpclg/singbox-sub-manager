@@ -9,18 +9,19 @@ func TestStateRepo_PauseResume(t *testing.T) {
 	dir := t.TempDir()
 	repo := NewStateRepo(filepath.Join(dir, "state.json"), filepath.Join(dir, "paused"))
 
-	if repo.IsPaused() {
-		t.Fatal("should not be paused initially")
+	paused, err := repo.IsPaused()
+	if err != nil || paused {
+		t.Fatalf("should not be paused initially: %v", err)
 	}
 
 	if err := repo.Pause(); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
-	if !repo.IsPaused() {
+	paused, _ = repo.IsPaused()
+	if !paused {
 		t.Fatal("should be paused")
 	}
 
-	// Create dummy state
 	s := State{SchemaVersion: 1}
 	s.Services = make(map[string]*ServiceState)
 	s.Services["caddy"] = &ServiceState{FailureCount: 3}
@@ -31,7 +32,8 @@ func TestStateRepo_PauseResume(t *testing.T) {
 	if err := repo.Resume(); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if repo.IsPaused() {
+	paused, _ = repo.IsPaused()
+	if paused {
 		t.Fatal("should not be paused after resume")
 	}
 

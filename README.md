@@ -239,7 +239,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.4.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.6.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
@@ -297,7 +297,7 @@ proxyctl node migrate
 
 ## 健康检查（proxyctl health）
 
-v0.4 起提供订阅中心本机健康检查（只读），帮助及时发现服务、配置、文件或网络层面的故障。
+v0.6 起提供订阅中心本机健康检查（只读），帮助及时发现服务、配置、文件或网络层面的故障。
 
 ### 检查命令
 
@@ -755,8 +755,8 @@ make build
 - 独立节点配置文件
 - 自动拉取远程节点
 - Web 管理页面
-- 节点健康检查
-- 自动故障切换
+- 节点健康检查 (已实现)
+- 自动故障切换与恢复 (已实现)
 - 自动更新 sing-box
 - 自动备份和恢复
 - Docker 部署
