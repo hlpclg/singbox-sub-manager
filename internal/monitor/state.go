@@ -28,6 +28,30 @@ type State struct {
 	Remote        RemoteState              `json:"remote"`
 }
 
+func (s *State) ValidateAndRepair() {
+	if s.SchemaVersion != 1 {
+		s.SchemaVersion = 1
+	}
+	if s.Services == nil {
+		s.Services = make(map[string]*ServiceState)
+	}
+	for svc, st := range s.Services {
+		if st == nil {
+			s.Services[svc] = &ServiceState{}
+		} else if st.FailureCount < 0 {
+			st.FailureCount = 0
+		} else if st.FailureCount > 3 {
+			st.FailureCount = 3
+		}
+	}
+	if s.Services["sing-box"] == nil {
+		s.Services["sing-box"] = &ServiceState{}
+	}
+	if s.Services["caddy"] == nil {
+		s.Services["caddy"] = &ServiceState{}
+	}
+}
+
 type StateRepo interface {
 	Load() (State, error)
 	Save(State) error
@@ -57,11 +81,20 @@ func (r *fileStateRepo) IsPaused() (bool, error) {
 }
 
 func (r *fileStateRepo) Pause() error {
-	f, err := os.Create(r.pausePath)
+	f, err := os.OpenFile(r.pausePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 	if err != nil {
+		if os.IsExist(err) {
+			return nil // already paused
+		}
 		return err
 	}
-	f.Close()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	return syncDir(filepath.Dir(r.pausePath))
 }
 
@@ -84,11 +117,11 @@ func (r *fileStateRepo) Resume() error {
 
 func (r *fileStateRepo) Load() (State, error) {
 	var s State
-	s.Services = make(map[string]*ServiceState)
 	data, err := os.ReadFile(r.jsonPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.SchemaVersion = 1
+			s.ValidateAndRepair()
 			return s, nil
 		}
 		return s, fmt.Errorf("read state file: %w", err)
@@ -99,26 +132,38 @@ func (r *fileStateRepo) Load() (State, error) {
 	if s.SchemaVersion != 1 {
 		return s, fmt.Errorf("unsupported schema version: %d", s.SchemaVersion)
 	}
-	if s.Services == nil {
-		s.Services = make(map[string]*ServiceState)
-	}
+	s.ValidateAndRepair()
 	return s, nil
 }
 
 func (r *fileStateRepo) Save(s State) error {
-	s.SchemaVersion = 1
+	s.ValidateAndRepair()
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := r.jsonPath + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+
+	dir := filepath.Dir(r.jsonPath)
+	f, err := os.CreateTemp(dir, "state-*.json.tmp")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
+	tmpName := f.Name()
+	defer os.Remove(tmpName)
+
+	if err := f.Chmod(0600); err != nil {
 		f.Close()
 		return err
+	}
+
+	n, err := f.Write(data)
+	if err != nil {
+		f.Close()
+		return err
+	}
+	if n != len(data) {
+		f.Close()
+		return fmt.Errorf("short write: %d < %d", n, len(data))
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
@@ -127,10 +172,10 @@ func (r *fileStateRepo) Save(s State) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, r.jsonPath); err != nil {
+	if err := os.Rename(tmpName, r.jsonPath); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(r.jsonPath))
+	return syncDir(dir)
 }
 
 func syncDir(dir string) error {

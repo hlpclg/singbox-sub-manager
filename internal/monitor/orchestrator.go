@@ -9,12 +9,13 @@ import (
 )
 
 type Orchestrator struct {
-	Repo         StateRepo
-	Checker      *EligibilityChecker
-	RunChecks    func(ctx context.Context, svcs ...string) []health.Result
-	Restart      func(ctx context.Context, svc string) error
-	Now          func() time.Time
-	CheckTimeout time.Duration
+	Repo             StateRepo
+	Checker          *EligibilityChecker
+	RunChecks        func(ctx context.Context, svcs ...string) []health.Result
+	LoadRemoteChecks func(ctx context.Context) ([]health.Check, error)
+	Restart          func(ctx context.Context, svc string) error
+	Now              func() time.Time
+	CheckTimeout     time.Duration
 }
 
 type OrchestratorResult struct {
@@ -50,23 +51,58 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 	paused, pauseErr := o.Repo.IsPaused()
 	if pauseErr != nil {
-		// If we can't determine pause state reliably, we treat it as an error to prevent accidental recovery.
 		stateErr = fmt.Errorf("pause marker error: %v", pauseErr)
 	}
 
-	// Always run checks even if state is corrupt
+	// Figure out if we should run remote checks
+	runRemote := false
+	if stateErr == nil {
+		if start.Sub(state.Remote.LastCheckAt) >= 30*time.Minute || state.Remote.LastCheckAt.IsZero() {
+			runRemote = true
+		}
+	}
+
 	results := o.RunChecks(ctx)
+
+	// Add remote checks
+	if runRemote && o.LoadRemoteChecks != nil {
+		if remoteChecks, err := o.LoadRemoteChecks(ctx); err == nil {
+			var concurrentIDs = health.ConcurrentIDs()
+			for _, c := range remoteChecks {
+				concurrentIDs[c.ID()] = true
+			}
+			cfg := health.Config{Timeouts: health.DefaultTimeouts()} // used only for defaults inside RunAll, but actually not ideal. We assume RunAll uses context.
+			remoteResults := health.RunAll(ctx, cfg, remoteChecks, concurrentIDs)
+
+			results = append(results, remoteResults...)
+
+			// Remote summary
+			rPass, rWarn, rFail := 0, 0, 0
+			for _, r := range remoteResults {
+				switch r.Status {
+				case health.StatusPass:
+					rPass++
+				case health.StatusWarn:
+					rWarn++
+				case health.StatusFail:
+					rFail++
+				}
+			}
+			report.RemoteSummary = fmt.Sprintf("pass:%d warn:%d fail:%d", rPass, rWarn, rFail)
+
+			state.Remote.LastCheckAt = start
+		} else {
+			report.RemoteSummary = fmt.Sprintf("load failed: %v", err)
+		}
+	}
+
 	report.Checks = results
 
 	checksMap := make(map[string]string)
-	hasFail := false
-	hasWarn := false
 	for _, r := range results {
 		checksMap[r.ID] = string(r.Status)
 		if r.Status == health.StatusFail {
-			hasFail = true
 		} else if r.Status == health.StatusWarn {
-			hasWarn = true
 		}
 	}
 
@@ -87,18 +123,18 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		}
 
 		if ctx.Err() != nil {
-			// Cancelled, do not attempt recovery
 			report.Actions[svc] = "cancelled"
 			continue
 		}
 
-		// Pre-flight
-		if o.Checker != nil {
-			if err := o.Checker.CheckEligibility(ctx, svc); err != nil {
-				report.Actions[svc] = "preflight_failed"
-				hasWarn = true
-				continue
-			}
+		if o.Checker == nil || o.Checker.RunConfigCheck == nil || o.Checker.CheckPortOwner == nil {
+			report.Actions[svc] = "preflight_failed_missing_checker"
+			continue
+		}
+
+		if err := o.Checker.CheckEligibility(ctx, svc); err != nil {
+			report.Actions[svc] = fmt.Sprintf("preflight_failed: %v", err)
+			continue
 		}
 
 		newState.Services[svc].RecoveryInProgress = true
@@ -111,8 +147,10 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			return OrchestratorResult{ExitCode: 3, Report: report}
 		}
 
-		// Restart with its own timeout bounds if needed, but bounded by ctx
-		restartErr := o.Restart(ctx, svc)
+		// Restart bounded by timeout
+		restartCtx, restartCancel := context.WithTimeout(ctx, 30*time.Second)
+		restartErr := o.Restart(restartCtx, svc)
+		restartCancel()
 
 		if restartErr != nil {
 			newState.Services[svc].LastRecoveryResult = "fail"
@@ -175,7 +213,27 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		return OrchestratorResult{ExitCode: 1, Report: report}
 	}
 
-	if hasFail || hasWarn || paused || len(actions) > 0 {
+	// Re-evaluate hasFail/hasWarn after recovery
+	finalHasFail := false
+	finalHasWarn := false
+
+	// Create a map to shadow initial checks with rechecks
+	finalChecks := make(map[string]string)
+	for k, v := range checksMap {
+		finalChecks[k] = v
+	}
+	for _, r := range report.Rechecks {
+		finalChecks[r.ID] = string(r.Status)
+	}
+	for _, st := range finalChecks {
+		if st == "fail" {
+			finalHasFail = true
+		} else if st == "warn" {
+			finalHasWarn = true
+		}
+	}
+
+	if finalHasFail || finalHasWarn || paused || len(actions) > 0 {
 		report.Status = "degraded"
 		return OrchestratorResult{ExitCode: 2, Report: report}
 	}

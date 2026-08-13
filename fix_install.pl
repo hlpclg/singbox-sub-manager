@@ -45,8 +45,11 @@ chmod 0644 "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
 mv "$MONITOR_SVC_TMP" /etc/systemd/system/proxyctl-monitor.service
 mv "$MONITOR_TIMER_TMP" /etc/systemd/system/proxyctl-monitor.timer
 
-systemctl daemon-reload
-systemctl enable --now proxyctl-monitor.timer
+if ! systemctl daemon-reload || ! systemctl enable --now proxyctl-monitor.timer; then
+  log_warn "Failed to enable proxyctl-monitor timer. Rolling back..."
+  rm -f /etc/systemd/system/proxyctl-monitor.service /etc/systemd/system/proxyctl-monitor.timer
+  systemctl daemon-reload || true
+fi
 
 END_MONITOR
         next;

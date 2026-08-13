@@ -82,7 +82,11 @@ func cmdMonitorStatus(stdout, stderr io.Writer) int {
 		return 3
 	}
 
-	paused, _ := repo.IsPaused()
+	paused, err := repo.IsPaused()
+	if err != nil {
+		fmt.Fprintf(stderr, "error reading pause marker: %v\n", err)
+		return 3
+	}
 
 	status := struct {
 		Paused bool          `json:"paused"`
@@ -108,29 +112,34 @@ func checkPortOwner(ctx context.Context, cfg health.Config, svc string) error {
 		portArgs = []string{"-lnpt"}
 	}
 
-	res := cfg.Runner.Run(ctx, "ss", portArgs...)
+	runner := cfg.Runner
+	if runner == nil {
+		runner = health.ExecRunner{}
+	}
+	res := runner.Run(ctx, "ss", portArgs...)
 	if res.ExitCode != 0 {
 		return fmt.Errorf("ss command failed")
 	}
 
 	out := res.Stdout
-	if svc == "sing-box" {
-		// check UDP 443
-		if !strings.Contains(out, ":443 ") {
-			return nil // no one owns it, safe to restart
-		}
-		if !strings.Contains(out, "sing-box") {
-			return fmt.Errorf("port udp 443 not owned by sing-box")
-		}
-	} else {
-		// check TCP 80, 443
-		if !strings.Contains(out, ":80 ") && !strings.Contains(out, ":443 ") {
-			return nil // no one owns it
-		}
-		if (strings.Contains(out, ":80 ") || strings.Contains(out, ":443 ")) && !strings.Contains(out, "caddy") {
-			return fmt.Errorf("port tcp 80/443 not owned by caddy")
+	lines := strings.Split(out, "\n")
+
+	for _, line := range lines {
+		if svc == "sing-box" {
+			if strings.Contains(line, ":443 ") {
+				if !strings.Contains(line, "sing-box") {
+					return fmt.Errorf("port udp 443 owned by unknown process: %s", line)
+				}
+			}
+		} else {
+			if strings.Contains(line, ":80 ") || strings.Contains(line, ":443 ") {
+				if !strings.Contains(line, "caddy") {
+					return fmt.Errorf("port tcp 80/443 owned by unknown process: %s", line)
+				}
+			}
 		}
 	}
+
 	return nil
 }
 
@@ -145,15 +154,20 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 	repo := getRepo()
 	cfg := healthResolveConfig("", nil)
 
+	runner := cfg.Runner
+	if runner == nil {
+		runner = health.ExecRunner{}
+	}
+
 	checker := &monitor.EligibilityChecker{
 		RunConfigCheck: func(ctx context.Context, svc string) error {
 			if svc == "sing-box" {
-				res := cfg.Runner.Run(ctx, "sing-box", "check", "-c", cfg.SingboxConfig)
+				res := runner.Run(ctx, "sing-box", "check", "-c", cfg.SingboxConfig)
 				if res.ExitCode != 0 {
 					return fmt.Errorf("config check failed")
 				}
 			} else {
-				res := cfg.Runner.Run(ctx, "caddy", "validate", "--config", cfg.CaddyConfig, "--adapter", "caddyfile")
+				res := runner.Run(ctx, "caddy", "validate", "--config", cfg.CaddyConfig, "--adapter", "caddyfile")
 				if res.ExitCode != 0 {
 					return fmt.Errorf("config check failed")
 				}
@@ -165,8 +179,6 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 		},
 	}
 
-	now := time.Now()
-
 	o := &monitor.Orchestrator{
 		Repo:    repo,
 		Checker: checker,
@@ -175,23 +187,6 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 			var checks []health.Check
 			if len(svcs) == 0 {
 				checks = allChecks
-
-				// Add remote checks if past 30m
-				state, err := repo.Load()
-				if err == nil {
-					// Also, run remote checks if it's the first time
-					if state.Remote.LastCheckAt.IsZero() || now.Sub(state.Remote.LastCheckAt) >= 30*time.Minute {
-						// Include remote checks
-						if ns, _, err := nodes.Load(defaultNodesPath); err == nil {
-							for _, n := range nodes.Enabled(ns) {
-								checks = append(checks, remote.NewNodeCheck(n))
-							}
-						}
-						// Update last check time
-						state.Remote.LastCheckAt = now
-						_ = repo.Save(state)
-					}
-				}
 			} else {
 				want := make(map[string]bool)
 				for _, s := range svcs {
@@ -203,13 +198,18 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 					}
 				}
 			}
-			concurrent := health.ConcurrentIDs()
-			for _, c := range checks {
-				if strings.HasPrefix(c.ID(), "remote.") {
-					concurrent[c.ID()] = true
-				}
+			return health.RunAll(ctx, cfg, checks, health.ConcurrentIDs())
+		},
+		LoadRemoteChecks: func(ctx context.Context) ([]health.Check, error) {
+			ns, _, err := nodes.Load(defaultNodesPath)
+			if err != nil {
+				return nil, err
 			}
-			return health.RunAll(ctx, cfg, checks, concurrent)
+			var rChecks []health.Check
+			for _, n := range nodes.Enabled(ns) {
+				rChecks = append(rChecks, remote.NewNodeCheck(n))
+			}
+			return rChecks, nil
 		},
 		Restart:      monitor.RestartService,
 		Now:          time.Now,
