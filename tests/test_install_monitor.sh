@@ -100,7 +100,9 @@ set -e
 [[ "$status" -ne 0 ]]
 grep -Fxq 'old service' "$UNIT_DIR/proxyctl-monitor.service"
 grep -Fxq 'old timer' "$UNIT_DIR/proxyctl-monitor.timer"
-! grep -Fq 'daemon-reload' "$CALLS"
+if grep -Fq 'daemon-reload' "$CALLS"; then
+  exit 1
+fi
 printf 'state probe failure test passed\n'
 
 echo "monitor installer contract passed"
