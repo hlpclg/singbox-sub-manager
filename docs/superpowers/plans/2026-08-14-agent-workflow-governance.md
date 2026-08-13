@@ -8,7 +8,7 @@
 
 **Tech Stack:** Markdown、Git、Codex 全局 `AGENTS.md`
 
-**整体状态：** 已完成，待最终状态提交封账。
+**整体状态：** 已完成并封账。
 
 ## Global Constraints
 
@@ -64,7 +64,7 @@ Commit message: `docs: add project agent workflows`
 
 **Task 1 完成记录：**
 
-- 状态：已完成，待本次状态提交封账。
+- 状态：已封账（`375d363`）。
 - 实际范围：新增六个项目工作流文件并更新根 `AGENTS.md` 入口。
 - 主提交 SHA：`4da2b43`。
 - 验证证据：六个目标文件存在且非空；根入口引用命中；`git diff --check` 通过；主提交仅包含预期七个文件。
@@ -105,7 +105,7 @@ Commit message: `docs: add project agent workflows`
 
 **Task 2 完成记录：**
 
-- 状态：已完成，待本次状态提交封账。
+- 状态：已封账（`74cb956`）。
 - 实际范围：更新 `~/.codex/AGENTS.md`，创建 `~/.codex/workflows/development/` 下六个通用工作流文件。
 - 备份：`~/.codex/AGENTS.md.backup-20260814-0334`。
 - 验证证据：六个目标文件存在且非空；全局入口引用命中；工作流目录和新增入口不含 Go 1.22、v0.6、proxyctl、singbox 或当前项目路径；入口差异仅新增五条通用规则。
@@ -158,7 +158,7 @@ Commit message: `docs: align workflow and v0.6 status`
 
 **Task 3 完成记录：**
 
-- 状态：已完成，待本次状态提交封账。
+- 状态：已封账（`a23fe6c`）。
 - 实际范围：更新 v0.6 设计状态和实施归档；更新工作流治理设计状态与两步封账规则。
 - 主提交 SHA：`c152ff6`。
 - 验证证据：过期状态关键词审计只剩本计划的执行说明；v0.6 用户命令、远程检查、timer、安装器测试和发布门禁在 README/CI/release 中均有对应记录；`git diff --check` 通过。
@@ -171,7 +171,7 @@ Commit message: `docs: align workflow and v0.6 status`
 |---|---|---|---|
 | 1. 项目 Agent 工作流 | `4da2b43` | `375d363` | 不适用 |
 | 2. 本机全局工作流 | `~/.codex/workflows/development/`，备份 `~/.codex/AGENTS.md.backup-20260814-0334` | `74cb956` | 不适用 |
-| 3. 文档状态审计 | `c152ff6` | 本次最终状态提交 | 无需更新 |
+| 3. 文档状态审计 | `c152ff6` | `a23fe6c` | 无需更新 |
 
 ## Final Verification
 
