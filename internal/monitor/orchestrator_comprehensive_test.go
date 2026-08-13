@@ -281,7 +281,7 @@ func TestOrchestrator_RemoteFailedResultIsDegraded(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_RemoteExecutionErrorIsDegraded(t *testing.T) {
+func TestOrchestrator_RemoteExecutionErrorIsInternal(t *testing.T) {
 	repo := &dummyRepo{state: validDummyState()}
 	o := &Orchestrator{
 		Repo:             repo,
@@ -291,8 +291,8 @@ func TestOrchestrator_RemoteExecutionErrorIsDegraded(t *testing.T) {
 		Now:              time.Now,
 	}
 	res := o.RunOnce(context.Background())
-	if res.ExitCode != 2 || res.Report.Status != "degraded" {
-		t.Fatalf("remote execution error did not degrade report: %+v", res)
+	if res.ExitCode != 3 || res.Report.Status != "internal_error" {
+		t.Fatalf("remote execution error was not internal error: %+v", res)
 	}
 }
 

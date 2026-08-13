@@ -271,7 +271,7 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			remoteResults, runErr := o.RunRemoteChecks(remoteCtx, remoteChecks)
 			if runErr != nil {
 				report.RemoteSummary = fmt.Sprintf("check failed: %v", runErr)
-				remoteDegraded = true
+				remoteFailed = true
 			} else {
 				rPass, rWarn, rFail := 0, 0, 0
 				for _, r := range remoteResults {
