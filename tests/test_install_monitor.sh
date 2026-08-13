@@ -39,6 +39,12 @@ CALLS="$TEST_DIR/systemctl.calls"
 
 systemctl() {
   printf '%s\n' "$*" >> "$CALLS"
+  if [[ "${MODE:-disabled}" == runtime ]]; then
+    case "$1 ${2:-}" in
+      "is-enabled proxyctl-monitor.timer") printf 'enabled-runtime\n'; return 0 ;;
+      "is-active proxyctl-monitor.timer") printf 'inactive\n'; return 3 ;;
+    esac
+  fi
   case "$1 ${2:-}" in
     "is-enabled proxyctl-monitor.timer") printf 'disabled\n'; return 1 ;;
     "is-active proxyctl-monitor.timer") printf 'inactive\n'; return 3 ;;
@@ -65,5 +71,18 @@ grep -Fq 'disable proxyctl-monitor.timer' "$CALLS"
 grep -Fq 'stop proxyctl-monitor.timer' "$CALLS"
 
 printf 'transaction rollback test passed\n'
+
+printf 'old service\n' > "$UNIT_DIR/proxyctl-monitor.service"
+printf 'old timer\n' > "$UNIT_DIR/proxyctl-monitor.timer"
+: > "$CALLS"
+set +e
+( export MONITOR_UNIT_DIR="$UNIT_DIR" MODE=runtime; eval "$SNIPPET" )
+status=$?
+set -e
+[[ "$status" -ne 0 ]]
+grep -Fxq 'old service' "$UNIT_DIR/proxyctl-monitor.service"
+grep -Fxq 'old timer' "$UNIT_DIR/proxyctl-monitor.timer"
+grep -Fq 'enable --runtime proxyctl-monitor.timer' "$CALLS"
+printf 'runtime enablement rollback test passed\n'
 
 echo "monitor installer contract passed"
