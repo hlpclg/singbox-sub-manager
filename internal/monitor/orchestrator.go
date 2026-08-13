@@ -165,15 +165,20 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		}
 		restartCtx, restartCancel := context.WithTimeout(ctx, restartTimeout)
 		restartErr := o.Restart(restartCtx, svc)
+		restartCtxErr := restartCtx.Err()
 		restartCancel()
 
-		if restartErr != nil {
+		if restartCtxErr != nil {
 			newState.Services[svc].LastRecoveryResult = "fail"
-			if restartCtx.Err() == context.DeadlineExceeded {
+			if restartCtxErr == context.DeadlineExceeded {
 				report.Actions[svc] = "restart_timeout"
 			} else {
 				report.Actions[svc] = "restart_failed"
 			}
+			recoveryFailed = true
+		} else if restartErr != nil {
+			newState.Services[svc].LastRecoveryResult = "fail"
+			report.Actions[svc] = "restart_failed"
 			recoveryFailed = true
 		} else if ctx.Err() != nil {
 			report.Actions[svc] = "cancelled"
@@ -308,7 +313,11 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 				remoteFailed = true
 			} else {
 				remoteResults, runErr := o.RunRemoteChecks(remoteCtx, remoteChecks)
-				if runErr != nil {
+				remoteCtxErr := remoteCtx.Err()
+				if remoteCtxErr != nil {
+					report.RemoteSummary = "cancelled"
+					remoteFailed = true
+				} else if runErr != nil {
 					report.RemoteSummary = fmt.Sprintf("check failed: %v", runErr)
 					remoteFailed = true
 				} else {

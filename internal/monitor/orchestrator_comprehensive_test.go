@@ -10,6 +10,14 @@ import (
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
 )
 
+type monitorTestCheck struct{ id string }
+
+func (c monitorTestCheck) ID() string   { return c.id }
+func (c monitorTestCheck) Name() string { return c.id }
+func (c monitorTestCheck) Run(context.Context, health.Config) health.Result {
+	return health.Result{ID: c.id, Status: health.StatusPass}
+}
+
 func TestOrchestrator_TimeRewind(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 	past := time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)
@@ -379,6 +387,26 @@ func TestOrchestrator_RemoteFailedResultIsDegraded(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_RemoteReturningSuccessAfterTimeoutIsNotCommitted(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	o := &Orchestrator{
+		Repo:      repo,
+		RunChecks: func(context.Context, ...string) []health.Result { return localPassResults() },
+		LoadRemoteChecks: func(context.Context) ([]health.Check, error) {
+			return []health.Check{monitorTestCheck{id: "remote.node.1"}}, nil
+		},
+		RunRemoteChecks: func(ctx context.Context, _ []health.Check) ([]health.Result, error) {
+			<-ctx.Done()
+			return []health.Result{{ID: "remote.node.1", Status: health.StatusPass}}, nil
+		},
+		Now: time.Now, CheckTimeout: 20 * time.Millisecond,
+	}
+	res := o.RunOnce(context.Background())
+	if res.ExitCode != 3 || res.Report.RemoteSummary != "cancelled" || !repo.state.Remote.LastCheckAt.IsZero() {
+		t.Fatalf("remote result after timeout was accepted: %+v state=%+v", res, repo.state.Remote)
+	}
+}
+
 func TestOrchestrator_RemoteExecutionErrorIsInternal(t *testing.T) {
 	repo := &dummyRepo{state: validDummyState()}
 	o := &Orchestrator{
@@ -436,6 +464,29 @@ func TestOrchestrator_RestartTimeoutIsBounded(t *testing.T) {
 	res := o.RunOnce(context.Background())
 	if time.Since(started) > time.Second || res.ExitCode != 1 || res.Report.Actions["sing-box"] != "restart_timeout" {
 		t.Fatalf("restart timeout was not bounded: elapsed=%s result=%+v", time.Since(started), res)
+	}
+}
+
+func TestOrchestrator_RestartReturningNilAfterTimeoutIsNotRecovery(t *testing.T) {
+	now := time.Now()
+	repo := &dummyRepo{state: State{SchemaVersion: 1, Services: map[string]*ServiceState{
+		"sing-box": {FailureCount: 2}, "caddy": {},
+	}}}
+	o := &Orchestrator{
+		Repo:    repo,
+		Checker: &EligibilityChecker{RunConfigCheck: func(context.Context, string) error { return nil }, CheckPortOwner: func(context.Context, string) error { return nil }},
+		RunChecks: func(_ context.Context, ids ...string) []health.Result {
+			if len(ids) > 0 {
+				return []health.Result{{ID: "service.singbox", Status: health.StatusPass}, {ID: "port.udp443", Status: health.StatusPass}}
+			}
+			return []health.Result{{ID: "service.singbox", Status: health.StatusFail}, {ID: "port.udp443", Status: health.StatusFail}, {ID: "service.caddy", Status: health.StatusPass}, {ID: "port.tcp80", Status: health.StatusPass}, {ID: "port.tcp443", Status: health.StatusPass}}
+		},
+		Restart: func(ctx context.Context, _ string) error { <-ctx.Done(); return nil },
+		Now:     nowFunc(now), CheckTimeout: time.Second, RestartTimeout: 10 * time.Millisecond,
+	}
+	res := o.RunOnce(context.Background())
+	if res.ExitCode != 1 || res.Report.Actions["sing-box"] != "restart_timeout" || len(res.Report.Rechecks) != 0 {
+		t.Fatalf("nil after restart timeout was accepted: %+v", res)
 	}
 }
 
