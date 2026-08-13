@@ -129,16 +129,26 @@ func checkPortOwner(ctx context.Context, cfg health.Config, svc string) error {
 	out := res.Stdout
 	lines := strings.Split(out, "\n")
 
+	unit := svc
+	unitRes := runner.Run(ctx, "systemctl", "show", "-p", "MainPID", "--value", unit)
+	if unitRes.ExitCode != 0 {
+		return fmt.Errorf("cannot resolve %s MainPID", unit)
+	}
+	mainPID := strings.TrimSpace(unitRes.Stdout)
+	if mainPID == "" || mainPID == "0" {
+		return fmt.Errorf("%s has no MainPID", unit)
+	}
+
 	for _, line := range lines {
 		if svc == "sing-box" {
 			if strings.Contains(line, ":443 ") {
-				if !ssLineHasProcess(line, "sing-box") {
+				if !ssLineHasProcess(line, "sing-box") || !ssLineHasPID(line, mainPID) {
 					return fmt.Errorf("port udp 443 owned by unknown process: %s", line)
 				}
 			}
 		} else {
 			if strings.Contains(line, ":80 ") || strings.Contains(line, ":443 ") {
-				if !ssLineHasProcess(line, "caddy") {
+				if !ssLineHasProcess(line, "caddy") || !ssLineHasPID(line, mainPID) {
 					return fmt.Errorf("port tcp 80/443 owned by unknown process: %s", line)
 				}
 			}
@@ -151,6 +161,10 @@ func checkPortOwner(ctx context.Context, cfg health.Config, svc string) error {
 func ssLineHasProcess(line, process string) bool {
 	pattern := `users:\(\("` + regexp.QuoteMeta(process) + `",`
 	return regexp.MustCompile(pattern).MatchString(line)
+}
+
+func ssLineHasPID(line, pid string) bool {
+	return regexp.MustCompile(`users:\(\("[^"]+",pid=` + regexp.QuoteMeta(pid) + `[,)\)]`).MatchString(line)
 }
 
 func runMonitorOrchestrator(stdout, stderr io.Writer) int {

@@ -89,6 +89,19 @@ func TestDecide_CrashMarkerSettlesBeforeRecovery(t *testing.T) {
 	}
 }
 
+func TestDecide_HealthyObservationSettlesCrashMarker(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	state := State{SchemaVersion: 1, Services: map[string]*ServiceState{
+		"sing-box": {FailureCount: 3, RecoveryInProgress: true, CooldownUntil: now.Add(time.Hour)},
+		"caddy":    {},
+	}}
+	checks := map[string]string{"service.singbox": "pass", "port.udp443": "pass", "service.caddy": "pass", "port.tcp80": "pass", "port.tcp443": "pass"}
+	state, actions := Decide(state, checks, now, false)
+	if len(actions) != 0 || state.Services["sing-box"].RecoveryInProgress || state.Services["sing-box"].LastRecoveryResult != "incomplete" {
+		t.Fatalf("healthy observation lost crash settlement: state=%+v actions=%v", *state.Services["sing-box"], actions)
+	}
+}
+
 func TestOrchestrator_CrashRecoveryAndPreflightFail(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
 
@@ -121,7 +134,8 @@ func TestOrchestrator_CrashRecoveryAndPreflightFail(t *testing.T) {
 				{ID: "port.tcp443", Status: health.StatusPass},
 			}
 		},
-		Now: func() time.Time { return now },
+		Restart: func(context.Context, string) error { return nil },
+		Now:     func() time.Time { return now },
 	}
 
 	res := o.RunOnce(context.Background())
@@ -189,14 +203,170 @@ func TestOrchestrator_DualServiceRecovery_And_RestartFail(t *testing.T) {
 		t.Errorf("expected both to restart, got %v", restarts)
 	}
 
-	if repo.state.Services["sing-box"].FailureCount != 0 { // recheck failed because mock RunChecks still returns fail
-		// wait, recheck uses same RunChecks mock which returns FAIL!
-		// So sing-box recheck also fails!
-		if res.Report.Actions["sing-box"] != "recheck_failed" {
-			t.Errorf("expected sing-box recheck_failed, got %s", res.Report.Actions["sing-box"])
-		}
+	if res.Report.Actions["sing-box"] != "recheck_failed" {
+		t.Errorf("expected sing-box recheck_failed, got %s", res.Report.Actions["sing-box"])
 	}
 }
+
+func TestOrchestrator_RemoteFailureDoesNotLoseLocalRecovery(t *testing.T) {
+	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+	repo := &dummyRepo{state: State{SchemaVersion: 1, Services: map[string]*ServiceState{
+		"sing-box": {FailureCount: 2}, "caddy": {},
+	}}}
+	o := &Orchestrator{
+		Repo: repo,
+		Checker: &EligibilityChecker{
+			RunConfigCheck: func(context.Context, string) error { return nil },
+			CheckPortOwner: func(context.Context, string) error { return nil },
+		},
+		RunChecks: func(_ context.Context, ids ...string) []health.Result {
+			if len(ids) > 0 {
+				return []health.Result{{ID: "service.singbox", Status: health.StatusPass}, {ID: "port.udp443", Status: health.StatusPass}}
+			}
+			return []health.Result{
+				{ID: "service.singbox", Status: health.StatusFail}, {ID: "port.udp443", Status: health.StatusFail},
+				{ID: "service.caddy", Status: health.StatusPass}, {ID: "port.tcp80", Status: health.StatusPass}, {ID: "port.tcp443", Status: health.StatusPass},
+			}
+		},
+		LoadRemoteChecks: func(context.Context) ([]health.Check, error) { return nil, fmt.Errorf("nodes unavailable") },
+		Restart:          func(context.Context, string) error { return nil },
+		Now:              func() time.Time { return now },
+	}
+	res := o.RunOnce(context.Background())
+	if res.ExitCode != 3 || res.Report.Status != "internal_error" {
+		t.Fatalf("remote failure should report internal error after local recovery: %+v", res)
+	}
+	if res.Report.Actions["sing-box"] != "recovered" || repo.state.Services["sing-box"].LastRecoveryResult != "pass" {
+		t.Fatalf("local recovery was lost on remote failure: %+v state=%+v", res.Report.Actions, repo.state.Services["sing-box"])
+	}
+}
+
+func TestOrchestrator_RemoteTimeoutDoesNotUseLocalDeadline(t *testing.T) {
+	now := time.Now()
+	repo := &dummyRepo{state: validDummyState()}
+	o := &Orchestrator{
+		Repo:      repo,
+		RunChecks: func(context.Context, ...string) []health.Result { return localPassResults() },
+		LoadRemoteChecks: func(ctx context.Context) ([]health.Check, error) {
+			select {
+			case <-time.After(20 * time.Millisecond):
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		RunRemoteChecks: func(context.Context, []health.Check) ([]health.Result, error) { return nil, nil },
+		Now:             nowFunc(now), CheckTimeout: 5 * time.Millisecond,
+	}
+	res := o.RunOnce(context.Background())
+	if res.Report.RemoteSummary != "pass:0 warn:0 fail:0" || res.ExitCode != 0 {
+		t.Fatalf("remote check inherited local deadline: %+v", res)
+	}
+}
+
+func TestOrchestrator_RemoteFailedResultIsDegraded(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	o := &Orchestrator{
+		Repo:             repo,
+		RunChecks:        func(context.Context, ...string) []health.Result { return localPassResults() },
+		LoadRemoteChecks: func(context.Context) ([]health.Check, error) { return nil, nil },
+		RunRemoteChecks: func(context.Context, []health.Check) ([]health.Result, error) {
+			return []health.Result{{ID: "remote.node.1", Status: health.StatusFail}}, nil
+		},
+		Now: time.Now,
+	}
+	res := o.RunOnce(context.Background())
+	if res.ExitCode != 2 || res.Report.Status != "degraded" {
+		t.Fatalf("remote failed result did not degrade report: %+v", res)
+	}
+}
+
+func TestOrchestrator_RemoteExecutionErrorIsDegraded(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	o := &Orchestrator{
+		Repo:             repo,
+		RunChecks:        func(context.Context, ...string) []health.Result { return localPassResults() },
+		LoadRemoteChecks: func(context.Context) ([]health.Check, error) { return nil, nil },
+		RunRemoteChecks:  func(context.Context, []health.Check) ([]health.Result, error) { return nil, fmt.Errorf("probe failed") },
+		Now:              time.Now,
+	}
+	res := o.RunOnce(context.Background())
+	if res.ExitCode != 2 || res.Report.Status != "degraded" {
+		t.Fatalf("remote execution error did not degrade report: %+v", res)
+	}
+}
+
+func TestOrchestrator_MissingHooksReturnInternalError(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	for name, configure := range map[string]func(*Orchestrator){
+		"run checks": func(o *Orchestrator) { o.RunChecks = nil },
+		"restart": func(o *Orchestrator) {
+			o.RunChecks = func(context.Context, ...string) []health.Result {
+				return []health.Result{{ID: "service.singbox", Status: health.StatusFail}, {ID: "port.udp443", Status: health.StatusFail}, {ID: "service.caddy", Status: health.StatusPass}, {ID: "port.tcp80", Status: health.StatusPass}, {ID: "port.tcp443", Status: health.StatusPass}}
+			}
+			o.Checker = &EligibilityChecker{RunConfigCheck: func(context.Context, string) error { return nil }, CheckPortOwner: func(context.Context, string) error { return nil }}
+			repo.state.Services["sing-box"].FailureCount = 2
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo.state = validDummyState()
+			o := &Orchestrator{Repo: repo, Now: time.Now, Restart: nil}
+			configure(o)
+			res := o.RunOnce(context.Background())
+			if res.ExitCode != 3 || res.Report.Status != "internal_error" {
+				t.Fatalf("missing hook did not return internal error: %+v", res)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_RestartTimeoutIsBounded(t *testing.T) {
+	now := time.Now()
+	repo := &dummyRepo{state: State{SchemaVersion: 1, Services: map[string]*ServiceState{
+		"sing-box": {FailureCount: 2}, "caddy": {},
+	}}}
+	o := &Orchestrator{
+		Repo:    repo,
+		Checker: &EligibilityChecker{RunConfigCheck: func(context.Context, string) error { return nil }, CheckPortOwner: func(context.Context, string) error { return nil }},
+		RunChecks: func(context.Context, ...string) []health.Result {
+			return []health.Result{{ID: "service.singbox", Status: health.StatusFail}, {ID: "port.udp443", Status: health.StatusFail}, {ID: "service.caddy", Status: health.StatusPass}, {ID: "port.tcp80", Status: health.StatusPass}, {ID: "port.tcp443", Status: health.StatusPass}}
+		},
+		Restart: func(ctx context.Context, _ string) error { <-ctx.Done(); return ctx.Err() },
+		Now:     nowFunc(now), CheckTimeout: time.Second, RestartTimeout: 10 * time.Millisecond,
+	}
+	started := time.Now()
+	res := o.RunOnce(context.Background())
+	if time.Since(started) > time.Second || res.ExitCode != 1 || res.Report.Actions["sing-box"] != "restart_timeout" {
+		t.Fatalf("restart timeout was not bounded: elapsed=%s result=%+v", time.Since(started), res)
+	}
+}
+
+func TestOrchestrator_RecheckTimeoutIsBounded(t *testing.T) {
+	now := time.Now()
+	repo := &dummyRepo{state: State{SchemaVersion: 1, Services: map[string]*ServiceState{
+		"sing-box": {FailureCount: 2}, "caddy": {},
+	}}}
+	var rechecking bool
+	o := &Orchestrator{
+		Repo:    repo,
+		Checker: &EligibilityChecker{RunConfigCheck: func(context.Context, string) error { return nil }, CheckPortOwner: func(context.Context, string) error { return nil }},
+		RunChecks: func(ctx context.Context, ids ...string) []health.Result {
+			if len(ids) > 0 {
+				rechecking = true
+				<-ctx.Done()
+			}
+			return []health.Result{{ID: "service.singbox", Status: health.StatusFail}, {ID: "port.udp443", Status: health.StatusFail}, {ID: "service.caddy", Status: health.StatusPass}, {ID: "port.tcp80", Status: health.StatusPass}, {ID: "port.tcp443", Status: health.StatusPass}}
+		},
+		Restart: func(context.Context, string) error { return nil },
+		Now:     nowFunc(now), CheckTimeout: time.Second, RecheckTimeout: 10 * time.Millisecond,
+	}
+	res := o.RunOnce(context.Background())
+	if !rechecking || res.ExitCode != 1 || res.Report.Actions["sing-box"] != "recheck_timeout" {
+		t.Fatalf("recheck timeout was not bounded: %+v", res)
+	}
+}
+
+func nowFunc(now time.Time) func() time.Time { return func() time.Time { return now } }
 
 func TestOrchestrator_PrecommitFail(t *testing.T) {
 	now := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)

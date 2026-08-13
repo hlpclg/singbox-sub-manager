@@ -17,6 +17,7 @@ type Orchestrator struct {
 	Restart          func(ctx context.Context, svc string) error
 	Now              func() time.Time
 	CheckTimeout     time.Duration
+	RestartTimeout   time.Duration
 	RecheckTimeout   time.Duration
 }
 
@@ -30,6 +31,7 @@ type Report struct {
 	Timestamp     string            `json:"timestamp"`
 	DurationMS    int64             `json:"duration_ms"`
 	Checks        []health.Result   `json:"checks"`
+	Decisions     map[string]string `json:"decisions"`
 	Actions       map[string]string `json:"actions,omitempty"`
 	Rechecks      []health.Result   `json:"rechecks,omitempty"`
 	RemoteSummary string            `json:"remote_summary,omitempty"`
@@ -37,7 +39,15 @@ type Report struct {
 
 func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 	start := o.Now()
+	if o.RunChecks == nil {
+		return OrchestratorResult{ExitCode: 3, Report: Report{
+			Status: "internal_error", Timestamp: start.Format(time.RFC3339),
+			Decisions: map[string]string{},
+			Actions:   map[string]string{"monitor": "missing_run_checks"},
+		}}
+	}
 
+	parentCtx := ctx
 	timeout := o.CheckTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -48,6 +58,7 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 	report := Report{
 		Timestamp: start.Format(time.RFC3339),
+		Decisions: make(map[string]string),
 		Actions:   make(map[string]string),
 	}
 
@@ -71,57 +82,11 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 	results := o.RunChecks(ctx)
 
-	// Add remote checks
-	if runRemote && o.LoadRemoteChecks != nil {
-		if remoteChecks, err := o.LoadRemoteChecks(ctx); err == nil {
-			if o.RunRemoteChecks == nil {
-				report.RemoteSummary = "remote runner unavailable"
-				report.Status = "internal_error"
-				report.DurationMS = o.Now().Sub(start).Milliseconds()
-				return OrchestratorResult{ExitCode: 3, Report: report}
-			}
-			var remoteResults []health.Result
-			remoteResults, err = o.RunRemoteChecks(ctx, remoteChecks)
-			if err != nil {
-				report.RemoteSummary = fmt.Sprintf("check failed: %v", err)
-				report.Status = "internal_error"
-				report.DurationMS = o.Now().Sub(start).Milliseconds()
-				return OrchestratorResult{ExitCode: 3, Report: report}
-			}
-
-			results = append(results, remoteResults...)
-
-			// Remote summary
-			rPass, rWarn, rFail := 0, 0, 0
-			for _, r := range remoteResults {
-				switch r.Status {
-				case health.StatusPass:
-					rPass++
-				case health.StatusWarn:
-					rWarn++
-				case health.StatusFail:
-					rFail++
-				}
-			}
-			report.RemoteSummary = fmt.Sprintf("pass:%d warn:%d fail:%d", rPass, rWarn, rFail)
-
-			state.Remote.LastCheckAt = start
-		} else {
-			report.RemoteSummary = fmt.Sprintf("load failed: %v", err)
-			report.Status = "internal_error"
-			report.DurationMS = o.Now().Sub(start).Milliseconds()
-			return OrchestratorResult{ExitCode: 3, Report: report}
-		}
-	}
-
 	report.Checks = results
 
 	checksMap := make(map[string]string)
 	for _, r := range results {
 		checksMap[r.ID] = string(r.Status)
-		if r.Status == health.StatusFail {
-		} else if r.Status == health.StatusWarn {
-		}
 	}
 	for _, id := range []string{"service.singbox", "port.udp443", "service.caddy", "port.tcp80", "port.tcp443"} {
 		if _, ok := checksMap[id]; !ok {
@@ -139,8 +104,22 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 	newState, actions := Decide(state, checksMap, start, paused)
 	report.Actions = actions
+	for svc, triggers := range map[string][]string{"sing-box": singboxTriggers, "caddy": caddyTriggers} {
+		decision := "healthy"
+		for _, trigger := range triggers {
+			if checksMap[trigger] != string(health.StatusPass) {
+				decision = "degraded"
+				break
+			}
+		}
+		if action, ok := actions[svc]; ok {
+			decision = action
+		}
+		report.Decisions[svc] = decision
+	}
 
 	recoveryFailed := false
+	internalFailure := false
 
 	for svc, action := range actions {
 		if action != "recover" {
@@ -154,6 +133,11 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 		if o.Checker == nil || o.Checker.RunConfigCheck == nil || o.Checker.CheckPortOwner == nil {
 			report.Actions[svc] = "preflight_failed_missing_checker"
+			continue
+		}
+		if o.Restart == nil {
+			report.Actions[svc] = "internal_error_missing_restart"
+			internalFailure = true
 			continue
 		}
 
@@ -173,13 +157,21 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		}
 
 		// Restart bounded by timeout
-		restartCtx, restartCancel := context.WithTimeout(ctx, 30*time.Second)
+		restartTimeout := o.RestartTimeout
+		if restartTimeout <= 0 {
+			restartTimeout = 30 * time.Second
+		}
+		restartCtx, restartCancel := context.WithTimeout(ctx, restartTimeout)
 		restartErr := o.Restart(restartCtx, svc)
 		restartCancel()
 
 		if restartErr != nil {
 			newState.Services[svc].LastRecoveryResult = "fail"
-			report.Actions[svc] = "restart_failed"
+			if restartCtx.Err() == context.DeadlineExceeded {
+				report.Actions[svc] = "restart_timeout"
+			} else {
+				report.Actions[svc] = "restart_failed"
+			}
 			recoveryFailed = true
 		} else if ctx.Err() != nil {
 			report.Actions[svc] = "cancelled"
@@ -199,11 +191,16 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			}
 			recheckCtx, recheckCancel := context.WithTimeout(ctx, recheckTimeout)
 			rechecks := o.RunChecks(recheckCtx, triggers...)
+			recheckErr := recheckCtx.Err()
 			recheckCancel()
 			report.Rechecks = append(report.Rechecks, rechecks...)
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || recheckErr != nil {
 				newState.Services[svc].LastRecoveryResult = "cancelled"
-				report.Actions[svc] = "cancelled"
+				if recheckErr == context.DeadlineExceeded {
+					report.Actions[svc] = "recheck_timeout"
+				} else {
+					report.Actions[svc] = "recheck_cancelled"
+				}
 				recoveryFailed = true
 				newState.Services[svc].RecoveryInProgress = false
 				continue
@@ -253,11 +250,66 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		return OrchestratorResult{ExitCode: 3, Report: report}
 	}
 
+	remoteFailed := false
+	remoteDegraded := false
+	if !runRemote {
+		report.RemoteSummary = "skipped: throttled"
+	} else if o.LoadRemoteChecks == nil {
+		report.RemoteSummary = "skipped: not configured"
+	} else if o.RunRemoteChecks == nil {
+		report.RemoteSummary = "skipped: remote runner unavailable"
+		remoteFailed = true
+	} else {
+		// The local deadline covers local checks and recovery only. Remote probing
+		// has its own bounded budget so a slow remote cannot consume local time.
+		remoteCtx, remoteCancel := context.WithTimeout(parentCtx, 30*time.Second)
+		remoteChecks, err := o.LoadRemoteChecks(remoteCtx)
+		if err != nil {
+			report.RemoteSummary = fmt.Sprintf("load failed: %v", err)
+			remoteFailed = true
+		} else {
+			remoteResults, runErr := o.RunRemoteChecks(remoteCtx, remoteChecks)
+			if runErr != nil {
+				report.RemoteSummary = fmt.Sprintf("check failed: %v", runErr)
+				remoteDegraded = true
+			} else {
+				rPass, rWarn, rFail := 0, 0, 0
+				for _, r := range remoteResults {
+					switch r.Status {
+					case health.StatusPass:
+						rPass++
+					case health.StatusWarn:
+						rWarn++
+					case health.StatusFail:
+						rFail++
+					}
+				}
+				remoteDegraded = rWarn > 0 || rFail > 0
+				report.RemoteSummary = fmt.Sprintf("pass:%d warn:%d fail:%d", rPass, rWarn, rFail)
+				report.Checks = append(report.Checks, remoteResults...)
+				newState.Remote.LastCheckAt = start
+				if err := o.Repo.Save(newState); err != nil {
+					remoteFailed = true
+					report.RemoteSummary = fmt.Sprintf("state save failed: %v", err)
+				}
+			}
+		}
+		remoteCancel()
+	}
+
 	report.DurationMS = o.Now().Sub(start).Milliseconds()
 
+	if internalFailure {
+		report.Status = "internal_error"
+		return OrchestratorResult{ExitCode: 3, Report: report}
+	}
 	if recoveryFailed {
 		report.Status = "recovery_failed"
 		return OrchestratorResult{ExitCode: 1, Report: report}
+	}
+	if remoteFailed {
+		report.Status = "internal_error"
+		return OrchestratorResult{ExitCode: 3, Report: report}
 	}
 
 	// Re-evaluate hasFail/hasWarn after recovery
@@ -287,7 +339,7 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			break
 		}
 	}
-	if finalHasFail || finalHasWarn || paused || unresolvedAction {
+	if finalHasFail || finalHasWarn || paused || unresolvedAction || remoteDegraded {
 		report.Status = "degraded"
 		return OrchestratorResult{ExitCode: 2, Report: report}
 	}

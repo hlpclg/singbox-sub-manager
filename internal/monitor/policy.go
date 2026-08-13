@@ -66,9 +66,12 @@ func Decide(state State, checks map[string]string, now time.Time, paused bool) (
 			}
 		} else if allPass {
 			svcState.LastCheckResult = "pass"
+			if svcState.RecoveryInProgress {
+				svcState.LastRecoveryResult = "incomplete"
+				svcState.RecoveryInProgress = false
+			}
 			if !paused && !timeRewound {
 				svcState.FailureCount = 0
-				svcState.RecoveryInProgress = false
 			}
 		} else {
 			svcState.LastCheckResult = "warn_or_missing"
