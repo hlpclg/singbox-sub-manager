@@ -296,6 +296,7 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			remoteTimeout = 30 * time.Second
 		}
 		remoteCtx, remoteCancel := context.WithTimeout(ctx, remoteTimeout)
+		defer remoteCancel()
 		remoteChecks, err := o.LoadRemoteChecks(remoteCtx)
 		if err != nil {
 			report.RemoteSummary = fmt.Sprintf("load failed: %v", err)
@@ -332,9 +333,6 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 					}
 				}
 			}
-		}
-		if remoteCtx != nil {
-			remoteCancel()
 		}
 	}
 
