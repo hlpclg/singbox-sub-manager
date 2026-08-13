@@ -22,11 +22,14 @@ func (r *dummyRepo) IsPaused() (bool, error) { return r.paused, nil }
 
 func TestOrchestrator_RunOnce_Healthy(t *testing.T) {
 	o := &Orchestrator{
-		Repo: &dummyRepo{},
+		Repo: &dummyRepo{state: InitialState()},
 		RunChecks: func(ctx context.Context, svcs ...string) []health.Result {
 			return []health.Result{
 				{ID: "service.singbox", Status: health.StatusPass},
+				{ID: "port.udp443", Status: health.StatusPass},
 				{ID: "service.caddy", Status: health.StatusPass},
+				{ID: "port.tcp80", Status: health.StatusPass},
+				{ID: "port.tcp443", Status: health.StatusPass},
 			}
 		},
 		Now: time.Now,

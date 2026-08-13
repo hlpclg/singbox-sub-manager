@@ -39,25 +39,28 @@ func Decide(state State, checks map[string]string, now time.Time, paused bool) (
 			}
 		}
 
-		timeRewound := now.Before(svcState.LastCheckAt)
-		svcState.LastCheckAt = now
+		timeRewound := !svcState.LastCheckAt.IsZero() && now.Before(svcState.LastCheckAt)
+		if !timeRewound {
+			svcState.LastCheckAt = now
+		}
 
 		cooldownActive := now.Before(svcState.CooldownUntil)
 
 		if hasFail {
 			svcState.LastCheckResult = "fail"
 			if !paused && !timeRewound {
-				if svcState.FailureCount >= 3 && !cooldownActive {
-					svcState.RecoveryInProgress = false
-				}
-
 				if svcState.FailureCount < 3 {
 					svcState.FailureCount++
 				}
 
 				if svcState.FailureCount >= 3 && !cooldownActive {
+					// A crash marker is a pending, already committed attempt. It must
+					// be settled by observation before another restart is eligible.
 					if !svcState.RecoveryInProgress {
 						actions[svc] = "recover"
+					} else {
+						svcState.LastRecoveryResult = "incomplete"
+						svcState.RecoveryInProgress = false
 					}
 				}
 			}

@@ -13,9 +13,11 @@ type Orchestrator struct {
 	Checker          *EligibilityChecker
 	RunChecks        func(ctx context.Context, svcs ...string) []health.Result
 	LoadRemoteChecks func(ctx context.Context) ([]health.Check, error)
+	RunRemoteChecks  func(ctx context.Context, checks []health.Check) ([]health.Result, error)
 	Restart          func(ctx context.Context, svc string) error
 	Now              func() time.Time
 	CheckTimeout     time.Duration
+	RecheckTimeout   time.Duration
 }
 
 type OrchestratorResult struct {
@@ -36,11 +38,13 @@ type Report struct {
 func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 	start := o.Now()
 
-	if o.CheckTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, o.CheckTimeout)
-		defer cancel()
+	timeout := o.CheckTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
 	}
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	report := Report{
 		Timestamp: start.Format(time.RFC3339),
@@ -48,6 +52,9 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 	}
 
 	state, stateErr := o.Repo.Load()
+	if stateErr == nil {
+		stateErr = state.Validate()
+	}
 
 	paused, pauseErr := o.Repo.IsPaused()
 	if pauseErr != nil {
@@ -67,12 +74,20 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 	// Add remote checks
 	if runRemote && o.LoadRemoteChecks != nil {
 		if remoteChecks, err := o.LoadRemoteChecks(ctx); err == nil {
-			var concurrentIDs = health.ConcurrentIDs()
-			for _, c := range remoteChecks {
-				concurrentIDs[c.ID()] = true
+			if o.RunRemoteChecks == nil {
+				report.RemoteSummary = "remote runner unavailable"
+				report.Status = "internal_error"
+				report.DurationMS = o.Now().Sub(start).Milliseconds()
+				return OrchestratorResult{ExitCode: 3, Report: report}
 			}
-			cfg := health.Config{Timeouts: health.DefaultTimeouts()} // used only for defaults inside RunAll, but actually not ideal. We assume RunAll uses context.
-			remoteResults := health.RunAll(ctx, cfg, remoteChecks, concurrentIDs)
+			var remoteResults []health.Result
+			remoteResults, err = o.RunRemoteChecks(ctx, remoteChecks)
+			if err != nil {
+				report.RemoteSummary = fmt.Sprintf("check failed: %v", err)
+				report.Status = "internal_error"
+				report.DurationMS = o.Now().Sub(start).Milliseconds()
+				return OrchestratorResult{ExitCode: 3, Report: report}
+			}
 
 			results = append(results, remoteResults...)
 
@@ -93,6 +108,9 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			state.Remote.LastCheckAt = start
 		} else {
 			report.RemoteSummary = fmt.Sprintf("load failed: %v", err)
+			report.Status = "internal_error"
+			report.DurationMS = o.Now().Sub(start).Milliseconds()
+			return OrchestratorResult{ExitCode: 3, Report: report}
 		}
 	}
 
@@ -103,6 +121,13 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		checksMap[r.ID] = string(r.Status)
 		if r.Status == health.StatusFail {
 		} else if r.Status == health.StatusWarn {
+		}
+	}
+	for _, id := range []string{"service.singbox", "port.udp443", "service.caddy", "port.tcp80", "port.tcp443"} {
+		if _, ok := checksMap[id]; !ok {
+			report.Status = "internal_error"
+			report.DurationMS = o.Now().Sub(start).Milliseconds()
+			return OrchestratorResult{ExitCode: 3, Report: report}
 		}
 	}
 
@@ -156,6 +181,10 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 			newState.Services[svc].LastRecoveryResult = "fail"
 			report.Actions[svc] = "restart_failed"
 			recoveryFailed = true
+		} else if ctx.Err() != nil {
+			report.Actions[svc] = "cancelled"
+			newState.Services[svc].LastRecoveryResult = "cancelled"
+			recoveryFailed = true
 		} else {
 			var triggers []string
 			if svc == "sing-box" {
@@ -164,8 +193,21 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 				triggers = caddyTriggers
 			}
 
-			rechecks := o.RunChecks(ctx, triggers...)
+			recheckTimeout := o.RecheckTimeout
+			if recheckTimeout <= 0 {
+				recheckTimeout = 30 * time.Second
+			}
+			recheckCtx, recheckCancel := context.WithTimeout(ctx, recheckTimeout)
+			rechecks := o.RunChecks(recheckCtx, triggers...)
+			recheckCancel()
 			report.Rechecks = append(report.Rechecks, rechecks...)
+			if ctx.Err() != nil {
+				newState.Services[svc].LastRecoveryResult = "cancelled"
+				report.Actions[svc] = "cancelled"
+				recoveryFailed = true
+				newState.Services[svc].RecoveryInProgress = false
+				continue
+			}
 
 			recheckFailed := false
 			recheckMissing := false
@@ -199,10 +241,15 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 		newState.Services[svc].RecoveryInProgress = false
 	}
+	cancelled := ctx.Err() != nil
 
 	if err := o.Repo.Save(newState); err != nil {
 		report.Status = "internal_error"
 		report.DurationMS = o.Now().Sub(start).Milliseconds()
+		return OrchestratorResult{ExitCode: 3, Report: report}
+	}
+	if cancelled {
+		report.Status = "internal_error"
 		return OrchestratorResult{ExitCode: 3, Report: report}
 	}
 
@@ -233,7 +280,14 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		}
 	}
 
-	if finalHasFail || finalHasWarn || paused || len(actions) > 0 {
+	unresolvedAction := false
+	for _, action := range report.Actions {
+		if action != "recovered" {
+			unresolvedAction = true
+			break
+		}
+	}
+	if finalHasFail || finalHasWarn || paused || unresolvedAction {
 		report.Status = "degraded"
 		return OrchestratorResult{ExitCode: 2, Report: report}
 	}

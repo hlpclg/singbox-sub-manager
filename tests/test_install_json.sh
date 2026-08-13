@@ -37,7 +37,7 @@ mkdir -p "$TMP"
 
 # Extract the write install state section from install-proxy.sh
 INSTALL_SNIPPET=$(awk '
-/# 12. Write install state/ { active=1 }
+/# 13. Write install state/ { active=1 }
 /# Masked Token for log/ { active=0 }
 active { print }
 ' "$REPO_ROOT/install-proxy.sh")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 )
 
 func cmdMonitor(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
+		fmt.Fprintln(stdout, "usage: proxyctl monitor [pause|resume|status]")
+		return 0
+	}
 	if len(args) == 0 {
 		return runMonitorOrchestrator(stdout, stderr)
 	}
@@ -127,13 +132,13 @@ func checkPortOwner(ctx context.Context, cfg health.Config, svc string) error {
 	for _, line := range lines {
 		if svc == "sing-box" {
 			if strings.Contains(line, ":443 ") {
-				if !strings.Contains(line, "sing-box") {
+				if !ssLineHasProcess(line, "sing-box") {
 					return fmt.Errorf("port udp 443 owned by unknown process: %s", line)
 				}
 			}
 		} else {
 			if strings.Contains(line, ":80 ") || strings.Contains(line, ":443 ") {
-				if !strings.Contains(line, "caddy") {
+				if !ssLineHasProcess(line, "caddy") {
 					return fmt.Errorf("port tcp 80/443 owned by unknown process: %s", line)
 				}
 			}
@@ -141,6 +146,11 @@ func checkPortOwner(ctx context.Context, cfg health.Config, svc string) error {
 	}
 
 	return nil
+}
+
+func ssLineHasProcess(line, process string) bool {
+	pattern := `users:\(\("` + regexp.QuoteMeta(process) + `",`
+	return regexp.MustCompile(pattern).MatchString(line)
 }
 
 func runMonitorOrchestrator(stdout, stderr io.Writer) int {
@@ -210,6 +220,13 @@ func runMonitorOrchestrator(stdout, stderr io.Writer) int {
 				rChecks = append(rChecks, remote.NewNodeCheck(n))
 			}
 			return rChecks, nil
+		},
+		RunRemoteChecks: func(ctx context.Context, checks []health.Check) ([]health.Result, error) {
+			concurrent := health.ConcurrentIDs()
+			for _, c := range checks {
+				concurrent[c.ID()] = true
+			}
+			return health.RunAll(ctx, cfg, checks, concurrent), nil
 		},
 		Restart:      monitor.RestartService,
 		Now:          time.Now,

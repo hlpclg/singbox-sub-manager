@@ -28,28 +28,34 @@ type State struct {
 	Remote        RemoteState              `json:"remote"`
 }
 
-func (s *State) ValidateAndRepair() {
+func InitialState() State {
+	return State{SchemaVersion: 1, Services: map[string]*ServiceState{
+		"sing-box": {},
+		"caddy":    {},
+	}}
+}
+
+func (s *State) Validate() error {
 	if s.SchemaVersion != 1 {
-		s.SchemaVersion = 1
+		return fmt.Errorf("unsupported schema version: %d", s.SchemaVersion)
 	}
 	if s.Services == nil {
-		s.Services = make(map[string]*ServiceState)
+		return fmt.Errorf("services missing")
+	}
+	for _, svc := range []string{"sing-box", "caddy"} {
+		if s.Services[svc] == nil {
+			return fmt.Errorf("service state missing: %s", svc)
+		}
 	}
 	for svc, st := range s.Services {
 		if st == nil {
-			s.Services[svc] = &ServiceState{}
-		} else if st.FailureCount < 0 {
-			st.FailureCount = 0
-		} else if st.FailureCount > 3 {
-			st.FailureCount = 3
+			return fmt.Errorf("service state is null: %s", svc)
+		}
+		if st.FailureCount < 0 || st.FailureCount > 3 {
+			return fmt.Errorf("invalid failure count for %s: %d", svc, st.FailureCount)
 		}
 	}
-	if s.Services["sing-box"] == nil {
-		s.Services["sing-box"] = &ServiceState{}
-	}
-	if s.Services["caddy"] == nil {
-		s.Services["caddy"] = &ServiceState{}
-	}
+	return nil
 }
 
 type StateRepo interface {
@@ -84,6 +90,13 @@ func (r *fileStateRepo) Pause() error {
 	f, err := os.OpenFile(r.pausePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 	if err != nil {
 		if os.IsExist(err) {
+			info, statErr := os.Stat(r.pausePath)
+			if statErr != nil {
+				return statErr
+			}
+			if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+				return fmt.Errorf("pause marker has invalid permissions")
+			}
 			return nil // already paused
 		}
 		return err
@@ -120,8 +133,7 @@ func (r *fileStateRepo) Load() (State, error) {
 	data, err := os.ReadFile(r.jsonPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.SchemaVersion = 1
-			s.ValidateAndRepair()
+			s = InitialState()
 			return s, nil
 		}
 		return s, fmt.Errorf("read state file: %w", err)
@@ -132,12 +144,16 @@ func (r *fileStateRepo) Load() (State, error) {
 	if s.SchemaVersion != 1 {
 		return s, fmt.Errorf("unsupported schema version: %d", s.SchemaVersion)
 	}
-	s.ValidateAndRepair()
+	if err := s.Validate(); err != nil {
+		return s, err
+	}
 	return s, nil
 }
 
 func (r *fileStateRepo) Save(s State) error {
-	s.ValidateAndRepair()
+	if err := s.Validate(); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -183,6 +199,9 @@ func syncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }

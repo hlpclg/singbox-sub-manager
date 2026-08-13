@@ -376,7 +376,7 @@ install_proxyctl() {
     else
       existing_ver=""
     fi
-    if [[ "$existing_ver" == "$PROXYCTL_VERSION" ]]; then
+    if [[ "$existing_ver" == "$PROXYCTL_VERSION" ]] && "$PROXYCTL_BIN" monitor --help >/dev/null 2>&1; then
       PROXYCTL_VALIDATED_BIN="$PROXYCTL_BIN"
       return 0
     fi
@@ -430,6 +430,12 @@ install_proxyctl() {
     rm -f "$tmp"
     PROXYCTL_VALIDATED_BIN=""
     log_warn "Downloaded proxyctl binary version mismatch ('$ver_out' != '$PROXYCTL_VERSION'); using shell renderer."
+    return 1
+  fi
+  if ! "$tmp" monitor --help >/dev/null 2>&1; then
+    rm -f "$tmp"
+    PROXYCTL_VALIDATED_BIN=""
+    log_warn "Downloaded proxyctl does not support monitor; using shell renderer."
     return 1
   fi
 
@@ -1077,7 +1083,8 @@ else
 fi
 
 if ! install_proxyctl; then
-  log_warn "proxyctl is unavailable; built-in shell renderer will be used."
+  log_error "proxyctl with monitor support is required; installation cannot enable monitoring."
+  die "proxyctl installation failed."
 fi
 run_proxyctl_merge "$NODES_CONF" "$OUT"
 
@@ -1226,14 +1233,47 @@ WantedBy=timers.target
 EOF2
 
 chmod 0644 "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
-mv "$MONITOR_SVC_TMP" /etc/systemd/system/proxyctl-monitor.service
-mv "$MONITOR_TIMER_TMP" /etc/systemd/system/proxyctl-monitor.timer
-
-if ! systemctl daemon-reload || ! systemctl enable --now proxyctl-monitor.timer; then
-  log_warn "Failed to enable proxyctl-monitor timer. Rolling back..."
-  rm -f /etc/systemd/system/proxyctl-monitor.service /etc/systemd/system/proxyctl-monitor.timer
-  systemctl daemon-reload || true
+MONITOR_BACKUP_DIR="$(mktemp -d /tmp/proxyctl-monitor-backup.XXXXXX)"
+MONITOR_HAD_SVC=false
+MONITOR_HAD_TIMER=false
+if [[ -e /etc/systemd/system/proxyctl-monitor.service ]]; then
+  cp -a /etc/systemd/system/proxyctl-monitor.service "$MONITOR_BACKUP_DIR/service"
+  MONITOR_HAD_SVC=true
 fi
+if [[ -e /etc/systemd/system/proxyctl-monitor.timer ]]; then
+  cp -a /etc/systemd/system/proxyctl-monitor.timer "$MONITOR_BACKUP_DIR/timer"
+  MONITOR_HAD_TIMER=true
+fi
+
+restore_monitor_units() {
+  systemctl disable --now proxyctl-monitor.timer >/dev/null 2>&1 || true
+  if [[ "$MONITOR_HAD_SVC" == true ]]; then
+    mv -f "$MONITOR_BACKUP_DIR/service" /etc/systemd/system/proxyctl-monitor.service
+  else
+    rm -f /etc/systemd/system/proxyctl-monitor.service
+  fi
+  if [[ "$MONITOR_HAD_TIMER" == true ]]; then
+    mv -f "$MONITOR_BACKUP_DIR/timer" /etc/systemd/system/proxyctl-monitor.timer
+  else
+    rm -f /etc/systemd/system/proxyctl-monitor.timer
+  fi
+  systemctl daemon-reload || true
+  if [[ "$MONITOR_HAD_TIMER" == true ]]; then
+    systemctl enable --now proxyctl-monitor.timer >/dev/null 2>&1 || true
+  fi
+  rm -rf "$MONITOR_BACKUP_DIR"
+}
+
+if ! mv "$MONITOR_SVC_TMP" /etc/systemd/system/proxyctl-monitor.service ||
+   ! mv "$MONITOR_TIMER_TMP" /etc/systemd/system/proxyctl-monitor.timer ||
+   ! systemctl daemon-reload ||
+   ! systemctl enable --now proxyctl-monitor.timer; then
+  log_error "Failed to activate proxyctl-monitor units; restoring previous units."
+  rm -f "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
+  restore_monitor_units
+  die "Failed to activate proxyctl-monitor timer."
+fi
+rm -rf "$MONITOR_BACKUP_DIR"
 
 # 12. Sysctl
 cat > /etc/sysctl.d/99-proxy-installer.conf <<'EOF'

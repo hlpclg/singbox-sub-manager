@@ -351,7 +351,21 @@ proxyctl health --domain sub.example.com
 
 ### 远程节点探测说明
 
-当前的健康检查专注于**订阅中心本机（Local）**，探测 `nodes.conf` 中外部 Hysteria2 节点是否真实可用的功能（Remote Health）计划于 **v0.5** 引入，本阶段不包含远程探测与自动禁用节点逻辑。
+`proxyctl monitor` 每轮执行本机健康检查；首次运行及距离上次远程检查达到 30 分钟时，会对 `nodes.conf` 中启用的 Hysteria2 节点执行有界远程探测。远程失败只进入报告，不会触发本机服务重启。
+
+### 自动监控与恢复
+
+安装脚本会启用 `proxyctl-monitor.timer`，按 5 分钟周期执行一次 `proxyctl monitor`。只有本机触发检查连续失败达到阈值、配置校验通过且端口归属明确时，才会重启对应的 `sing-box` 或 `caddy` 服务；每次尝试进入 30 分钟冷却。
+
+管理员控制命令：
+
+```bash
+proxyctl monitor pause
+proxyctl monitor resume
+proxyctl monitor status
+```
+
+状态文件位于 `/var/lib/singbox-sub-manager/monitor-state.json`，暂停标记位于 `/var/lib/singbox-sub-manager/monitor-paused`。`monitor` 输出机器可读 JSON；退出码 0 表示最终健康，1 表示恢复失败，2 表示降级但未发生失败恢复，3 表示无法可靠决策。
 
 ## 获取其他节点的连接信息
 
@@ -755,8 +769,8 @@ make build
 - 独立节点配置文件
 - 自动拉取远程节点
 - Web 管理页面
-- 节点健康检查 (已实现)
-- 自动故障切换与恢复 (已实现)
+- 节点健康检查
+- 自动故障切换与恢复
 - 自动更新 sing-box
 - 自动备份和恢复
 - Docker 部署

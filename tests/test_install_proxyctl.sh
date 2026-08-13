@@ -52,6 +52,9 @@ if [[ "\${1:-}" == version ]]; then
   printf '%s\\n' '$version'
   exit 0
 fi
+if [[ "\${1:-}" == monitor && "\${2:-}" == --help ]]; then
+  exit 0
+fi
 if [[ "\${1:-}" == merge ]]; then
   printf '%s\\n' '$label' >> '$marker'
   out=''
@@ -76,6 +79,7 @@ make_evil_proxyctl() {
 #!/usr/bin/env bash
 printf 'evil:%s\\n' "\${1:-}" >> '$marker'
 if [[ "\${1:-}" == version ]]; then printf 'v0.2.2\\n'; exit 0; fi
+if [[ "\${1:-}" == monitor && "\${2:-}" == --help ]]; then exit 1; fi
 exit 90
 EOF
   chmod +x "$path"
