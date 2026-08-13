@@ -32,15 +32,15 @@
 
 **Produces:** 项目内所有 Agent 可发现、可复制执行的工作流和模板。
 
-- [ ] **Step 1: 创建项目工作流文档**
+- [x] **Step 1: 创建项目工作流文档**
 
 文档分别定义入口与优先级、Task 生命周期、审查闭环、三级门禁、验收矩阵和交接模板；不重复项目根已有的具体工具命令。
 
-- [ ] **Step 2: 更新项目入口**
+- [x] **Step 2: 更新项目入口**
 
 根 `AGENTS.md` 规定在计划、实施、审查和交付任务中按需读取 `docs/agent-workflows/README.md`，并明确项目规则高于本机全局规则。
 
-- [ ] **Step 3: 验证引用和格式**
+- [x] **Step 3: 验证引用和格式**
 
 Run:
 
@@ -52,13 +52,22 @@ git diff --check
 
 Expected: 所有文件存在且非空，入口引用存在，差异检查通过。
 
-- [ ] **Step 4: 提交主变更**
+- [x] **Step 4: 提交主变更**
 
 Commit message: `docs: add project agent workflows`
 
-- [ ] **Step 5: 回填 Task 状态并封账**
+- [x] **Step 5: 回填 Task 状态并封账**
 
 在本计划记录主提交 SHA、验证证据和 `README：不适用（仅内部 Agent 工作流，无用户功能变化）`，提交消息为 `docs: record agent workflow task 1`。封账提交完成前不得进入 Task 2。
+
+**Task 1 完成记录：**
+
+- 状态：已完成，待本次状态提交封账。
+- 实际范围：新增六个项目工作流文件并更新根 `AGENTS.md` 入口。
+- 主提交 SHA：`4da2b43`。
+- 验证证据：六个目标文件存在且非空；根入口引用命中；`git diff --check` 通过；主提交仅包含预期七个文件。
+- README：不适用（仅内部 Agent 工作流，无用户功能变化）。
+- 代码门禁：不适用（纯 Markdown 规则变更，未改代码、测试、依赖、配置或 CI）。
 
 ---
 
