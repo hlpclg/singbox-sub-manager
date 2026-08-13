@@ -1197,14 +1197,42 @@ if ! curl -sf --connect-timeout 10 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/nul
   log_warn "External curl check to Caddy failed. This may be due to DNS propagation."
 fi
 
-# 11. Sysctl
+# 11. Monitor
+cat > /etc/systemd/system/proxyctl-monitor.service <<'EOF2'
+[Unit]
+Description=Proxyctl Health Monitor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyctl monitor
+SuccessExitStatus=2
+EOF2
+
+cat > /etc/systemd/system/proxyctl-monitor.timer <<'EOF2'
+[Unit]
+Description=Proxyctl Health Monitor Timer
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+AccuracySec=15s
+RandomizedDelaySec=15s
+
+[Install]
+WantedBy=timers.target
+EOF2
+
+systemctl daemon-reload
+systemctl enable --now proxyctl-monitor.timer
+
+# 12. Sysctl
 cat > /etc/sysctl.d/99-proxy-installer.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
-# 12. Write install state
+# 13. Write install state
 INSTALL_JSON="$BASE_DIR/install.json"
 INSTALL_JSON_TMP="$(mktemp "$BASE_DIR/.install.json.tmp.XXXXXX")"
 trap 'rm -rf "$TMP" "$INSTALL_JSON_TMP"' EXIT
