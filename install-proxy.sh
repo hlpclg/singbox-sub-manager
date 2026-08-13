@@ -1235,6 +1235,11 @@ EOF2
 
 chmod 0644 "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
 MONITOR_BACKUP_DIR="$(mktemp -d /tmp/proxyctl-monitor-backup.XXXXXX)"
+monitor_cleanup_on_error() {
+  rm -f "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
+  rm -rf "$MONITOR_BACKUP_DIR"
+}
+trap monitor_cleanup_on_error EXIT
 MONITOR_HAD_SVC=false
 MONITOR_HAD_TIMER=false
 MONITOR_ENABLEMENT_STATE=""
@@ -1310,6 +1315,7 @@ if ! mv "$MONITOR_SVC_TMP" "$MONITOR_UNIT_DIR/proxyctl-monitor.service" ||
   die "Failed to activate proxyctl-monitor timer."
 fi
 rm -rf "$MONITOR_BACKUP_DIR"
+trap - EXIT
 
 # 12. Sysctl
 cat > /etc/sysctl.d/99-proxy-installer.conf <<'EOF'

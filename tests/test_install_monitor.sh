@@ -59,7 +59,7 @@ systemctl() {
 }
 
 log_error() { :; }
-die() { return 1; }
+die() { exit 1; }
 export -f systemctl log_error die
 export CALLS
 
@@ -100,7 +100,10 @@ set -e
 [[ "$status" -ne 0 ]]
 grep -Fxq 'old service' "$UNIT_DIR/proxyctl-monitor.service"
 grep -Fxq 'old timer' "$UNIT_DIR/proxyctl-monitor.timer"
-if grep -Fq 'daemon-reload' "$CALLS"; then
+if grep -Eq '^(daemon-reload|enable)' "$CALLS"; then
+  exit 1
+fi
+if compgen -G "$UNIT_DIR/.proxyctl-monitor.*.tmp.*" >/dev/null; then
   exit 1
 fi
 printf 'state probe failure test passed\n'
