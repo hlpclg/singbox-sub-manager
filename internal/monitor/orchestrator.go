@@ -38,6 +38,9 @@ type Report struct {
 }
 
 func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
+	if o == nil || o.Now == nil || o.Repo == nil || ctx == nil {
+		return OrchestratorResult{ExitCode: 3, Report: Report{Status: "internal_error", Decisions: map[string]string{}, Actions: map[string]string{"monitor": "missing_dependency"}}}
+	}
 	start := o.Now()
 	if o.RunChecks == nil {
 		return OrchestratorResult{ExitCode: 3, Report: Report{
@@ -47,7 +50,6 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		}}
 	}
 
-	parentCtx := ctx
 	timeout := o.CheckTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -238,6 +240,21 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 
 		newState.Services[svc].RecoveryInProgress = false
 	}
+	for svc, svcState := range newState.Services {
+		if action, ok := report.Actions[svc]; ok {
+			report.Decisions[svc] = action
+			continue
+		}
+		if paused && svcState.LastCheckResult != "pass" {
+			report.Decisions[svc] = "paused"
+		} else if svcState.FailureCount > 0 && start.Before(svcState.CooldownUntil) {
+			report.Decisions[svc] = "cooldown"
+		} else if svcState.FailureCount > 0 {
+			report.Decisions[svc] = fmt.Sprintf("failure_%d", svcState.FailureCount)
+		} else {
+			report.Decisions[svc] = "healthy"
+		}
+	}
 	cancelled := ctx.Err() != nil
 
 	if err := o.Repo.Save(newState); err != nil {
@@ -260,41 +277,65 @@ func (o *Orchestrator) RunOnce(ctx context.Context) OrchestratorResult {
 		report.RemoteSummary = "skipped: remote runner unavailable"
 		remoteFailed = true
 	} else {
-		// The local deadline covers local checks and recovery only. Remote probing
-		// has its own bounded budget so a slow remote cannot consume local time.
-		remoteCtx, remoteCancel := context.WithTimeout(parentCtx, 30*time.Second)
+		if ctx.Err() != nil {
+			report.Status = "internal_error"
+			report.DurationMS = o.Now().Sub(start).Milliseconds()
+			return OrchestratorResult{ExitCode: 3, Report: report}
+		}
+		deadline, hasDeadline := ctx.Deadline()
+		remoteTimeout := 30 * time.Second
+		if hasDeadline {
+			remoteTimeout = time.Until(deadline)
+		}
+		if remoteTimeout <= 0 {
+			report.Status = "internal_error"
+			report.DurationMS = o.Now().Sub(start).Milliseconds()
+			return OrchestratorResult{ExitCode: 3, Report: report}
+		}
+		if remoteTimeout > 30*time.Second {
+			remoteTimeout = 30 * time.Second
+		}
+		remoteCtx, remoteCancel := context.WithTimeout(ctx, remoteTimeout)
 		remoteChecks, err := o.LoadRemoteChecks(remoteCtx)
 		if err != nil {
 			report.RemoteSummary = fmt.Sprintf("load failed: %v", err)
 			remoteFailed = true
 		} else {
-			remoteResults, runErr := o.RunRemoteChecks(remoteCtx, remoteChecks)
-			if runErr != nil {
-				report.RemoteSummary = fmt.Sprintf("check failed: %v", runErr)
+			cancelledRemote := remoteCtx.Err() != nil || ctx.Err() != nil
+			if cancelledRemote {
+				report.RemoteSummary = "cancelled"
 				remoteFailed = true
 			} else {
-				rPass, rWarn, rFail := 0, 0, 0
-				for _, r := range remoteResults {
-					switch r.Status {
-					case health.StatusPass:
-						rPass++
-					case health.StatusWarn:
-						rWarn++
-					case health.StatusFail:
-						rFail++
-					}
-				}
-				remoteDegraded = rWarn > 0 || rFail > 0
-				report.RemoteSummary = fmt.Sprintf("pass:%d warn:%d fail:%d", rPass, rWarn, rFail)
-				report.Checks = append(report.Checks, remoteResults...)
-				newState.Remote.LastCheckAt = start
-				if err := o.Repo.Save(newState); err != nil {
+				remoteResults, runErr := o.RunRemoteChecks(remoteCtx, remoteChecks)
+				if runErr != nil {
+					report.RemoteSummary = fmt.Sprintf("check failed: %v", runErr)
 					remoteFailed = true
-					report.RemoteSummary = fmt.Sprintf("state save failed: %v", err)
+				} else {
+					rPass, rWarn, rFail := 0, 0, 0
+					for _, r := range remoteResults {
+						switch r.Status {
+						case health.StatusPass:
+							rPass++
+						case health.StatusWarn:
+							rWarn++
+						case health.StatusFail:
+							rFail++
+						}
+					}
+					remoteDegraded = rWarn > 0 || rFail > 0
+					report.RemoteSummary = fmt.Sprintf("pass:%d warn:%d fail:%d", rPass, rWarn, rFail)
+					report.Checks = append(report.Checks, remoteResults...)
+					newState.Remote.LastCheckAt = start
+					if err := o.Repo.Save(newState); err != nil {
+						remoteFailed = true
+						report.RemoteSummary = fmt.Sprintf("state save failed: %v", err)
+					}
 				}
 			}
 		}
-		remoteCancel()
+		if remoteCtx != nil {
+			remoteCancel()
+		}
 	}
 
 	report.DurationMS = o.Now().Sub(start).Milliseconds()

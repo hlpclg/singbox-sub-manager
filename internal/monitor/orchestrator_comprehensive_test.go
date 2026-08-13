@@ -241,7 +241,7 @@ func TestOrchestrator_RemoteFailureDoesNotLoseLocalRecovery(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_RemoteTimeoutDoesNotUseLocalDeadline(t *testing.T) {
+func TestOrchestrator_RemoteTimeoutUsesLocalDeadline(t *testing.T) {
 	now := time.Now()
 	repo := &dummyRepo{state: validDummyState()}
 	o := &Orchestrator{
@@ -259,8 +259,106 @@ func TestOrchestrator_RemoteTimeoutDoesNotUseLocalDeadline(t *testing.T) {
 		Now:             nowFunc(now), CheckTimeout: 5 * time.Millisecond,
 	}
 	res := o.RunOnce(context.Background())
-	if res.Report.RemoteSummary != "pass:0 warn:0 fail:0" || res.ExitCode != 0 {
-		t.Fatalf("remote check inherited local deadline: %+v", res)
+	if res.Report.RemoteSummary != "load failed: context deadline exceeded" || res.ExitCode != 3 {
+		t.Fatalf("remote check escaped local deadline: %+v", res)
+	}
+}
+
+func TestOrchestrator_RemoteUsesRemainingTotalDeadline(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	remoteCalled := false
+	o := &Orchestrator{
+		Repo:      repo,
+		RunChecks: func(context.Context, ...string) []health.Result { return localPassResults() },
+		LoadRemoteChecks: func(ctx context.Context) ([]health.Check, error) {
+			remoteCalled = true
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("remote context has no deadline")
+			}
+			return nil, nil
+		},
+		RunRemoteChecks: func(context.Context, []health.Check) ([]health.Result, error) { return nil, nil },
+		Now:             time.Now, CheckTimeout: 25 * time.Millisecond,
+	}
+	res := o.RunOnce(context.Background())
+	if !remoteCalled || res.ExitCode != 0 {
+		t.Fatalf("remote did not use total deadline: called=%v result=%+v", remoteCalled, res)
+	}
+}
+
+func TestOrchestrator_CancelledBeforeRemoteSkipsHook(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	ctx, cancel := context.WithCancel(context.Background())
+	remoteCalled := false
+	o := &Orchestrator{
+		Repo:             repo,
+		RunChecks:        func(context.Context, ...string) []health.Result { cancel(); return localPassResults() },
+		LoadRemoteChecks: func(context.Context) ([]health.Check, error) { remoteCalled = true; return nil, nil },
+		RunRemoteChecks:  func(context.Context, []health.Check) ([]health.Result, error) { remoteCalled = true; return nil, nil },
+		Now:              time.Now,
+	}
+	res := o.RunOnce(ctx)
+	if remoteCalled || res.ExitCode != 3 {
+		t.Fatalf("cancelled run entered remote hook: called=%v result=%+v", remoteCalled, res)
+	}
+}
+
+func TestOrchestrator_CancelledAfterRemoteLoadSkipsExecution(t *testing.T) {
+	repo := &dummyRepo{state: validDummyState()}
+	ctx, cancel := context.WithCancel(context.Background())
+	runCalled := false
+	o := &Orchestrator{
+		Repo:             repo,
+		RunChecks:        func(context.Context, ...string) []health.Result { return localPassResults() },
+		LoadRemoteChecks: func(context.Context) ([]health.Check, error) { cancel(); return nil, nil },
+		RunRemoteChecks:  func(context.Context, []health.Check) ([]health.Result, error) { runCalled = true; return nil, nil },
+		Now:              time.Now,
+	}
+	res := o.RunOnce(ctx)
+	if runCalled || res.ExitCode != 3 {
+		t.Fatalf("cancelled run entered remote execution: called=%v result=%+v", runCalled, res)
+	}
+}
+
+func TestOrchestrator_MissingDependenciesReturnInternalError(t *testing.T) {
+	for name, o := range map[string]*Orchestrator{
+		"now":  {Repo: &dummyRepo{state: validDummyState()}, RunChecks: func(context.Context, ...string) []health.Result { return localPassResults() }},
+		"repo": {Now: time.Now, RunChecks: func(context.Context, ...string) []health.Result { return localPassResults() }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			res := o.RunOnce(context.Background())
+			if res.ExitCode != 3 || res.Report.Status != "internal_error" {
+				t.Fatalf("missing dependency panicked or returned wrong result: %+v", res)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_NilContextReturnsInternalError(t *testing.T) {
+	o := &Orchestrator{Now: time.Now, Repo: &dummyRepo{state: validDummyState()}, RunChecks: func(context.Context, ...string) []health.Result { return localPassResults() }}
+	res := o.RunOnce(nil)
+	if res.ExitCode != 3 || res.Report.Status != "internal_error" {
+		t.Fatalf("nil context was not rejected: %+v", res)
+	}
+}
+
+func TestOrchestrator_DecisionsReflectFinalRecovery(t *testing.T) {
+	now := time.Now()
+	repo := &dummyRepo{state: State{SchemaVersion: 1, Services: map[string]*ServiceState{"sing-box": {FailureCount: 2}, "caddy": {}}}}
+	o := &Orchestrator{
+		Repo:    repo,
+		Checker: &EligibilityChecker{RunConfigCheck: func(context.Context, string) error { return nil }, CheckPortOwner: func(context.Context, string) error { return nil }},
+		RunChecks: func(_ context.Context, ids ...string) []health.Result {
+			if len(ids) > 0 {
+				return []health.Result{{ID: "service.singbox", Status: health.StatusPass}, {ID: "port.udp443", Status: health.StatusPass}}
+			}
+			return []health.Result{{ID: "service.singbox", Status: health.StatusFail}, {ID: "port.udp443", Status: health.StatusFail}, {ID: "service.caddy", Status: health.StatusPass}, {ID: "port.tcp80", Status: health.StatusPass}, {ID: "port.tcp443", Status: health.StatusPass}}
+		},
+		Restart: func(context.Context, string) error { return nil }, Now: func() time.Time { return now },
+	}
+	res := o.RunOnce(context.Background())
+	if res.Report.Decisions["sing-box"] != "recovered" {
+		t.Fatalf("decision did not reflect recovery: %+v", res.Report.Decisions)
 	}
 }
 

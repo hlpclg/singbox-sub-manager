@@ -245,7 +245,7 @@ sudo ./merge-nodes.sh
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
 - 固定路径文件缺失或任一校验不匹配时，从 GitHub Release 下载对应架构二进制并校验 SHA256 及 `version` 输出；
 - PATH 中其他同名 `proxyctl` 不会被复用或执行；
-- `install-proxy.sh` 在下载/校验失败时会安全回退至内置 Shell 渲染器；
+- `install-proxy.sh` 若无法安装带 `monitor` 支持且通过校验的 `proxyctl` 会失败退出，不会启用监控 timer；
 - `merge-nodes.sh` 无内置渲染器回退，若无法获取校验通过的 `proxyctl` 会明确报错退出。
 
 两个命令都会覆盖生成：
@@ -351,7 +351,9 @@ proxyctl health --domain sub.example.com
 
 ### 远程节点探测说明
 
-`proxyctl monitor` 每轮执行本机健康检查；首次运行及距离上次远程检查达到 30 分钟时，会对 `nodes.conf` 中启用的 Hysteria2 节点执行有界远程探测。远程失败只进入报告，不会触发本机服务重启。
+`proxyctl monitor` 每轮执行本机健康检查；首次运行及距离上次远程检查达到 30 分钟时，会对 `nodes.conf` 中启用的 Hysteria2 节点执行有界远程探测。远程探测结果失败只进入报告，不会触发本机服务重启；节点配置加载或探测执行错误返回退出码 3，但仍保留已完成的本机状态更新。
+
+`monitor` 不接受 `--remote` 或节点路径参数；远程检查由安装配置中的 `nodes.conf` 自动加载并按 30 分钟节流。需要临时指定节点文件或只运行远程检查时，使用 `proxyctl health --remote --nodes <path>`。
 
 ### 自动监控与恢复
 
@@ -747,12 +749,12 @@ make build
 
 ### 发布 SOP
 
-新版本（如 v0.2.2）发布标准流程：
+新版本（如 v0.6.0）发布标准流程：
 
 1. **工作区审查**：确认工作区状态并审查修改 (`git status --short` 与 `git diff`)；
-2. **本地测试**：在具备工具的环境中运行全部测试 (`bash -n install-proxy.sh`, `bash -n merge-nodes.sh`, `bash tests/test_install_proxyctl.sh`, `go test -v ./...`)；
+2. **本地测试**：在具备工具的环境中运行全部测试 (`bash -n install-proxy.sh`, `bash -n merge-nodes.sh`, `bash tests/test_install_proxyctl.sh`, `bash tests/test_install_json.sh`, `bash tests/test_install_monitor.sh`, `go test -v ./...`)；
 3. **代码提交**：获取用户明确授权后提交并推送至 `main` 分支；
-4. **打 Tag 推送**：获取用户明确授权后创建并推送 Tag (`git tag v0.2.2 && git push origin v0.2.2`)；
+4. **打 Tag 推送**：获取用户明确授权后创建并推送对应版本 Tag（例如 `git tag v0.6.0`）；
 5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Debian 12) 与 `release` 工作流全部成功通过；
 6. **发布校验**：在 GitHub Release 页面确认 `proxyctl-linux-amd64`、`proxyctl-linux-arm64` 及 `checksums.txt` 3 个 Asset 已发布，且 `./dist/proxyctl-linux-amd64 version` 正确输出 Tag 名称。
 

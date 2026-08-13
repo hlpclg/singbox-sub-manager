@@ -1246,8 +1246,31 @@ fi
 if [[ -e "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" ]]; then
   cp -a "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" "$MONITOR_BACKUP_DIR/timer"
   MONITOR_HAD_TIMER=true
-  [[ "$(systemctl is-enabled proxyctl-monitor.timer 2>/dev/null || true)" == "enabled" ]] && MONITOR_WAS_ENABLED=true
-  [[ "$(systemctl is-active proxyctl-monitor.timer 2>/dev/null || true)" == "active" ]] && MONITOR_WAS_ACTIVE=true
+  MONITOR_ENABLED_STATE=""
+  if ! MONITOR_ENABLED_STATE="$(systemctl is-enabled proxyctl-monitor.timer 2>/dev/null)"; then
+    case "$MONITOR_ENABLED_STATE" in
+      disabled|indirect|static|masked) ;;
+      *) die "Unable to determine proxyctl-monitor timer enablement state." ;;
+    esac
+  fi
+  case "$MONITOR_ENABLED_STATE" in
+    enabled|enabled-runtime) MONITOR_WAS_ENABLED=true ;;
+    disabled|indirect|static|masked) MONITOR_WAS_ENABLED=false ;;
+    *) die "Unable to determine proxyctl-monitor timer enablement state." ;;
+  esac
+
+  MONITOR_ACTIVE_STATE=""
+  if ! MONITOR_ACTIVE_STATE="$(systemctl is-active proxyctl-monitor.timer 2>/dev/null)"; then
+    case "$MONITOR_ACTIVE_STATE" in
+      inactive|failed|deactivating|activating) ;;
+      *) die "Unable to determine proxyctl-monitor timer active state." ;;
+    esac
+  fi
+  case "$MONITOR_ACTIVE_STATE" in
+    active) MONITOR_WAS_ACTIVE=true ;;
+    inactive|failed|deactivating|activating) MONITOR_WAS_ACTIVE=false ;;
+    *) die "Unable to determine proxyctl-monitor timer active state." ;;
+  esac
 fi
 
 restore_monitor_units() {
