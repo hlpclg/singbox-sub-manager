@@ -8,6 +8,8 @@
 
 **Tech Stack:** Markdown、Git、Codex 全局 `AGENTS.md`
 
+**整体状态：** 已完成，待最终状态提交封账。
+
 ## Global Constraints
 
 - 用户当前指令、已批准规格、项目规则、全局规则依次优先；冲突时停止并报告。
@@ -123,23 +125,23 @@ Commit message: `docs: add project agent workflows`
 
 **Produces:** 与已合并实现一致的设计/计划状态和可追溯提交记录。
 
-- [ ] **Step 1: 更新 v0.6 设计状态**
+- [x] **Step 1: 更新 v0.6 设计状态**
 
 将“待实施”更新为已实施并合并，记录合并提交 `b167df1`；不改写历史设计契约。
 
-- [ ] **Step 2: 更新 v0.6 实施计划记录**
+- [x] **Step 2: 更新 v0.6 实施计划记录**
 
 在计划顶部增加执行记录表，逐 Task 记录实际实现提交及后续修复范围。历史步骤不伪造逐步执行证据；以“计划基线已完成、最终门禁已通过、详细修复提交见记录”的方式归档。
 
-- [ ] **Step 3: 更新治理设计状态与自引用规则**
+- [x] **Step 3: 更新治理设计状态与自引用规则**
 
 将治理设计更新为已批准/实施，并把“不可能在同一提交中写入自身 SHA”明确为“主提交 + 状态封账提交”。
 
-- [ ] **Step 4: 审计 README**
+- [x] **Step 4: 审计 README**
 
 核对 v0.6 monitor、health remote、安装器测试和发布流程。若已一致，计划记录 `README：无需更新（已覆盖当前用户可见行为）`；若有缺口，同 Task 修改。
 
-- [ ] **Step 5: 验证并提交主变更**
+- [x] **Step 5: 验证并提交主变更**
 
 Run:
 
@@ -150,9 +152,26 @@ git diff --check
 
 Commit message: `docs: align workflow and v0.6 status`
 
-- [ ] **Step 6: 回填最终状态并封账**
+- [x] **Step 6: 回填最终状态并封账**
 
 记录 Task 3 主提交 SHA、验证证据、README 结论和本计划整体完成状态，提交消息为 `docs: complete agent workflow rollout`。提交后验证工作区为空。
+
+**Task 3 完成记录：**
+
+- 状态：已完成，待本次状态提交封账。
+- 实际范围：更新 v0.6 设计状态和实施归档；更新工作流治理设计状态与两步封账规则。
+- 主提交 SHA：`c152ff6`。
+- 验证证据：过期状态关键词审计只剩本计划的执行说明；v0.6 用户命令、远程检查、timer、安装器测试和发布门禁在 README/CI/release 中均有对应记录；`git diff --check` 通过。
+- README：无需更新（现有内容已覆盖当前 v0.6 用户可见行为，未发现过期说明）。
+- 代码门禁：不适用（纯 Markdown 状态修正，未改代码、测试、依赖、配置或 CI）。
+
+## Rollout Record
+
+| Task | 主交付或本机变更 | 状态封账 | README |
+|---|---|---|---|
+| 1. 项目 Agent 工作流 | `4da2b43` | `375d363` | 不适用 |
+| 2. 本机全局工作流 | `~/.codex/workflows/development/`，备份 `~/.codex/AGENTS.md.backup-20260814-0334` | `74cb956` | 不适用 |
+| 3. 文档状态审计 | `c152ff6` | 本次最终状态提交 | 无需更新 |
 
 ## Final Verification
 
