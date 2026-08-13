@@ -82,8 +82,8 @@ fi
 
 echo "Testing failure cleanup..."
 (
-  # shellcheck disable=SC2329
-  # shellcheck disable=SC2329
+  # Invoked indirectly by the evaluated snippet after export -f.
+  # shellcheck disable=SC2317,SC2329
   chmod() { return 1; }
   export -f chmod
   ( eval "$INSTALL_SNIPPET" )
