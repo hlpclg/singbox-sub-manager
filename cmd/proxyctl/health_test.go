@@ -156,6 +156,14 @@ func TestHealthUsageIncluded(t *testing.T) {
 	}
 }
 
+func TestUsageDocumentsRemoteHealthFlags(t *testing.T) {
+	var stderr bytes.Buffer
+	run([]string{}, &bytes.Buffer{}, &stderr)
+	if !strings.Contains(stderr.String(), "health   [--json] [--verbose] [--domain DOMAIN] [--remote --nodes PATH]") {
+		t.Fatalf("usage should document explicit remote health invocation: %s", stderr.String())
+	}
+}
+
 func TestHealthNoSecretInOutput(t *testing.T) {
 	restore := injectFakeRegistry(health.StatusPass)
 	defer restore()
