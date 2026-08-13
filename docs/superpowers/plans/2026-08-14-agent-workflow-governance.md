@@ -85,21 +85,30 @@ Commit message: `docs: add project agent workflows`
 
 **Produces:** 不依赖当前仓库、可供其他项目 Agent 使用的本机通用规则。
 
-- [ ] **Step 1: 备份现有全局入口**
+- [x] **Step 1: 备份现有全局入口**
 
 在写入前保存 `~/.codex/AGENTS.md` 的本地备份，备份不进入 Git。
 
-- [ ] **Step 2: 创建本机通用工作流**
+- [x] **Step 2: 创建本机通用工作流**
 
 只保留跨项目原则，不包含 Go 1.22、当前仓库路径、v0.6 或本项目命令。全局入口指向 `~/.codex/workflows/development/README.md`。
 
-- [ ] **Step 3: 验证全局文件**
+- [x] **Step 3: 验证全局文件**
 
 检查全部文件非空、入口引用正确、无当前项目专有字符串；展示入口差异供审阅。
 
-- [ ] **Step 4: 回填 Task 状态并封账**
+- [x] **Step 4: 回填 Task 状态并封账**
 
 本机文件不提交；在项目计划记录修改路径、备份路径、验证证据和 `README：不适用（本机全局治理，无项目用户功能变化）`，以 `docs: record global workflow task` 提交状态。封账前不得进入 Task 3。
+
+**Task 2 完成记录：**
+
+- 状态：已完成，待本次状态提交封账。
+- 实际范围：更新 `~/.codex/AGENTS.md`，创建 `~/.codex/workflows/development/` 下六个通用工作流文件。
+- 备份：`~/.codex/AGENTS.md.backup-20260814-0334`。
+- 验证证据：六个目标文件存在且非空；全局入口引用命中；工作流目录和新增入口不含 Go 1.22、v0.6、proxyctl、singbox 或当前项目路径；入口差异仅新增五条通用规则。
+- README：不适用（本机全局治理，无项目用户功能变化）。
+- 仓库提交：本机文件不进入仓库；本状态提交仅记录完成证据。
 
 ---
 
