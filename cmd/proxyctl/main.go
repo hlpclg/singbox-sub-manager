@@ -33,6 +33,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdValidate(args[1:], stdout, stderr)
 	case "subscription":
 		return cmdSubscription(args[1:], stdout, stderr)
+	case "monitor":
+		return cmdMonitor(args[1:], stdout, stderr)
 	case "health":
 		return cmdHealth(args[1:], stdout, stderr)
 	case "version":
