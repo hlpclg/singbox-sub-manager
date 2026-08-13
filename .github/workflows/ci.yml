@@ -26,12 +26,16 @@ jobs:
         run: |
           shellcheck install-proxy.sh
           shellcheck merge-nodes.sh
+          shellcheck tests/test_install_json.sh
+          shellcheck tests/test_install_proxyctl.sh
+          shellcheck tests/test_install_monitor.sh
       - name: Go fmt
         run: if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then echo "Go code is not formatted"; exit 1; fi
       - name: Shell tests
         run: |
           bash tests/test_install_proxyctl.sh
           bash tests/test_install_json.sh
+          bash tests/test_install_monitor.sh
 
       - name: Go test
         run: go test -v ./...

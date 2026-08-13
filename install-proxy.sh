@@ -106,7 +106,7 @@ CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="/usr/local/bin/proxyctl"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.4.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.6.0}"
 PROXYCTL_VALIDATED_BIN=""
 
 # 1. OS & Root Check (Safe Early Exit)
@@ -376,7 +376,7 @@ install_proxyctl() {
     else
       existing_ver=""
     fi
-    if [[ "$existing_ver" == "$PROXYCTL_VERSION" ]]; then
+    if [[ "$existing_ver" == "$PROXYCTL_VERSION" ]] && "$PROXYCTL_BIN" monitor --help >/dev/null 2>&1; then
       PROXYCTL_VALIDATED_BIN="$PROXYCTL_BIN"
       return 0
     fi
@@ -430,6 +430,12 @@ install_proxyctl() {
     rm -f "$tmp"
     PROXYCTL_VALIDATED_BIN=""
     log_warn "Downloaded proxyctl binary version mismatch ('$ver_out' != '$PROXYCTL_VERSION'); using shell renderer."
+    return 1
+  fi
+  if ! "$tmp" monitor --help >/dev/null 2>&1; then
+    rm -f "$tmp"
+    PROXYCTL_VALIDATED_BIN=""
+    log_warn "Downloaded proxyctl does not support monitor; using shell renderer."
     return 1
   fi
 
@@ -1077,7 +1083,8 @@ else
 fi
 
 if ! install_proxyctl; then
-  log_warn "proxyctl is unavailable; built-in shell renderer will be used."
+  log_error "proxyctl with monitor support is required; installation cannot enable monitoring."
+  die "proxyctl installation failed."
 fi
 run_proxyctl_merge "$NODES_CONF" "$OUT"
 
@@ -1197,14 +1204,127 @@ if ! curl -sf --connect-timeout 10 "https://$DOMAIN/$TOKEN/clash.yaml" >/dev/nul
   log_warn "External curl check to Caddy failed. This may be due to DNS propagation."
 fi
 
-# 11. Sysctl
+# 11. Monitor
+MONITOR_UNIT_DIR="${MONITOR_UNIT_DIR:-/etc/systemd/system}"
+MONITOR_SVC_TMP="$(mktemp "$MONITOR_UNIT_DIR/.proxyctl-monitor.service.tmp.XXXXXX")"
+MONITOR_TIMER_TMP="$(mktemp "$MONITOR_UNIT_DIR/.proxyctl-monitor.timer.tmp.XXXXXX")"
+
+cat > "$MONITOR_SVC_TMP" <<'EOF2'
+[Unit]
+Description=Proxyctl Health Monitor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyctl monitor
+SuccessExitStatus=2
+EOF2
+
+cat > "$MONITOR_TIMER_TMP" <<'EOF2'
+[Unit]
+Description=Proxyctl Health Monitor Timer
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+AccuracySec=15s
+RandomizedDelaySec=15s
+
+[Install]
+WantedBy=timers.target
+EOF2
+
+chmod 0644 "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
+MONITOR_BACKUP_DIR="$(mktemp -d /tmp/proxyctl-monitor-backup.XXXXXX)"
+monitor_cleanup_on_error() {
+  rm -f "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
+  rm -rf "$MONITOR_BACKUP_DIR"
+}
+trap monitor_cleanup_on_error EXIT
+MONITOR_HAD_SVC=false
+MONITOR_HAD_TIMER=false
+MONITOR_ENABLEMENT_STATE=""
+MONITOR_WAS_ACTIVE=false
+if [[ -e "$MONITOR_UNIT_DIR/proxyctl-monitor.service" ]]; then
+  cp -a "$MONITOR_UNIT_DIR/proxyctl-monitor.service" "$MONITOR_BACKUP_DIR/service"
+  MONITOR_HAD_SVC=true
+fi
+if [[ -e "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" ]]; then
+  cp -a "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" "$MONITOR_BACKUP_DIR/timer"
+  MONITOR_HAD_TIMER=true
+  MONITOR_ENABLEMENT_STATE=""
+  if ! MONITOR_ENABLEMENT_STATE="$(systemctl is-enabled proxyctl-monitor.timer 2>/dev/null)"; then
+    case "$MONITOR_ENABLEMENT_STATE" in
+      disabled|indirect|static|masked) ;;
+      *) die "Unable to determine proxyctl-monitor timer enablement state." ;;
+    esac
+  fi
+  case "$MONITOR_ENABLEMENT_STATE" in
+    enabled|enabled-runtime|disabled|indirect|static|masked) ;;
+    *) die "Unable to determine proxyctl-monitor timer enablement state." ;;
+  esac
+
+  MONITOR_ACTIVE_STATE=""
+  if ! MONITOR_ACTIVE_STATE="$(systemctl is-active proxyctl-monitor.timer 2>/dev/null)"; then
+    case "$MONITOR_ACTIVE_STATE" in
+      inactive|failed|deactivating|activating) ;;
+      *) die "Unable to determine proxyctl-monitor timer active state." ;;
+    esac
+  fi
+  case "$MONITOR_ACTIVE_STATE" in
+    active) MONITOR_WAS_ACTIVE=true ;;
+    inactive|failed|deactivating|activating) MONITOR_WAS_ACTIVE=false ;;
+    *) die "Unable to determine proxyctl-monitor timer active state." ;;
+  esac
+fi
+
+restore_monitor_units() {
+  systemctl disable --now proxyctl-monitor.timer >/dev/null 2>&1 || true
+  if [[ "$MONITOR_HAD_SVC" == true ]]; then
+    mv -f "$MONITOR_BACKUP_DIR/service" "$MONITOR_UNIT_DIR/proxyctl-monitor.service"
+  else
+    rm -f "$MONITOR_UNIT_DIR/proxyctl-monitor.service"
+  fi
+  if [[ "$MONITOR_HAD_TIMER" == true ]]; then
+    mv -f "$MONITOR_BACKUP_DIR/timer" "$MONITOR_UNIT_DIR/proxyctl-monitor.timer"
+  else
+    rm -f "$MONITOR_UNIT_DIR/proxyctl-monitor.timer"
+  fi
+  systemctl daemon-reload || true
+  if [[ "$MONITOR_HAD_TIMER" == true ]]; then
+    case "$MONITOR_ENABLEMENT_STATE" in
+      enabled) systemctl enable proxyctl-monitor.timer >/dev/null 2>&1 || true ;;
+      enabled-runtime) systemctl enable --runtime proxyctl-monitor.timer >/dev/null 2>&1 || true ;;
+      disabled|indirect|static|masked) systemctl disable proxyctl-monitor.timer >/dev/null 2>&1 || true ;;
+    esac
+    if [[ "$MONITOR_WAS_ACTIVE" == true ]]; then
+      systemctl start proxyctl-monitor.timer >/dev/null 2>&1 || true
+    else
+      systemctl stop proxyctl-monitor.timer >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf "$MONITOR_BACKUP_DIR"
+}
+
+if ! mv "$MONITOR_SVC_TMP" "$MONITOR_UNIT_DIR/proxyctl-monitor.service" ||
+   ! mv "$MONITOR_TIMER_TMP" "$MONITOR_UNIT_DIR/proxyctl-monitor.timer" ||
+   ! systemctl daemon-reload ||
+   ! systemctl enable --now proxyctl-monitor.timer; then
+  log_error "Failed to activate proxyctl-monitor units; restoring previous units."
+  rm -f "$MONITOR_SVC_TMP" "$MONITOR_TIMER_TMP"
+  restore_monitor_units
+  die "Failed to activate proxyctl-monitor timer."
+fi
+rm -rf "$MONITOR_BACKUP_DIR"
+trap - EXIT
+
+# 12. Sysctl
 cat > /etc/sysctl.d/99-proxy-installer.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
-# 12. Write install state
+# 13. Write install state
 INSTALL_JSON="$BASE_DIR/install.json"
 INSTALL_JSON_TMP="$(mktemp "$BASE_DIR/.install.json.tmp.XXXXXX")"
 trap 'rm -rf "$TMP" "$INSTALL_JSON_TMP"' EXIT

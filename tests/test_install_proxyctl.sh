@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2030,SC2031,SC2329
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,10 +47,14 @@ printf '%s\n' '# managed-by: installer' 'Node1|1.2.3.4|443|pass123|obfs123|examp
 make_proxyctl() {
   local path="$1" version="$2" marker="$3" label="$4"
   mkdir -p "$(dirname "$path")"
+# shellcheck disable=SC2016
   cat > "$path" <<EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == version ]]; then
   printf '%s\\n' '$version'
+  exit 0
+fi
+if [[ "\${1:-}" == monitor && "\${2:-}" == --help ]]; then
   exit 0
 fi
 if [[ "\${1:-}" == merge ]]; then
@@ -72,10 +77,12 @@ EOF
 make_evil_proxyctl() {
   local path="$1" marker="$2"
   mkdir -p "$(dirname "$path")"
+# shellcheck disable=SC2016
   cat > "$path" <<EOF
 #!/usr/bin/env bash
 printf 'evil:%s\\n' "\${1:-}" >> '$marker'
 if [[ "\${1:-}" == version ]]; then printf 'v0.2.2\\n'; exit 0; fi
+if [[ "\${1:-}" == monitor && "\${2:-}" == --help ]]; then exit 1; fi
 exit 90
 EOF
   chmod +x "$path"
@@ -98,6 +105,8 @@ run_install_case() {
     export CHECKSUM_MODE="ok"
     "$setup_fn"
 
+    # Invoked indirectly by the sourced production harness after export -f.
+    # shellcheck disable=SC2317
     curl() {
       local output="" url=""
       while [[ $# -gt 0 ]]; do

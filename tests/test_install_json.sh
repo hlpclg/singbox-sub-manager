@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2030,SC2031,SC2329
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,8 +37,9 @@ TMP="$TEST_DIR/tmp_dir"
 mkdir -p "$TMP"
 
 # Extract the write install state section from install-proxy.sh
+# shellcheck disable=SC2016
 INSTALL_SNIPPET=$(awk '
-/# 12. Write install state/ { active=1 }
+/# 13. Write install state/ { active=1 }
 /# Masked Token for log/ { active=0 }
 active { print }
 ' "$REPO_ROOT/install-proxy.sh")
@@ -80,7 +82,8 @@ fi
 
 echo "Testing failure cleanup..."
 (
-  # shellcheck disable=SC2329
+  # Invoked indirectly by the evaluated snippet after export -f.
+  # shellcheck disable=SC2317,SC2329
   chmod() { return 1; }
   export -f chmod
   ( eval "$INSTALL_SNIPPET" )
