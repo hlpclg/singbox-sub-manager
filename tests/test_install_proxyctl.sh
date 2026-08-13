@@ -105,6 +105,8 @@ run_install_case() {
     export CHECKSUM_MODE="ok"
     "$setup_fn"
 
+    # Invoked indirectly by the sourced production harness after export -f.
+    # shellcheck disable=SC2317
     curl() {
       local output="" url=""
       while [[ $# -gt 0 ]]; do
