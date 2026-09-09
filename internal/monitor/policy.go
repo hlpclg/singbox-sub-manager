@@ -9,6 +9,20 @@ var (
 	caddyTriggers   = []string{"service.caddy", "port.tcp443", "port.tcp80"}
 )
 
+// ServiceTriggers returns the health check IDs that must pass for svc to count
+// as recovered. Callers outside the monitor loop (the restore transaction, for
+// one) reuse them so there is a single definition of "this service is back".
+func ServiceTriggers(svc string) []string {
+	switch svc {
+	case "sing-box":
+		return append([]string(nil), singboxTriggers...)
+	case "caddy":
+		return append([]string(nil), caddyTriggers...)
+	default:
+		return nil
+	}
+}
+
 func Decide(state State, checks map[string]string, now time.Time, paused bool) (State, map[string]string) {
 	actions := make(map[string]string)
 

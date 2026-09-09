@@ -20,6 +20,7 @@
 - 优先代理 Google Play、Google、OpenAI、Claude、GitHub、YouTube 等服务
 - 国内域名、私有网络和 Apple 中国服务默认直连
 - Caddy 禁用 HTTP/3，避免与 Hysteria2 的 UDP 443 冲突
+- 一条命令备份全部持久化状态，恢复失败时按恢复前映像自动回滚
 
 ## 当前支持的系统
 
@@ -369,6 +370,68 @@ proxyctl monitor status
 
 状态文件位于 `/var/lib/singbox-sub-manager/monitor-state.json`，暂停标记位于 `/var/lib/singbox-sub-manager/monitor-paused`。`monitor` 输出机器可读 JSON；退出码 0 表示最终健康，1 表示恢复失败，2 表示降级但未发生失败恢复，3 表示无法可靠决策。
 
+## 备份与恢复（proxyctl backup / restore）
+
+`proxyctl backup` 把单机全部持久化状态打包成一个可校验的 `.tar.gz` 归档：`/etc/singbox-sub-manager/` 整棵配置树、`/etc/sing-box/config.json`、`/etc/caddy/Caddyfile`、订阅 token、monitor 状态与暂停标记。不存在的路径记入归档清单的“跳过”而不是报错。
+
+```bash
+# 创建备份（默认写入 /var/lib/singbox-sub-manager/backups/，保留最近 10 份）
+sudo proxyctl backup
+
+# 保留份数改为 3；--keep 0 表示不清理
+sudo proxyctl backup --keep 3
+
+# 备份到指定路径（不参与自动命名和保留策略）
+sudo proxyctl backup --out /root/before-upgrade.tar.gz
+
+# 列出可用归档（时间倒序，含 proxyctl 版本和大小）
+sudo proxyctl backup list
+```
+
+**归档包含私钥、订阅 token 和 Hysteria2 密码。** 归档文件权限为 `0600`、备份目录为 `0700`，但一旦复制到别处，保管责任就在你自己：按与服务器同等的安全级别存放，不要放进对象存储公开桶、聊天工具或代码仓库。
+
+保留策略只删除本工具按 `backup-YYYYMMDDTHHMMSSZ[-N].tar.gz` 命名生成的归档，你自己放进备份目录的其他文件不受影响。
+
+### 恢复
+
+```bash
+# 先看会改动什么：不加锁、不写盘、不重启
+sudo proxyctl restore /var/lib/singbox-sub-manager/backups/backup-20260909T100000Z.tar.gz --dry-run
+
+# 实际恢复：恢复文件 → 重启受影响服务 → 健康复检
+sudo proxyctl restore /var/lib/singbox-sub-manager/backups/backup-20260909T100000Z.tar.gz
+
+# 只恢复文件，不重启任何服务（需要你自行重启才会生效）
+sudo proxyctl restore /path/backup.tar.gz --no-restart
+```
+
+恢复流程是一个事务：先获取与 monitor 相同的恢复锁，再校验归档（校验和、路径安全、清单与内容一致），创建“恢复前映像”（逐字节记录每个目标文件的内容、权限和属主），然后写入。归档校验在任何写入之前完成，校验不通过时不会改动任何文件。归档中命中 `sing-box`/`caddy` 配置的路径会触发对应服务重启并复用 monitor 的健康复检口径。
+
+复检失败时会自动回滚：按恢复前映像逐字节还原原文件的内容、权限和属主，并删除本次新建的文件，然后再次重启复检。回滚成功退出码为 4；回滚本身失败退出码为 5，此时命令会列出处于不确定状态的路径并保留映像目录供人工恢复。
+
+monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明确报错，提示稍后重试或先执行 `proxyctl monitor pause`，不会无限等待，也不会绕过锁。
+
+### 恢复对 monitor 的影响
+
+`monitor-state.json` 和 `monitor-paused` 属于备份范围，恢复时按归档中的存在性精确还原：
+
+- 归档在 monitor 暂停期间创建，恢复后 monitor 仍然是暂停的，需要执行 `proxyctl monitor resume` 才会重新生效。
+- 归档中没有暂停标记，则恢复会删除当前的暂停标记。
+- 状态文件按归档还原，失败计数会一并回退到备份时刻。
+
+`restore` 不会自行启动或恢复 monitor，命令输出会明确说明本次恢复对 monitor 的影响。
+
+### 退出码
+
+- `0` 成功
+- `1` I/O 或服务失败（系统处于已知状态）
+- `2` 参数错误
+- `3` 归档校验或安全预检失败（未写入任何文件）
+- `4` 文件已恢复但重启/复检失败，配置已成功回滚
+- `5` 回滚失败，需要人工介入
+
+这张表只适用于 `backup` 和 `restore`。`health` 和 `monitor` 有各自的退出码含义（其中 1/2 表示健康状态，3 表示参数或内部错误），不要跨命令套用。
+
 ## 获取其他节点的连接信息
 
 在每台 Hysteria2 节点服务器上执行：
@@ -444,6 +507,8 @@ singbox-sub-manager/
 /etc/singbox-sub-manager/config.env
 /etc/singbox-sub-manager/nodes.conf
 /var/log/singbox-sub-manager/installer.log
+/var/lib/singbox-sub-manager/backups/            # proxyctl backup 生成的归档（0700）
+/var/lib/singbox-sub-manager/restore-snapshots/  # 恢复前映像，事务结束后自动清理
 ```
 
 ### 订阅文件
