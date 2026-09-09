@@ -69,7 +69,7 @@ type archiveEntry struct {
 	data   []byte
 }
 
-func readArchive(t *testing.T, path string) []archiveEntry {
+func readArchiveEntries(t *testing.T, path string) []archiveEntry {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
@@ -187,7 +187,7 @@ func TestCreate_ChecksumMatches(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	entries := readArchive(t, m.ArchivePath)
+	entries := readArchiveEntries(t, m.ArchivePath)
 	for _, f := range m.Files {
 		archived := entryByName(t, entries, f.Path)
 		sum := sha256.Sum256(archived.data)
@@ -250,7 +250,7 @@ func TestCreate_SkipsMissingPaths(t *testing.T) {
 			t.Errorf("%s must not be packed", p)
 		}
 	}
-	for _, e := range readArchive(t, m.ArchivePath) {
+	for _, e := range readArchiveEntries(t, m.ArchivePath) {
 		for _, p := range want {
 			if e.header.Name == p {
 				t.Errorf("archive contains skipped path %s", p)
@@ -370,7 +370,7 @@ func TestCreate_RecursesTreeAndSkipsNonRegularEntries(t *testing.T) {
 			t.Errorf("%s must not be packed", rel)
 		}
 	}
-	for _, e := range readArchive(t, m.ArchivePath) {
+	for _, e := range readArchiveEntries(t, m.ArchivePath) {
 		if e.header.Typeflag != tar.TypeReg {
 			t.Errorf("archive entry %s has type %q, want a regular file", e.header.Name, string(e.header.Typeflag))
 		}
@@ -433,7 +433,7 @@ func TestCreate_PreservesOwnershipAndMode(t *testing.T) {
 		t.Errorf("manifest ownership = %d:%d, want %d:%d", entry.UID, entry.GID, wantUID, wantGID)
 	}
 
-	hdr := entryByName(t, readArchive(t, m.ArchivePath), "etc/caddy/Caddyfile").header
+	hdr := entryByName(t, readArchiveEntries(t, m.ArchivePath), "etc/caddy/Caddyfile").header
 	if fs.FileMode(hdr.Mode).Perm() != 0640 {
 		t.Errorf("tar mode = %o, want 0640", hdr.Mode)
 	}
@@ -460,7 +460,7 @@ func TestCreate_TarShapeExact(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	entries := readArchive(t, m.ArchivePath)
+	entries := readArchiveEntries(t, m.ArchivePath)
 	if len(entries) != len(m.Files)+1 {
 		t.Fatalf("archive has %d entries, want %d (manifest + files)", len(entries), len(m.Files)+1)
 	}
@@ -569,7 +569,7 @@ func TestCreate_OutOverridesNamingAndRetentionPath(t *testing.T) {
 	if IsArchiveName(filepath.Base(out)) {
 		t.Error("a --out path must not be treated as a system-created archive name")
 	}
-	if len(readArchive(t, out)) != len(m.Files)+1 {
+	if len(readArchiveEntries(t, out)) != len(m.Files)+1 {
 		t.Error("--out archive does not have the expected shape")
 	}
 }
@@ -684,7 +684,7 @@ func TestCreate_PacksLegalButUnusualFileNames(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	packed := manifestPaths(m)
-	entries := readArchive(t, m.ArchivePath)
+	entries := readArchiveEntries(t, m.ArchivePath)
 	for _, rel := range unusual {
 		if _, ok := packed[rel]; !ok {
 			t.Errorf("%s was not packed", rel)
