@@ -1240,3 +1240,29 @@ func TestBackupListCmd_OrdersSameSecondArchivesBySuffix(t *testing.T) {
 		}
 	}
 }
+
+func TestBackupAndRestoreHelpSucceed(t *testing.T) {
+	// install-proxy.sh probes these before an upgrade to find out whether the
+	// installed binary can snapshot configuration at all, so they must exit 0
+	// the way `monitor --help` does.
+	h := newHarness(t)
+	h.install(t)
+
+	for _, args := range [][]string{
+		{"backup", "--help"},
+		{"backup", "-h"},
+		{"restore", "--help"},
+		{"restore", "-h"},
+	} {
+		code, stdout, stderr := runCmd(t, args...)
+		if code != exitOK {
+			t.Errorf("%v: exit = %d, want 0 (stderr %q)", args, code, stderr)
+		}
+		if !strings.Contains(stdout, "usage:") {
+			t.Errorf("%v: stdout = %q, want usage text", args, stdout)
+		}
+	}
+	if len(h.restoreOpts) != 0 || h.lock.tryCalls != 0 {
+		t.Error("--help did any real work")
+	}
+}

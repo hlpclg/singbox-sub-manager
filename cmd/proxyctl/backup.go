@@ -122,6 +122,11 @@ func runServiceChecks(ctx context.Context, ids ...string) []health.Result {
 }
 
 func cmdBackup(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
+		fmt.Fprintln(stdout, "usage: proxyctl backup [--out PATH] [--keep N]")
+		fmt.Fprintln(stdout, "       proxyctl backup list")
+		return exitOK
+	}
 	if len(args) > 0 && args[0] == "list" {
 		return cmdBackupList(args[1:], stdout, stderr)
 	}
@@ -308,6 +313,10 @@ func formatSize(n int64) string {
 }
 
 func cmdRestore(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
+		fmt.Fprintln(stdout, "usage: proxyctl restore <archive-path> [--dry-run] [--no-restart]")
+		return exitOK
+	}
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "show what would change without writing or locking")
