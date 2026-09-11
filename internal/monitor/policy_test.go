@@ -90,3 +90,36 @@ func TestDecide_ComplexScenarios(t *testing.T) {
 		t.Errorf("paused: expected count 0, no actions. got %d", state.Services["sing-box"].FailureCount)
 	}
 }
+
+func TestServiceTriggers(t *testing.T) {
+	// The restore transaction reuses these, so they must stay the same list
+	// the monitor's own decisions are made from.
+	if got := ServiceTriggers("sing-box"); len(got) != len(singboxTriggers) {
+		t.Fatalf("sing-box triggers = %v, want %v", got, singboxTriggers)
+	} else {
+		for i := range singboxTriggers {
+			if got[i] != singboxTriggers[i] {
+				t.Errorf("sing-box triggers = %v, want %v", got, singboxTriggers)
+			}
+		}
+	}
+	if got := ServiceTriggers("caddy"); len(got) != len(caddyTriggers) {
+		t.Fatalf("caddy triggers = %v, want %v", got, caddyTriggers)
+	} else {
+		for i := range caddyTriggers {
+			if got[i] != caddyTriggers[i] {
+				t.Errorf("caddy triggers = %v, want %v", got, caddyTriggers)
+			}
+		}
+	}
+	if got := ServiceTriggers("nginx"); got != nil {
+		t.Errorf("unknown service triggers = %v, want nil", got)
+	}
+
+	// The caller must not be able to edit the monitor's own slices.
+	mutated := ServiceTriggers("caddy")
+	mutated[0] = "tampered"
+	if caddyTriggers[0] == "tampered" {
+		t.Error("ServiceTriggers handed out the package's own slice")
+	}
+}

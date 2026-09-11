@@ -20,6 +20,8 @@
 - 优先代理 Google Play、Google、OpenAI、Claude、GitHub、YouTube 等服务
 - 国内域名、私有网络和 Apple 中国服务默认直连
 - Caddy 禁用 HTTP/3，避免与 Hysteria2 的 UDP 443 冲突
+- 一条命令备份全部持久化状态，恢复失败时按恢复前映像自动回滚
+- 升级 proxyctl 失败时自动回滚二进制、校验文件和配置
 
 ## 当前支持的系统
 
@@ -369,6 +371,105 @@ proxyctl monitor status
 
 状态文件位于 `/var/lib/singbox-sub-manager/monitor-state.json`，暂停标记位于 `/var/lib/singbox-sub-manager/monitor-paused`。`monitor` 输出机器可读 JSON；退出码 0 表示最终健康，1 表示恢复失败，2 表示降级但未发生失败恢复，3 表示无法可靠决策。
 
+## 备份与恢复（proxyctl backup / restore）
+
+`proxyctl backup` 把单机全部持久化状态打包成一个可校验的 `.tar.gz` 归档：`/etc/singbox-sub-manager/` 整棵配置树、`/etc/sing-box/config.json`、`/etc/caddy/Caddyfile`、订阅 token、monitor 状态与暂停标记。不存在的路径记入归档清单的“跳过”而不是报错。
+
+```bash
+# 创建备份（默认写入 /var/lib/singbox-sub-manager/backups/，保留最近 10 份）
+sudo proxyctl backup
+
+# 保留份数改为 3；--keep 0 表示不清理
+sudo proxyctl backup --keep 3
+
+# 备份到指定路径（不参与自动命名和保留策略）
+sudo proxyctl backup --out /root/before-upgrade.tar.gz
+
+# 列出可用归档（时间倒序，含 proxyctl 版本和大小）
+sudo proxyctl backup list
+```
+
+**归档包含私钥、订阅 token 和 Hysteria2 密码。** 归档文件权限为 `0600`、备份目录为 `0700`，但一旦复制到别处，保管责任就在你自己：按与服务器同等的安全级别存放，不要放进对象存储公开桶、聊天工具或代码仓库。
+
+保留策略只删除本工具按 `backup-YYYYMMDDTHHMMSSZ[-N].tar.gz` 命名生成的归档，你自己放进备份目录的其他文件不受影响。
+
+### 恢复
+
+```bash
+# 先看会改动什么：不加锁、不写盘、不重启
+sudo proxyctl restore /var/lib/singbox-sub-manager/backups/backup-20260909T100000Z.tar.gz --dry-run
+
+# 实际恢复：恢复文件 → 重启受影响服务 → 健康复检
+sudo proxyctl restore /var/lib/singbox-sub-manager/backups/backup-20260909T100000Z.tar.gz
+
+# 只恢复文件，不重启任何服务（需要你自行重启才会生效）
+sudo proxyctl restore /path/backup.tar.gz --no-restart
+```
+
+恢复流程是一个事务：先获取与 monitor 相同的恢复锁，再校验归档（校验和、路径安全、清单与内容一致），创建“恢复前映像”（逐字节记录每个目标文件的内容、权限和属主），然后写入。归档校验在任何写入之前完成，校验不通过时不会改动任何文件。归档中命中 `sing-box`/`caddy` 配置的路径会触发对应服务重启并复用 monitor 的健康复检口径。
+
+复检失败时会自动回滚：按恢复前映像逐字节还原原文件的内容、权限和属主，并删除本次新建的文件，然后再次重启复检。回滚成功退出码为 4；回滚本身失败退出码为 5，此时命令会列出处于不确定状态的路径并保留映像目录供人工恢复。
+
+monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明确报错，提示稍后重试或先执行 `proxyctl monitor pause`，不会无限等待，也不会绕过锁。
+
+### 恢复对 monitor 的影响
+
+`monitor-state.json` 和 `monitor-paused` 属于备份范围，恢复时按归档中的存在性精确还原：
+
+- 归档在 monitor 暂停期间创建，恢复后 monitor 仍然是暂停的，需要执行 `proxyctl monitor resume` 才会重新生效。
+- 归档中没有暂停标记，则恢复会删除当前的暂停标记。
+- 状态文件按归档还原，失败计数会一并回退到备份时刻。
+
+`restore` 不会自行启动或恢复 monitor，命令输出会明确说明本次恢复对 monitor 的影响。
+
+### 退出码
+
+- `0` 成功
+- `1` I/O 或服务失败（系统处于已知状态）
+- `2` 参数错误
+- `3` 归档校验或安全预检失败（未写入任何文件）
+- `4` 文件已恢复但重启/复检失败，配置已成功回滚
+- `5` 回滚失败，需要人工介入
+
+这张表只适用于 `backup` 和 `restore`。`health` 和 `monitor` 有各自的退出码含义（其中 1/2 表示健康状态，3 表示参数或内部错误），不要跨命令套用。
+
+## 升级与回滚（install-proxy.sh update / rollback）
+
+安装语法不变：`sudo ./install-proxy.sh <domain> [email]` 与 `sudo ./install-proxy.sh install --domain ...` 行为完全一致。`update` 和 `rollback` 是新增的子命令，不需要域名参数。
+
+```bash
+# 升级 proxyctl 到最新 Release
+sudo ./install-proxy.sh update
+
+# 回滚到最近一次升级会话（二进制 + 配置）
+sudo ./install-proxy.sh rollback
+
+# 回滚到指定的升级会话，或指定的配置归档
+sudo ./install-proxy.sh rollback --to 20260910T101112Z
+sudo ./install-proxy.sh rollback --to backup-20260909T100000Z.tar.gz
+```
+
+`update` 的顺序是固定的，每一步失败都不会让系统停在半生效状态：
+
+1. 查询最新 Release tag，并探测当前 `proxyctl` 是否支持 `backup`/`restore`。
+2. 支持时用**当前**二进制创建本次升级专用的配置快照；不支持（v0.6 及更早）时明确提示这是「仅二进制升级」，不会调用旧版没有的子命令，失败时也只能回滚二进制。
+3. 把当前二进制和 `.sha256` 复制（不是移动）到升级会话目录，并记录各自的 SHA-256。线上文件全程保持可用。
+4. 下载对应架构的二进制，用 Release 的 `checksums.txt` 校验。校验或下载失败时线上二进制和校验文件原样不动。
+5. 会话元数据落盘之后，才用同目录临时文件原子替换线上的二进制（`0755`）和校验文件（`0644`）。
+6. 用**新**二进制执行 `proxyctl health --json`，只有退出码 0 算成功。
+
+健康检查失败时自动回滚：先用仍在位的新二进制把配置恢复到升级前快照（这样即使旧版本没有 `restore` 也能完成配置回滚），再校验暂存副本的 SHA-256 并原子恢复旧二进制和旧校验文件。暂存副本校验不通过时拒绝回滚并要求人工介入，不会把损坏的文件写上去。
+
+升级会话保存在 `/var/lib/singbox-sub-manager/updates/<时间戳>/`，目录权限 `0700`，内部文件 `0600`。成功升级后保留最近一个成功会话，供之后手动 `rollback`；只有下一次成功升级才会清理更旧的成功会话。失败的会话一律保留，不自动删除。
+
+收到 `SIGINT`/`SIGTERM` 时的行为分三种：会话元数据尚未落盘（还在建快照或暂存旧二进制）时，删除这个不完整的会话并清理下载临时文件，线上文件未被触碰；元数据已落盘后中断，保留整个会话并清理临时文件，之后可以用 `rollback` 回到升级前状态；如果中断发生在健康检查期间，新二进制已经在位、会话状态停在 `in_progress`，不会自动回滚，需要你自己执行 `sudo ./install-proxy.sh rollback`。三种情况都以退出码 130 结束并打印说明。
+
+不完整的会话（没有 `session.meta`）不会被 `rollback` 选中，不带参数的 `rollback` 只会回到最近一个完整会话。
+
+重跑安装脚本会把 proxyctl 拉回安装脚本内置的 `PROXYCTL_VERSION`：`update` 之后如果再执行 `sudo ./install-proxy.sh <domain>`，二进制会被降级回安装脚本固定的版本。升级后需要重跑安装时，用 `sudo PROXYCTL_VERSION=<tag> ./install-proxy.sh <domain>` 指定当前版本。
+
+`rollback` 不带参数时使用最近一次会话：先恢复配置（如果该会话有快照），再校验并恢复二进制对。会话里只有配置快照而没有暂存二进制时，会明确告诉你「二进制未变更」。找不到任何会话或归档时报错退出，不会静默无操作。
+
 ## 获取其他节点的连接信息
 
 在每台 Hysteria2 节点服务器上执行：
@@ -444,6 +545,9 @@ singbox-sub-manager/
 /etc/singbox-sub-manager/config.env
 /etc/singbox-sub-manager/nodes.conf
 /var/log/singbox-sub-manager/installer.log
+/var/lib/singbox-sub-manager/backups/            # proxyctl backup 生成的归档（0700）
+/var/lib/singbox-sub-manager/restore-snapshots/  # 恢复前映像，事务结束后自动清理
+/var/lib/singbox-sub-manager/updates/            # 升级会话：旧二进制、校验文件与配置快照（0700）
 ```
 
 ### 订阅文件

@@ -10,70 +10,17 @@ EMAIL_EXPLICIT=false
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  sudo ./install-proxy.sh <domain> [email]
-  sudo ./install-proxy.sh --domain <domain> [--email <email>]
+  sudo ./install-proxy.sh [install] <domain> [email]
+  sudo ./install-proxy.sh [install] --domain <domain> [--email <email>]
+  sudo ./install-proxy.sh update
+  sudo ./install-proxy.sh rollback [--to <session-or-archive>]
 
 Example:
   sudo ./install-proxy.sh sub.example.com admin@example.com
+  sudo ./install-proxy.sh update
 EOF
 }
 
-POSITIONAL=()
-
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    install) shift ;;
-    --domain)
-      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --domain" >&2; usage; exit 1; }
-      DOMAIN="$2"
-      shift 2
-      ;;
-    --email)
-      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --email" >&2; usage; exit 1; }
-      EMAIL="$2"
-      EMAIL_EXPLICIT=true
-      shift 2
-      ;;
-    -h|--help) usage; exit 0 ;;
-    -*) echo "Unknown parameter: $1" >&2; usage; exit 1 ;;
-    *) POSITIONAL+=("$1"); shift ;;
-  esac
-done
-
-if [[ ${#POSITIONAL[@]} -gt 2 ]]; then
-  echo "Too many positional parameters: ${POSITIONAL[*]}" >&2
-  usage
-  exit 1
-fi
-
-if [[ ${#POSITIONAL[@]} -ge 1 ]]; then
-  if [[ -n "$DOMAIN" ]]; then
-    echo "Domain provided both positionally and with --domain" >&2
-    usage
-    exit 1
-  fi
-  DOMAIN="${POSITIONAL[0]}"
-fi
-
-if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
-  if [[ "$EMAIL_EXPLICIT" == true ]]; then
-    echo "Email provided both positionally and with --email" >&2
-    usage
-    exit 1
-  fi
-  EMAIL="${POSITIONAL[1]}"
-fi
-
-if [[ -z "$DOMAIN" ]]; then
-  echo "Missing required domain" >&2
-  usage
-  exit 1
-fi
-
-if [[ "$DOMAIN" =~ :// || "$DOMAIN" == */* || "$DOMAIN" == *:* || "$DOMAIN" == *[[:space:]]* || "$DOMAIN" != *.* ]]; then
-  echo "Domain must be a hostname only, for example: sub.example.com" >&2
-  exit 1
-fi
 
 HY2_PORT="${HY2_PORT:-443}"
 NODE_NAME="${NODE_NAME:-AWS-HY2}"
@@ -104,50 +51,73 @@ CADDY_APT_BACKUP_ORIGINALS=()
 CADDY_APT_BACKUP_FILES=()
 CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
-PROXYCTL_BIN="/usr/local/bin/proxyctl"
+PROXYCTL_BIN="${PROXYCTL_BIN:-/usr/local/bin/proxyctl}"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.6.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.7.0}"
 PROXYCTL_VALIDATED_BIN=""
+UPDATES_DIR="${UPDATES_DIR:-$STATE_DIR/updates}"
+BACKUPS_DIR="${BACKUPS_DIR:-$STATE_DIR/backups}"
+DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-120}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"
 
-# 1. OS & Root Check (Safe Early Exit)
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "ERROR: Please run as root (sudo)" >&2
-  exit 1
-fi
+# 1. OS & Root Check. Each command runs this after parsing its own arguments,
+# so --help and argument errors still answer a non-root caller the way they
+# always have.
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: Please run as root (sudo)" >&2
+    exit 1
+  fi
+}
 
-if [[ -f /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  OS="${ID:-}"
-  VER="${VERSION_ID:-}"
-  if [[ "$OS" == "ubuntu" ]]; then
-    if [[ "$VER" != "22.04" && "$VER" != "24.04" ]]; then
-      echo "ERROR: Only Ubuntu 22.04 and 24.04 are supported" >&2
-      exit 1
-    fi
-  elif [[ "$OS" == "debian" ]]; then
-    if [[ "$VER" != "12" ]]; then
-      echo "ERROR: Only Debian 12 is supported" >&2
+require_supported_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS="${ID:-}"
+    VER="${VERSION_ID:-}"
+    if [[ "$OS" == "ubuntu" ]]; then
+      if [[ "$VER" != "22.04" && "$VER" != "24.04" ]]; then
+        echo "ERROR: Only Ubuntu 22.04 and 24.04 are supported" >&2
+        exit 1
+      fi
+    elif [[ "$OS" == "debian" ]]; then
+      if [[ "$VER" != "12" ]]; then
+        echo "ERROR: Only Debian 12 is supported" >&2
+        exit 1
+      fi
+    else
+      echo "ERROR: Only Ubuntu and Debian are supported" >&2
       exit 1
     fi
   else
-    echo "ERROR: Only Ubuntu and Debian are supported" >&2
+    echo "ERROR: Could not determine OS" >&2
     exit 1
   fi
-else
-  echo "ERROR: Could not determine OS" >&2
-  exit 1
-fi
+}
 
 arch(){ case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) echo "ERROR: Unsupported architecture" >&2; exit 1;; esac; }
 
-mkdir -p "$BASE_DIR" "$CERTS_DIR" "$STATE_DIR" "$LOG_DIR" "$SUB_ROOT" "$TEMPLATE_DIR" "$EXAMPLES_DIR"
+prepare_runtime_dirs() {
+  mkdir -p "$BASE_DIR" "$CERTS_DIR" "$STATE_DIR" "$LOG_DIR" "$SUB_ROOT" "$TEMPLATE_DIR" "$EXAMPLES_DIR"
+}
 
-exec 9> "$LOCK_FILE"
-if ! flock -n 9; then
-  echo "Another installation is in progress. Please wait." >&2
-  exit 1
-fi
+# acquire_installer_lock keeps installs, upgrades and rollbacks from running
+# over each other.
+acquire_installer_lock() {
+  exec 9> "$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "Another installation is in progress. Please wait." >&2
+    exit 1
+  fi
+}
+
+installer_preflight() {
+  require_root
+  require_supported_os
+  prepare_runtime_dirs
+  acquire_installer_lock
+}
 
 log() {
   local msg="$1"
@@ -796,6 +766,71 @@ check_disk() {
     die "Insufficient disk space on $mnt. At least 512MB required."
   fi
 }
+
+# cmd_install performs the installation. Its body is the original top-level
+# script moved verbatim: the lines are deliberately not re-indented, so this
+# refactor stays auditable line by line (git diff -w shows only the wrapper)
+# and the heredocs that generate configuration files keep their exact bytes.
+cmd_install() {
+POSITIONAL=()
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    install) shift ;;
+    --domain)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --domain" >&2; usage; exit 1; }
+      DOMAIN="$2"
+      shift 2
+      ;;
+    --email)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --email" >&2; usage; exit 1; }
+      EMAIL="$2"
+      EMAIL_EXPLICIT=true
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Unknown parameter: $1" >&2; usage; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -gt 2 ]]; then
+  echo "Too many positional parameters: ${POSITIONAL[*]}" >&2
+  usage
+  exit 1
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 1 ]]; then
+  if [[ -n "$DOMAIN" ]]; then
+    echo "Domain provided both positionally and with --domain" >&2
+    usage
+    exit 1
+  fi
+  DOMAIN="${POSITIONAL[0]}"
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
+  if [[ "$EMAIL_EXPLICIT" == true ]]; then
+    echo "Email provided both positionally and with --email" >&2
+    usage
+    exit 1
+  fi
+  EMAIL="${POSITIONAL[1]}"
+fi
+
+if [[ -z "$DOMAIN" ]]; then
+  echo "Missing required domain" >&2
+  usage
+  exit 1
+fi
+
+if [[ "$DOMAIN" =~ :// || "$DOMAIN" == */* || "$DOMAIN" == *:* || "$DOMAIN" == *[[:space:]]* || "$DOMAIN" != *.* ]]; then
+  echo "Domain must be a hostname only, for example: sub.example.com" >&2
+  exit 1
+fi
+
+installer_preflight
+
 check_disk "/"
 check_disk "/tmp"
 
@@ -1352,3 +1387,408 @@ echo "Token (masked for log): $MASKED_TOKEN"
 
 trap - EXIT
 rm -rf "$TMP"
+}
+
+# --- v0.7 upgrade and rollback ---------------------------------------------
+# The functions below are top level so the test harness can extract and drive
+# them one at a time. Downloading, release lookup and the health check are
+# separate seams for the same reason.
+
+fetch_url() {
+  curl -fsSL --max-time "$DOWNLOAD_TIMEOUT" "$1" -o "$2"
+}
+
+latest_proxyctl_tag() {
+  curl -fsSL --max-time "$DOWNLOAD_TIMEOUT" "https://api.github.com/repos/${PROXYCTL_REPOSITORY}/releases/latest" \
+    | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -1
+}
+
+run_proxyctl_health() {
+  timeout "$HEALTH_TIMEOUT" "$1" health --json >/dev/null 2>&1
+}
+
+# proxyctl_supports_config_snapshot reports whether the installed binary can
+# create and restore configuration snapshots. v0.6 and older cannot, and must
+# never be asked to run a subcommand they do not have.
+proxyctl_supports_config_snapshot() {
+  local bin="$1"
+  "$bin" backup --help >/dev/null 2>&1 && "$bin" restore --help >/dev/null 2>&1
+}
+
+# sync_path flushes one path to disk. GNU coreutils (the supported targets)
+# implements the per-file form; elsewhere it is a no-op rather than a
+# whole-system sync.
+sync_path() {
+  sync "$1" 2>/dev/null || true
+}
+
+# replace_file_atomic publishes src at dest through a same-directory temporary
+# file, so the live file is either the old one or the complete new one.
+replace_file_atomic() {
+  local src="$1" dest="$2" mode="$3" dir tmp
+  dir="$(dirname "$dest")"
+  tmp="$(mktemp "$dir/.proxyctl-replace.XXXXXX")" || return 1
+  if ! cat "$src" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  sync_path "$tmp"
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+  sync_path "$dir"
+}
+
+session_meta_get() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v k="$key" 'index($0, k "=") == 1 { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+# write_session_meta lands the metadata atomically. Nothing may replace the
+# live binary before this file is on disk: it is the only record of what the
+# rollback has to put back.
+write_session_meta() {
+  local dir="$1"
+  shift
+  local tmp
+  tmp="$(mktemp "$dir/.session.meta.XXXXXX")" || return 1
+  printf '%s\n' "$@" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0600 "$tmp" || { rm -f "$tmp"; return 1; }
+  sync_path "$tmp"
+  mv -f "$tmp" "$dir/session.meta" || { rm -f "$tmp"; return 1; }
+  sync_path "$dir"
+}
+
+set_session_status() {
+  local dir="$1" status="$2" tmp
+  [[ -f "$dir/session.meta" ]] || return 1
+  tmp="$(mktemp "$dir/.session.meta.XXXXXX")" || return 1
+  awk -v s="$status" 'index($0, "status=") == 1 { print "status=" s; next } { print }' "$dir/session.meta" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0600 "$tmp"
+  sync_path "$tmp"
+  mv -f "$tmp" "$dir/session.meta"
+  sync_path "$dir"
+}
+
+create_update_session() {
+  local stamp dir i
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 "$UPDATES_DIR"
+  dir="$UPDATES_DIR/$stamp"
+  i=1
+  while ! mkdir "$dir" 2>/dev/null; do
+    [[ -d "$dir" ]] || return 1
+    dir="$UPDATES_DIR/${stamp}-${i}"
+    i=$((i + 1))
+    [[ "$i" -le 100 ]] || return 1
+  done
+  chmod 0700 "$dir"
+  printf '%s\n' "$dir"
+}
+
+# latest_update_session ignores directories without metadata: an upgrade that
+# died mid-staging must never become the target of a bare `rollback`.
+latest_update_session() {
+  local dir
+  [[ -d "$UPDATES_DIR" ]] || return 0
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    [[ -f "$dir/session.meta" ]] || continue
+    printf '%s\n' "$dir"
+  done < <(find "$UPDATES_DIR" -mindepth 1 -maxdepth 1 -type d | sort) | tail -1
+}
+
+# verify_staged_binary_pair refuses to roll back to a copy that changed while
+# it was parked: a corrupted pair is worse than the binary now installed.
+verify_staged_binary_pair() {
+  local dir="$1" meta="$1/session.meta" want_bin want_side got
+  want_bin="$(session_meta_get "$meta" previous_binary_sha256 || true)"
+  want_side="$(session_meta_get "$meta" previous_sidecar_sha256 || true)"
+  [[ -n "$want_bin" && -n "$want_side" ]] || return 1
+  [[ -f "$dir/proxyctl.previous" && -f "$dir/proxyctl.previous.sha256" ]] || return 1
+  got="$(sha256_file "$dir/proxyctl.previous" 2>/dev/null || true)"
+  [[ "$got" == "$want_bin" ]] || return 1
+  got="$(sha256_file "$dir/proxyctl.previous.sha256" 2>/dev/null || true)"
+  [[ "$got" == "$want_side" ]] || return 1
+  return 0
+}
+
+restore_binary_pair() {
+  local dir="$1"
+  verify_staged_binary_pair "$dir" || return 1
+  replace_file_atomic "$dir/proxyctl.previous" "$PROXYCTL_BIN" 0755 || return 1
+  replace_file_atomic "$dir/proxyctl.previous.sha256" "${PROXYCTL_BIN}.sha256" 0644 || return 1
+  hash -r 2>/dev/null || true
+  return 0
+}
+
+restore_config_snapshot() {
+  local snapshot="$1"
+  proxyctl_supports_config_snapshot "$PROXYCTL_BIN" || return 1
+  "$PROXYCTL_BIN" restore "$snapshot"
+}
+
+# prune_successful_sessions keeps the newest successful session so a later
+# manual rollback still has a binary to go back to. Failed and interrupted
+# sessions are never removed automatically.
+prune_successful_sessions() {
+  local keep="$1" dir
+  [[ -d "$UPDATES_DIR" ]] || return 0
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    [[ "$dir" != "$keep" ]] || continue
+    if [[ "$(session_meta_get "$dir/session.meta" status || true)" == "success" ]]; then
+      rm -rf "$dir" || log_warn "Cannot prune the old update session $dir"
+    fi
+  done < <(find "$UPDATES_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+}
+
+UPDATE_TMP_FILES=()
+UPDATE_SESSION_DIR=""
+
+update_signal_cleanup() {
+  local f
+  for f in "${UPDATE_TMP_FILES[@]:-}"; do
+    [[ -n "$f" ]] && rm -f "$f"
+  done
+  if [[ -n "${UPDATE_SESSION_DIR:-}" && ! -f "${UPDATE_SESSION_DIR}/session.meta" ]]; then
+    rm -rf "$UPDATE_SESSION_DIR"
+    log_error "Interrupted before the update session was complete; the incomplete session was removed and nothing was changed."
+    exit 130
+  fi
+  log_error "Interrupted. The update session was kept so 'rollback' can still use it."
+  exit 130
+}
+
+cmd_update() {
+  if [[ $# -gt 0 ]]; then
+    echo "Unknown parameter for update: $1" >&2
+    usage
+    exit 1
+  fi
+
+  installer_preflight
+
+  local target_tag current_version session_dir snapshot=""
+  local arch_name asset url chk_url bin_tmp chk_tmp expected_sha256 expected_count
+  local prev_bin_sha prev_side_sha sidecar_tmp
+
+  [[ -x "$PROXYCTL_BIN" ]] || die "No proxyctl at $PROXYCTL_BIN. Run the installer first."
+  [[ -f "${PROXYCTL_BIN}.sha256" ]] || die "Missing ${PROXYCTL_BIN}.sha256; refusing to upgrade without a verifiable rollback copy."
+
+  target_tag="$(latest_proxyctl_tag || true)"
+  [[ -n "$target_tag" ]] || die "Cannot determine the latest proxyctl release."
+
+  case "$(uname -m)" in
+    x86_64|amd64) arch_name="amd64" ;;
+    aarch64|arm64) arch_name="arm64" ;;
+    *) die "Unsupported architecture for a proxyctl upgrade." ;;
+  esac
+
+  current_version="$("$PROXYCTL_BIN" version 2>/dev/null || true)"
+  log "Upgrading proxyctl ${current_version:-unknown} to $target_tag"
+
+  session_dir="$(create_update_session)" || die "Cannot create an update session directory."
+  UPDATE_SESSION_DIR="$session_dir"
+  # Armed before anything is staged: a signal now can only find a session that
+  # is still incomplete, and update_signal_cleanup removes exactly those.
+  trap update_signal_cleanup INT TERM
+
+  if proxyctl_supports_config_snapshot "$PROXYCTL_BIN"; then
+    snapshot="$session_dir/config-snapshot.tar.gz"
+    if ! "$PROXYCTL_BIN" backup --out "$snapshot" >/dev/null; then
+      rm -f "$snapshot"
+      die "Could not create the pre-upgrade configuration snapshot; the installed binary was not touched."
+    fi
+    chmod 0600 "$snapshot"
+    sync_path "$snapshot"
+  else
+    log_warn "The installed proxyctl has no backup/restore subcommands. This is a binary-only upgrade: no configuration snapshot is created and a failed upgrade can only roll the binary back."
+  fi
+
+  cp "$PROXYCTL_BIN" "$session_dir/proxyctl.previous"
+  cp "${PROXYCTL_BIN}.sha256" "$session_dir/proxyctl.previous.sha256"
+  chmod 0600 "$session_dir/proxyctl.previous" "$session_dir/proxyctl.previous.sha256"
+  sync_path "$session_dir/proxyctl.previous"
+  sync_path "$session_dir/proxyctl.previous.sha256"
+  prev_bin_sha="$(sha256_file "$session_dir/proxyctl.previous")" || die "Cannot hash the staged binary copy."
+  prev_side_sha="$(sha256_file "$session_dir/proxyctl.previous.sha256")" || die "Cannot hash the staged sidecar copy."
+
+  write_session_meta "$session_dir" \
+    "schema_version=1" \
+    "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "from_version=${current_version:-unknown}" \
+    "to_version=$target_tag" \
+    "previous_binary=proxyctl.previous" \
+    "previous_binary_sha256=$prev_bin_sha" \
+    "previous_sidecar=proxyctl.previous.sha256" \
+    "previous_sidecar_sha256=$prev_side_sha" \
+    "config_snapshot=$(basename "${snapshot:-}")" \
+    "status=in_progress" \
+    || die "Cannot record the update session metadata; the installed binary was not touched."
+
+  asset="proxyctl-linux-${arch_name}"
+  url="https://github.com/${PROXYCTL_REPOSITORY}/releases/download/${target_tag}/${asset}"
+  chk_url="https://github.com/${PROXYCTL_REPOSITORY}/releases/download/${target_tag}/checksums.txt"
+  bin_tmp="$(mktemp "/tmp/proxyctl-update.XXXXXX")"
+  UPDATE_TMP_FILES+=("$bin_tmp")
+  chk_tmp="$(mktemp "/tmp/proxyctl-update.checksums.XXXXXX")"
+  UPDATE_TMP_FILES+=("$chk_tmp")
+
+  if ! fetch_url "$url" "$bin_tmp" || ! fetch_url "$chk_url" "$chk_tmp"; then
+    rm -f "$bin_tmp" "$chk_tmp"
+    set_session_status "$session_dir" failed || true
+    die "Download failed; the installed proxyctl and its checksum file are unchanged."
+  fi
+
+  expected_count="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
+  expected_sha256="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
+  if [[ "$expected_count" != "1" || -z "$expected_sha256" ]]; then
+    rm -f "$bin_tmp" "$chk_tmp"
+    set_session_status "$session_dir" failed || true
+    die "No checksum entry for $asset; the installed proxyctl is unchanged."
+  fi
+  if [[ "$(sha256_file "$bin_tmp" 2>/dev/null || true)" != "$expected_sha256" ]]; then
+    rm -f "$bin_tmp" "$chk_tmp"
+    set_session_status "$session_dir" failed || true
+    die "Checksum mismatch for the downloaded proxyctl; the installed proxyctl is unchanged."
+  fi
+  rm -f "$chk_tmp"
+
+  sidecar_tmp="$(mktemp "/tmp/proxyctl-update.sidecar.XXXXXX")"
+  UPDATE_TMP_FILES+=("$sidecar_tmp")
+  printf '%s\n' "$expected_sha256" > "$sidecar_tmp"
+
+  if ! replace_file_atomic "$bin_tmp" "$PROXYCTL_BIN" 0755; then
+    rm -f "$bin_tmp" "$sidecar_tmp"
+    set_session_status "$session_dir" failed || true
+    die "Could not install the new proxyctl; the previous binary is still in place."
+  fi
+  if ! replace_file_atomic "$sidecar_tmp" "${PROXYCTL_BIN}.sha256" 0644; then
+    rm -f "$bin_tmp" "$sidecar_tmp"
+    log_error "Could not install the new checksum file; rolling the binary back."
+    restore_binary_pair "$session_dir" || die "The binary rollback failed as well. $PROXYCTL_BIN and its checksum file need manual attention; the session is kept at $session_dir."
+    set_session_status "$session_dir" failed || true
+    die "Upgrade aborted; the previous proxyctl and checksum file were restored."
+  fi
+  rm -f "$bin_tmp" "$sidecar_tmp"
+  UPDATE_TMP_FILES=()
+  hash -r 2>/dev/null || true
+
+  log "Running the health check with the new binary"
+  if run_proxyctl_health "$PROXYCTL_BIN"; then
+    if set_session_status "$session_dir" success; then
+      prune_successful_sessions "$session_dir"
+    else
+      log_warn "Cannot mark the update session successful; older sessions were left alone."
+    fi
+    log "proxyctl upgraded to $target_tag. The previous binary is kept at $session_dir for a manual rollback."
+    trap - INT TERM
+    return 0
+  fi
+
+  log_error "The health check failed after the upgrade; rolling back."
+  if [[ -n "$snapshot" ]]; then
+    if ! restore_config_snapshot "$snapshot"; then
+      set_session_status "$session_dir" rollback_failed || true
+      die "Restoring the configuration snapshot failed. The system is in an uncertain state; the session is kept at $session_dir."
+    fi
+    log "Configuration restored from the upgrade snapshot."
+  fi
+  if ! restore_binary_pair "$session_dir"; then
+    set_session_status "$session_dir" rollback_failed || true
+    die "Restoring the previous proxyctl failed. $PROXYCTL_BIN needs manual attention; the session is kept at $session_dir."
+  fi
+  set_session_status "$session_dir" rolled_back || true
+  trap - INT TERM
+  log_error "The upgrade was rolled back: the previous proxyctl, its checksum file and the configuration are back in place."
+  return 1
+}
+
+cmd_rollback() {
+  local target="" session="" snapshot=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to)
+        [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing value for --to" >&2; usage; exit 1; }
+        target="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown parameter for rollback: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  installer_preflight
+
+  if [[ -n "$target" ]]; then
+    if [[ "$target" != */* ]]; then
+      case "$target" in
+        ""|.|..) die "Invalid --to value '$target'." ;;
+      esac
+    fi
+    if [[ "$target" != */* && -d "$UPDATES_DIR/$target" ]]; then
+      session="$UPDATES_DIR/$target"
+    elif [[ -f "$BACKUPS_DIR/$target" ]]; then
+      snapshot="$BACKUPS_DIR/$target"
+    elif [[ -f "$target" ]]; then
+      snapshot="$target"
+    else
+      die "No update session or backup archive named '$target'."
+    fi
+  else
+    session="$(latest_update_session)"
+    [[ -n "$session" ]] || die "There is no update session to roll back. Pass --to <archive> to restore a configuration backup instead."
+  fi
+
+  if [[ -n "$snapshot" ]]; then
+    restore_config_snapshot "$snapshot" || die "Restoring the configuration from $snapshot failed."
+    log "Configuration restored from $snapshot. The proxyctl binary was not changed."
+    return 0
+  fi
+
+  local snapshot_name
+  snapshot_name="$(session_meta_get "$session/session.meta" config_snapshot || true)"
+  if [[ -n "$snapshot_name" && -f "$session/$snapshot_name" ]]; then
+    restore_config_snapshot "$session/$snapshot_name" || die "Restoring the configuration from the session snapshot failed; the binary was not changed."
+    log "Configuration restored from the session snapshot."
+  fi
+
+  if [[ -f "$session/proxyctl.previous" ]]; then
+    restore_binary_pair "$session" || die "Restoring the previous proxyctl failed; $PROXYCTL_BIN needs manual attention."
+    log "The previous proxyctl and its checksum file were restored from $session."
+  else
+    log_warn "This session has no staged binary: only the configuration was rolled back, the proxyctl binary is unchanged."
+  fi
+  return 0
+}
+
+main() {
+  case "${1:-}" in
+    update)
+      shift
+      cmd_update "$@"
+      ;;
+    rollback)
+      shift
+      cmd_rollback "$@"
+      ;;
+    install)
+      shift
+      cmd_install "$@"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      cmd_install "$@"
+      ;;
+  esac
+}
+
+main "$@"

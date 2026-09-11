@@ -37,6 +37,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdMonitor(args[1:], stdout, stderr)
 	case "health":
 		return cmdHealth(args[1:], stdout, stderr)
+	case "backup":
+		return cmdBackup(args[1:], stdout, stderr)
+	case "restore":
+		return cmdRestore(args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, Version)
 		return 0
@@ -54,6 +58,8 @@ func usage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "  subscription build --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  health   [--json] [--verbose] [--domain DOMAIN] [--remote --nodes PATH]")
 	fmt.Fprintln(stderr, "  monitor  [pause|resume|status]")
+	fmt.Fprintln(stderr, "  backup   [--out PATH] [--keep N] | list")
+	fmt.Fprintln(stderr, "  restore  <archive-path> [--dry-run] [--no-restart]")
 	fmt.Fprintln(stderr, "  version  -- show version")
 	return 2
 }
