@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SC2016: the harness is assembled from single-quoted source lines on purpose.
-# SC2329: the stubs are invoked indirectly, by the production functions.
+# SC2317/SC2329: the stubs are invoked indirectly, by the production functions.
+# Which of the two a given shellcheck reports depends on its version (0.9
+# says SC2317, 0.11 says SC2329), so both are listed.
 # Subshell-scope checks (SC2030/SC2031) stay on: this suite depends on them.
-# shellcheck disable=SC2016,SC2329
+# shellcheck disable=SC2016,SC2317,SC2329
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
