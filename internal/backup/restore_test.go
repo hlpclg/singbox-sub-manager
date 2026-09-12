@@ -459,6 +459,283 @@ func TestRestore_RejectsManifestContentMismatch(t *testing.T) {
 	}
 }
 
+// corruptGzipHeader flips the gzip magic number so gzip.NewReader rejects the
+// file outright, the failure a real machine hit with a corrupted download.
+func corruptGzipHeader(t *testing.T, archive string) string {
+	t.Helper()
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	data[0] ^= 0xff
+	out := filepath.Join(t.TempDir(), "bad-header.tar.gz")
+	if err := os.WriteFile(out, data, 0600); err != nil {
+		t.Fatalf("write corrupted archive: %v", err)
+	}
+	return out
+}
+
+// truncatedGzipHeader cuts the file off inside the fixed 10-byte gzip header,
+// short of a full header but past empty.
+func truncatedGzipHeader(t *testing.T, archive string) string {
+	t.Helper()
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "truncated-header.tar.gz")
+	if err := os.WriteFile(out, data[:4], 0600); err != nil {
+		t.Fatalf("write truncated archive: %v", err)
+	}
+	return out
+}
+
+// truncatedGzipBody keeps a valid gzip header but cuts the compressed stream
+// short, so the header parses fine and the failure only surfaces once tar
+// starts reading decompressed bytes.
+func truncatedGzipBody(t *testing.T, archive string) string {
+	t.Helper()
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if len(data) < 40 {
+		t.Fatalf("archive too small to truncate meaningfully: %d bytes", len(data))
+	}
+	out := filepath.Join(t.TempDir(), "truncated-body.tar.gz")
+	if err := os.WriteFile(out, data[:len(data)-20], 0600); err != nil {
+		t.Fatalf("write truncated archive: %v", err)
+	}
+	return out
+}
+
+// corruptDeflateBody keeps a valid 10-byte gzip header but replaces the first
+// byte of the compressed stream with an invalid DEFLATE block type, so gzip
+// accepts the header and decompression itself fails with
+// flate.CorruptInputError instead of a truncation or header error.
+func corruptDeflateBody(t *testing.T, archive string) string {
+	t.Helper()
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	const gzipHeaderLen = 10
+	if len(data) <= gzipHeaderLen {
+		t.Fatalf("archive too small to hold a compressed body: %d bytes", len(data))
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	out[gzipHeaderLen] = 0xff
+	path := filepath.Join(t.TempDir(), "bad-deflate.tar.gz")
+	if err := os.WriteFile(path, out, 0600); err != nil {
+		t.Fatalf("write corrupted archive: %v", err)
+	}
+	return path
+}
+
+// corruptTarStructure wraps garbage bytes in a well-formed gzip stream, so
+// gzip accepts the file but the first tar header is unparseable.
+func corruptTarStructure(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "bad-tar.tar.gz")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	if _, err := gz.Write([]byte("this is not a tar payload, just enough garbage bytes to fill a header block")); err != nil {
+		t.Fatalf("write garbage payload: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return path
+}
+
+// corruptManifestJSON produces an otherwise well-formed archive whose
+// manifest.json entry is not valid JSON.
+func corruptManifestJSON(t *testing.T) string {
+	t.Helper()
+	_, entries := validParts(t)
+	entries[0] = rawEntry{name: ManifestName, data: "{not valid json"}
+	return writeRawArchive(t, filepath.Join(t.TempDir(), "bad-manifest.tar.gz"), entries)
+}
+
+// truncatedManifestBody cuts an archive containing only the manifest entry
+// short, so the truncation lands inside the one entry ReadManifest actually
+// reads (unlike truncatedGzipBody on a multi-file archive, which only cuts
+// the last few bytes and can land entirely inside tar's trailing zero blocks,
+// staying invisible to the cheap listing path by design). Compressed bytes
+// don't map linearly onto the plaintext they decode to, so this cuts a
+// fraction of the compressed stream rather than a fixed byte count, landing
+// inside the manifest's own compressed content across archive sizes.
+func truncatedManifestBody(t *testing.T) string {
+	t.Helper()
+	_, entries := validParts(t)
+	full := writeRawArchive(t, filepath.Join(t.TempDir(), "manifest-only.tar.gz"), entries[:1])
+	data, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "truncated-manifest.tar.gz")
+	if err := os.WriteFile(out, data[:len(data)*9/10], 0600); err != nil {
+		t.Fatalf("write truncated archive: %v", err)
+	}
+	return out
+}
+
+type archiveFormatCase struct {
+	name  string
+	build func(t *testing.T) string
+}
+
+// archiveFormatCases enumerates the ways an archive's gzip/tar container or
+// embedded manifest can be malformed, independent of its declared content.
+func archiveFormatCases(t *testing.T) []archiveFormatCase {
+	t.Helper()
+	valid := validArchive(t)
+	return []archiveFormatCase{
+		{"corrupt gzip header", func(t *testing.T) string { return corruptGzipHeader(t, valid) }},
+		{"truncated gzip header", func(t *testing.T) string { return truncatedGzipHeader(t, valid) }},
+		{"truncated gzip body", func(t *testing.T) string { return truncatedGzipBody(t, valid) }},
+		{"corrupt deflate body", func(t *testing.T) string { return corruptDeflateBody(t, valid) }},
+		{"corrupt tar structure", corruptTarStructure},
+		{"corrupt manifest json", corruptManifestJSON},
+	}
+}
+
+// readManifestFormatCases mirrors archiveFormatCases but swaps in a
+// truncation that actually lands inside the manifest entry, since ReadManifest
+// only reads that one entry and stops.
+func readManifestFormatCases(t *testing.T) []archiveFormatCase {
+	t.Helper()
+	valid := validArchive(t)
+	return []archiveFormatCase{
+		{"corrupt gzip header", func(t *testing.T) string { return corruptGzipHeader(t, valid) }},
+		{"truncated gzip header", func(t *testing.T) string { return truncatedGzipHeader(t, valid) }},
+		{"truncated manifest body", truncatedManifestBody},
+		{"corrupt deflate body", func(t *testing.T) string { return corruptDeflateBody(t, valid) }},
+		{"corrupt tar structure", corruptTarStructure},
+		{"corrupt manifest json", corruptManifestJSON},
+	}
+}
+
+// TestRestore_RejectsCorruptArchiveContainer is the regression test for the
+// on-host finding: a corrupted gzip header (and its adjacent tar/manifest
+// parsing failures) must be classified the same way ErrChecksumMismatch and
+// friends are, not fall through as a generic I/O failure. Every case must be
+// rejected before the lock is taken and before anything is written.
+func TestRestore_RejectsCorruptArchiveContainer(t *testing.T) {
+	for _, tc := range archiveFormatCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := tc.build(t)
+			dest := t.TempDir()
+			before := fingerprint(t, dest)
+			l := &fakeLocker{}
+
+			_, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest, Lock: l})
+			if !errors.Is(err, ErrArchiveFormat) {
+				t.Fatalf("err = %v, want ErrArchiveFormat", err)
+			}
+			if !sameFingerprint(before, fingerprint(t, dest)) {
+				t.Error("a rejected archive changed the destination")
+			}
+			if l.tryCalls != 0 {
+				t.Errorf("a rejected archive still reached for the lock (%d TryLock calls)", l.tryCalls)
+			}
+		})
+	}
+}
+
+// TestRestore_DryRun_RejectsCorruptArchiveContainer covers the dry-run path
+// separately: it shares readArchive with the real restore, but a regression
+// that only checked the writing path would miss it going unrejected here.
+func TestRestore_DryRun_RejectsCorruptArchiveContainer(t *testing.T) {
+	for _, tc := range archiveFormatCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := tc.build(t)
+			dest := t.TempDir()
+			before := fingerprint(t, dest)
+
+			res, err := Restore(context.Background(), archive, RestoreOptions{DryRun: true, DestRoot: dest})
+			if !errors.Is(err, ErrArchiveFormat) {
+				t.Fatalf("err = %v, want ErrArchiveFormat", err)
+			}
+			if len(res.Preview) != 0 {
+				t.Errorf("Preview = %v, want none for a rejected archive", res.Preview)
+			}
+			if !sameFingerprint(before, fingerprint(t, dest)) {
+				t.Error("a rejected dry-run changed the destination")
+			}
+		})
+	}
+}
+
+// TestVerify_RejectsCorruptArchiveContainer confirms Verify, which shares
+// readArchive with Restore, gets the same classification.
+func TestVerify_RejectsCorruptArchiveContainer(t *testing.T) {
+	archive := corruptGzipHeader(t, validArchive(t))
+	if _, err := Verify(context.Background(), archive); !errors.Is(err, ErrArchiveFormat) {
+		t.Fatalf("err = %v, want ErrArchiveFormat", err)
+	}
+}
+
+// TestReadManifest_RejectsCorruptArchiveContainer confirms the cheap listing
+// path (`backup list`), which opens the archive independently of Restore and
+// Verify, classifies the same container failures the same way.
+func TestReadManifest_RejectsCorruptArchiveContainer(t *testing.T) {
+	for _, tc := range readManifestFormatCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := tc.build(t)
+			if _, err := ReadManifest(context.Background(), archive); !errors.Is(err, ErrArchiveFormat) {
+				t.Fatalf("err = %v, want ErrArchiveFormat", err)
+			}
+		})
+	}
+}
+
+// TestRestore_MissingOrUnreadableArchiveIsNotArchiveFormat guards the other
+// side of the fix: a missing file or a permission failure opening the
+// archive is a plain I/O problem, not a verdict on the archive's own bytes,
+// and must not be swept into the same classification as a corrupt container.
+func TestRestore_MissingOrUnreadableArchiveIsNotArchiveFormat(t *testing.T) {
+	dest := t.TempDir()
+
+	t.Run("missing file", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "does-not-exist.tar.gz")
+		_, err := Restore(context.Background(), missing, RestoreOptions{DestRoot: dest})
+		if err == nil {
+			t.Fatal("Restore: want an error for a missing archive")
+		}
+		if errors.Is(err, ErrArchiveFormat) {
+			t.Errorf("err = %v, misclassified a missing file as an invalid archive", err)
+		}
+		if !os.IsNotExist(errors.Unwrap(err)) {
+			t.Errorf("err = %v, want it to unwrap to a not-exist error", err)
+		}
+	})
+
+	t.Run("permission denied", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses file permissions")
+		}
+		archive := validArchive(t)
+		if err := os.Chmod(archive, 0000); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		defer os.Chmod(archive, 0600)
+
+		_, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+		if err == nil {
+			t.Fatal("Restore: want an error for an unreadable archive")
+		}
+		if errors.Is(err, ErrArchiveFormat) {
+			t.Errorf("err = %v, misclassified a permission failure as an invalid archive", err)
+		}
+	})
+}
+
 func TestRestore_DryRunNoWrites(t *testing.T) {
 	archive := validArchive(t)
 	dest := newDest(t, []destFile{

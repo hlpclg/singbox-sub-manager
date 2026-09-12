@@ -648,6 +648,7 @@ func reportRestoreError(err error, stderr io.Writer) int {
 	case errors.Is(err, backup.ErrUnsafePath),
 		errors.Is(err, backup.ErrChecksumMismatch),
 		errors.Is(err, backup.ErrArchiveContentMismatch),
+		errors.Is(err, backup.ErrArchiveFormat),
 		errors.Is(err, backup.ErrUnsupportedSchema),
 		errors.Is(err, backup.ErrUnsupportedSourceType):
 		return exitArchiveInvalid

@@ -645,6 +645,10 @@ func TestRestoreCmd_ArchiveRejectionExitCode(t *testing.T) {
 		{"unsafe path", fmt.Errorf("wrapped: %w", backup.ErrUnsafePath), exitArchiveInvalid, 0},
 		{"checksum", fmt.Errorf("wrapped: %w", backup.ErrChecksumMismatch), exitArchiveInvalid, 0},
 		{"content mismatch", fmt.Errorf("wrapped: %w", backup.ErrArchiveContentMismatch), exitArchiveInvalid, 0},
+		// Regression for the on-host finding: a corrupted gzip/tar container
+		// or manifest must classify the same as the other archive rejections
+		// above, not fall through to the generic I/O exit code below.
+		{"archive format", fmt.Errorf("wrapped: %w", backup.ErrArchiveFormat), exitArchiveInvalid, 0},
 		{"schema", fmt.Errorf("wrapped: %w", backup.ErrUnsupportedSchema), exitArchiveInvalid, 0},
 		// An I/O failure can leave half a restore behind, so that one is
 		// undone with the image.
@@ -671,6 +675,107 @@ func TestRestoreCmd_ArchiveRejectionExitCode(t *testing.T) {
 				t.Errorf("lock taken %d times, released %d", h.lock.tryCalls, h.lock.unlockCalls)
 			}
 		})
+	}
+}
+
+// TestRestoreCmd_CorruptGzipArchiveExitsArchiveInvalid is the end-to-end
+// regression for the on-host finding: it runs the real internal/backup.Restore
+// against an actual corrupted archive file, rather than a mocked error, so a
+// classification gap in that package (not just in reportRestoreError's
+// switch) would still be caught here.
+func TestRestoreCmd_CorruptGzipArchiveExitsArchiveInvalid(t *testing.T) {
+	h := newHarness(t)
+	h.env.restore = backup.Restore
+	h.install(t)
+
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := os.WriteFile(archive, []byte("not a valid gzip archive"), 0600); err != nil {
+		t.Fatalf("write corrupt archive: %v", err)
+	}
+
+	code, stdout, stderr := runCmd(t, "restore", archive)
+	if code != exitArchiveInvalid {
+		t.Fatalf("exit = %d, want %d (stdout %q, stderr %q)", code, exitArchiveInvalid, stdout, stderr)
+	}
+	entries, err := os.ReadDir(h.env.destRoot)
+	if err != nil {
+		t.Fatalf("read destRoot: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destRoot has %v, want a rejected archive to write nothing", entries)
+	}
+	// newHarness's snapshotRoot is itself a t.TempDir(), which testing
+	// creates up front, so its absence is not the signal; an untouched
+	// snapshot root has nothing inside it.
+	snapEntries, err := os.ReadDir(h.env.snapshotRoot)
+	if err != nil {
+		t.Fatalf("read snapshotRoot: %v", err)
+	}
+	if len(snapEntries) != 0 {
+		t.Errorf("snapshotRoot has %v, want a rejected archive to capture no pre-restore image", snapEntries)
+	}
+	if len(h.restarted) != 0 {
+		t.Errorf("a rejected archive restarted %v", h.restarted)
+	}
+}
+
+// TestRestoreCmd_CorruptGzipArchiveDryRunExitsArchiveInvalid covers the same
+// real corrupted archive through --dry-run, which shares readArchive with the
+// real restore but takes a different command path to the same exit code.
+func TestRestoreCmd_CorruptGzipArchiveDryRunExitsArchiveInvalid(t *testing.T) {
+	h := newHarness(t)
+	h.env.restore = backup.Restore
+	h.install(t)
+
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	if err := os.WriteFile(archive, []byte("not a valid gzip archive"), 0600); err != nil {
+		t.Fatalf("write corrupt archive: %v", err)
+	}
+
+	code, stdout, stderr := runCmd(t, "restore", "--dry-run", archive)
+	if code != exitArchiveInvalid {
+		t.Fatalf("exit = %d, want %d (stdout %q, stderr %q)", code, exitArchiveInvalid, stdout, stderr)
+	}
+	if h.lock.tryCalls != 0 {
+		t.Errorf("a rejected dry-run took the recovery lock %d times", h.lock.tryCalls)
+	}
+	entries, err := os.ReadDir(h.env.destRoot)
+	if err != nil {
+		t.Fatalf("read destRoot: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destRoot has %v, want a rejected dry-run to write nothing", entries)
+	}
+}
+
+// TestRestoreCmd_CorruptDeflateBodyExitsArchiveInvalid is the regression for
+// the review finding on a corrupted gzip header (7606138): a valid gzip
+// header wrapping corrupt DEFLATE data fails later, inside decompression
+// (flate.CorruptInputError), not at gzip.NewReader, and must classify the
+// same way.
+func TestRestoreCmd_CorruptDeflateBodyExitsArchiveInvalid(t *testing.T) {
+	h := newHarness(t)
+	h.env.restore = backup.Restore
+	h.install(t)
+
+	// A minimal valid 10-byte gzip header (no name/comment/extra flags)
+	// followed by one byte that is not a legal DEFLATE block type.
+	archive := filepath.Join(t.TempDir(), "backup.tar.gz")
+	body := []byte{0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff}
+	if err := os.WriteFile(archive, body, 0600); err != nil {
+		t.Fatalf("write corrupt archive: %v", err)
+	}
+
+	code, stdout, stderr := runCmd(t, "restore", archive)
+	if code != exitArchiveInvalid {
+		t.Fatalf("exit = %d, want %d (stdout %q, stderr %q)", code, exitArchiveInvalid, stdout, stderr)
+	}
+	entries, err := os.ReadDir(h.env.destRoot)
+	if err != nil {
+		t.Fatalf("read destRoot: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("destRoot has %v, want a rejected archive to write nothing", entries)
 	}
 }
 

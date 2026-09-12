@@ -2,6 +2,7 @@ package backup
 
 import (
 	"archive/tar"
+	"compress/flate"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -24,6 +25,12 @@ var (
 	// ErrArchiveContentMismatch reports that the archive holds entries the
 	// manifest does not declare, or is missing entries it does declare.
 	ErrArchiveContentMismatch = errors.New("backup: archive content does not match its manifest")
+	// ErrArchiveFormat reports that the archive container itself is not a
+	// valid gzip/tar package (corrupt or truncated gzip framing, an
+	// unparseable tar header, or a manifest.json entry that is not valid
+	// JSON). It is distinct from ErrArchiveContentMismatch, which covers a
+	// well-formed archive holding the wrong entries.
+	ErrArchiveFormat = errors.New("backup: archive is not a valid package")
 )
 
 // Stable restore failure reasons, reported per path in FailureReasons.
@@ -118,6 +125,9 @@ func ReadManifest(ctx context.Context, archivePath string) (Manifest, error) {
 			return Manifest{}, fmt.Errorf("%w: no %s", ErrArchiveContentMismatch, ManifestName)
 		}
 		if err != nil {
+			if isArchiveFormatError(err) {
+				return Manifest{}, fmt.Errorf("%w: %v", ErrArchiveFormat, err)
+			}
 			return Manifest{}, fmt.Errorf("backup: read archive: %w", err)
 		}
 		if hdr.Name != ManifestName {
@@ -125,6 +135,9 @@ func ReadManifest(ctx context.Context, archivePath string) (Manifest, error) {
 		}
 		data, err := io.ReadAll(tr)
 		if err != nil {
+			if isArchiveFormatError(err) {
+				return Manifest{}, fmt.Errorf("%w: %v", ErrArchiveFormat, err)
+			}
 			return Manifest{}, fmt.Errorf("backup: read %s: %w", ManifestName, err)
 		}
 		return decodeManifest(data)
@@ -331,15 +344,38 @@ func openArchive(archivePath string) (*os.File, *gzip.Reader, *tar.Reader, error
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		f.Close()
+		if isArchiveFormatError(err) {
+			return nil, nil, nil, fmt.Errorf("%w: %v", ErrArchiveFormat, err)
+		}
 		return nil, nil, nil, fmt.Errorf("backup: read archive: %w", err)
 	}
 	return f, gz, tar.NewReader(gz), nil
 }
 
+// isArchiveFormatError reports whether err is one of the specific, stable
+// errors gzip and tar return for malformed framing (a bad magic number or
+// checksum, corrupt DEFLATE data past a valid gzip header, an unparseable
+// tar header, or a stream that ends before its declared content does) — as
+// opposed to a filesystem, permission, or cancellation failure that merely
+// surfaced while reading through them. Those stdlib errors are propagated
+// unwrapped on a genuine I/O failure from the underlying reader, so this
+// check does not need to special-case them.
+func isArchiveFormatError(err error) bool {
+	if errors.Is(err, gzip.ErrHeader) ||
+		errors.Is(err, gzip.ErrChecksum) ||
+		errors.Is(err, tar.ErrHeader) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) {
+		return true
+	}
+	var flateErr flate.CorruptInputError
+	return errors.As(err, &flateErr)
+}
+
 func decodeManifest(data []byte) (Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
-		return Manifest{}, fmt.Errorf("backup: decode %s: %w", ManifestName, err)
+		return Manifest{}, fmt.Errorf("%w: decode %s: %v", ErrArchiveFormat, ManifestName, err)
 	}
 	if err := m.Validate(); err != nil {
 		return Manifest{}, err
@@ -374,6 +410,9 @@ func readArchive(ctx context.Context, archivePath string) (Manifest, map[string]
 			break
 		}
 		if err != nil {
+			if isArchiveFormatError(err) {
+				return Manifest{}, nil, fmt.Errorf("%w: %v", ErrArchiveFormat, err)
+			}
 			return Manifest{}, nil, fmt.Errorf("backup: read archive: %w", err)
 		}
 		if hdr.Typeflag != tar.TypeReg {
@@ -385,6 +424,9 @@ func readArchive(ctx context.Context, archivePath string) (Manifest, map[string]
 			}
 			manifestData, err = io.ReadAll(tr)
 			if err != nil {
+				if isArchiveFormatError(err) {
+					return Manifest{}, nil, fmt.Errorf("%w: %v", ErrArchiveFormat, err)
+				}
 				return Manifest{}, nil, fmt.Errorf("backup: read %s: %w", ManifestName, err)
 			}
 			haveManifest = true
@@ -398,6 +440,9 @@ func readArchive(ctx context.Context, archivePath string) (Manifest, map[string]
 		}
 		data, err := io.ReadAll(tr)
 		if err != nil {
+			if isArchiveFormatError(err) {
+				return Manifest{}, nil, fmt.Errorf("%w: %v", ErrArchiveFormat, err)
+			}
 			return Manifest{}, nil, fmt.Errorf("backup: read %s: %w", hdr.Name, err)
 		}
 		sum := sha256.Sum256(data)
