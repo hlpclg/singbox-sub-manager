@@ -1192,23 +1192,6 @@ func TestReadManifest_Cancellation(t *testing.T) {
 	}
 }
 
-func TestResolveUnderRoot_KeepsPathsInside(t *testing.T) {
-	root := t.TempDir()
-	if _, err := resolveUnderRoot(root, "../escape"); !errors.Is(err, ErrUnsafePath) {
-		t.Errorf("traversal was accepted")
-	}
-	if _, err := resolveUnderRoot(root, "/etc/passwd"); !errors.Is(err, ErrUnsafePath) {
-		t.Errorf("absolute path was accepted")
-	}
-	got, err := resolveUnderRoot(root, "etc/caddy/Caddyfile")
-	if err != nil {
-		t.Fatalf("resolveUnderRoot: %v", err)
-	}
-	if want := filepath.Join(root, "etc/caddy/Caddyfile"); got != want {
-		t.Errorf("resolved = %q, want %q", got, want)
-	}
-}
-
 func TestRestore_RejectsSymlinkedParentDirectory(t *testing.T) {
 	archive := validArchive(t)
 	base := t.TempDir()

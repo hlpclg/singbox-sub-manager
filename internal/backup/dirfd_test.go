@@ -11,10 +11,12 @@ package backup
 // and hookAfterMkdirat are process-global test seams.
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -640,5 +642,140 @@ func TestResolveUnderTrustedRoot_R3_ResolvesToTheSameObjectUnderRoot(t *testing.
 	if uint64(gotSt.Dev) != uint64(wantSt.Dev) || uint64(gotSt.Ino) != uint64(wantSt.Ino) {
 		t.Fatalf("resolved object (dev=%d ino=%d) != filepath.Join(root, ...) (dev=%d ino=%d)",
 			gotSt.Dev, gotSt.Ino, wantSt.Dev, wantSt.Ino)
+	}
+}
+
+// --- T5: trusted roots follow symlinks, exactly like v0.7 (design §7.1) ---
+//
+// Static layout, no hook: each subtest gives one trusted root as (or behind)
+// a symbolic link and confirms the operation succeeds exactly as it would
+// against the resolved real directory — same result, same permissions
+// (design §5) — and that the bytes actually land at the resolved location,
+// not beside it. The shared mutation for this row (openTrustedRoot changed
+// to reject a symlinked root outright, from `/` with O_NOFOLLOW at every
+// level) is applied once against openTrustedRoot and confirmed to break all
+// four subtests below; see the plan doc's Task 4 completion record for the
+// mutation-testing evidence (this file records the tests, not the mutation
+// itself, which is never committed).
+
+func TestT5_BackupDirItselfIsASymlink(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-backups")
+	if err := os.MkdirAll(real, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(base, "backups")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	src := newSource(t, defaultSource)
+
+	m, err := Create(context.Background(), CreateOptions{SourceRoot: src, BackupDir: link, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !strings.HasPrefix(m.ArchivePath, link) {
+		t.Errorf("archive path = %q, want it reported through the given BackupDir %q (v0.7 parity)", m.ArchivePath, link)
+	}
+	if _, err := os.Stat(m.ArchivePath); err != nil {
+		t.Errorf("archive not readable through the symlink: %v", err)
+	}
+	if names := dirNames(t, real); len(names) != 1 {
+		t.Errorf("resolved directory %s holds %v, want exactly the one archive", real, names)
+	}
+	info, err := os.Stat(real)
+	if err != nil {
+		t.Fatalf("stat resolved dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != backupDirMode {
+		t.Errorf("resolved backup dir mode = %o, want %o", got, backupDirMode)
+	}
+}
+
+func TestT5_SnapshotRootIsASymlink(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-snapshots")
+	if err := os.MkdirAll(real, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(base, "snapshots")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	dest := newSource(t, []sourceFile{{caddyPath, "original\n", 0640}})
+
+	snap, err := CaptureSnapshot(context.Background(), CaptureOptions{
+		DestRoot: dest, SnapshotRoot: link, Paths: []string{caddyPath}, Now: fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("CaptureSnapshot: %v", err)
+	}
+	if !strings.HasPrefix(snap.Dir, link) {
+		t.Errorf("snapshot dir = %q, want it reported through the given SnapshotRoot %q (v0.7 parity)", snap.Dir, link)
+	}
+	if names := dirNames(t, real); len(names) != 1 {
+		t.Errorf("resolved directory %s holds %v, want exactly the one transaction directory", real, names)
+	}
+	if _, err := LoadSnapshot(snap.Dir); err != nil {
+		t.Errorf("LoadSnapshot through the symlink: %v", err)
+	}
+}
+
+func TestT5_OutParentPathHasASymlinkAncestor(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-ancestor")
+	link := filepath.Join(base, "linked-ancestor")
+	if err := os.MkdirAll(real, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	src := newSource(t, defaultSource)
+	// --out's own parent directory is real (a plain, non-symlink directory),
+	// but an ANCESTOR of that parent (link) is a symlink — a different case
+	// from T5's other three rows, which each symlink the trusted root
+	// itself. openTrustedRoot's os.Open(dir) resolves the whole given path
+	// (including any symlinked ancestor) exactly as v0.7 did.
+	outDir := filepath.Join(link, "out")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	out := filepath.Join(outDir, "custom.tar.gz")
+
+	m, err := Create(context.Background(), CreateOptions{SourceRoot: src, Out: out, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if m.ArchivePath != out {
+		t.Errorf("archive path = %q, want %q", m.ArchivePath, out)
+	}
+	if _, err := os.Stat(filepath.Join(real, "out", "custom.tar.gz")); err != nil {
+		t.Errorf("archive not found at the resolved location: %v", err)
+	}
+}
+
+func TestT5_DestRootItselfIsASymlink(t *testing.T) {
+	archive := validArchive(t)
+	base := t.TempDir()
+	real := filepath.Join(base, "real-dest")
+	link := filepath.Join(base, "dest")
+	if err := os.MkdirAll(real, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	l := &fakeLocker{}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: link, Lock: l})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if len(res.Failed) != 0 {
+		t.Errorf("failed = %v, want none", res.Failed)
+	}
+	if _, err := os.Stat(filepath.Join(real, filepath.FromSlash(caddyPath))); err != nil {
+		t.Errorf("restored file not found at the resolved location: %v", err)
 	}
 }

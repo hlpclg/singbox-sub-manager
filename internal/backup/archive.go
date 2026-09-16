@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,8 +16,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"syscall"
+	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // The fixed backup path set from the design document, section 4. All paths are
@@ -81,8 +84,13 @@ type payload struct {
 
 // Create packs the fixed path set into a gzip-compressed tar archive and
 // returns its manifest. The archive is staged in a same-directory temporary
-// file, fsynced and atomically renamed, so a failed run never leaves a file
-// that could be mistaken for a complete archive.
+// file, fsynced and atomically renamed. A run that fails before the rename
+// leaves nothing that could be mistaken for a complete archive; one whose
+// only failure is after a successful rename (closing the fd, or fsyncing
+// the output directory) leaves the archive itself in place — its content is
+// already complete and correctly named, only the directory entry's
+// durability across a crash is unconfirmed — and does not run the
+// reservation cleanup against it (see writeArchive's published return).
 func Create(ctx context.Context, opts CreateOptions) (Manifest, error) {
 	if opts.SourceRoot == "" {
 		opts.SourceRoot = "/"
@@ -96,7 +104,13 @@ func Create(ctx context.Context, opts CreateOptions) (Manifest, error) {
 	}
 	createdAt := nowFn().UTC()
 
-	payloads, skipped, reasons, err := collect(ctx, opts.SourceRoot)
+	sourceRootFd, err := openTrustedRoot(opts.SourceRoot, false, 0)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("backup: open source root: %w", err)
+	}
+	defer sourceRootFd.Close()
+
+	payloads, skipped, reasons, err := collect(ctx, sourceRootFd)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -116,21 +130,43 @@ func Create(ctx context.Context, opts CreateOptions) (Manifest, error) {
 		return Manifest{}, err
 	}
 
-	dest, release, err := reserveDestination(opts, createdAt)
+	outDirFd, leaf, fullPath, reservedSelf, release, err := reserveDestination(opts, createdAt)
 	if err != nil {
 		return Manifest{}, err
 	}
-	if err := writeArchiveFn(ctx, dest, m, payloads); err != nil {
-		release()
+	defer outDirFd.Close()
+	published, err := writeArchiveFn(ctx, outDirFd, leaf, m, payloads)
+	if err != nil {
+		// published: the rename already succeeded — release() must not run
+		// against the archive this call itself just finished writing (it
+		// would either refuse via a §6.7 identity mismatch, since the
+		// reservation's fd no longer matches what the name now points to,
+		// or — for a hypothetical bare-Unlinkat release — delete it
+		// outright). release() needs reservedSelf's fd still open for that
+		// identity check, so close it only after release() has run.
+		if !published {
+			if w := release(); w != "" {
+				err = fmt.Errorf("%w (%s)", err, w)
+			}
+		}
+		if reservedSelf != nil {
+			reservedSelf.Close()
+		}
 		return Manifest{}, err
 	}
-	m.ArchivePath = dest
+	if reservedSelf != nil {
+		reservedSelf.Close()
+	}
+	m.ArchivePath = fullPath
 	return m, nil
 }
 
 // collect reads every source file exactly once, using the same bytes for the
 // manifest checksum and the archive payload so the two can never disagree.
-func collect(ctx context.Context, sourceRoot string) ([]payload, []string, map[string]string, error) {
+// sourceRootFd is SourceRoot's trusted-root fd (design §6.2); every name
+// under it is resolved fd-relative, O_NOFOLLOW at each component, exactly
+// like every other operation in this package.
+func collect(ctx context.Context, sourceRootFd *os.File) ([]payload, []string, map[string]string, error) {
 	var payloads []payload
 	skipped := []string{}
 	reasons := map[string]string{}
@@ -141,81 +177,68 @@ func collect(ctx context.Context, sourceRoot string) ([]payload, []string, map[s
 	}
 
 	for _, tree := range recursiveTrees {
-		root := filepath.Join(sourceRoot, filepath.FromSlash(tree))
-		if _, err := os.Lstat(root); err != nil {
-			if os.IsNotExist(err) {
+		comps := splitLogicalPath(tree)
+		chain, err := resolveParentDirs(sourceRootFd, comps, false, 0, dirAllowExisting)
+		closeErr := func() { chain.closeOpened() }
+		if err != nil {
+			closeErr()
+			if errors.Is(err, os.ErrNotExist) {
 				// Record the whole tree so a restore can tell "there was
 				// no configuration tree" from "there was one and it was
 				// packed" (design document, section 4).
 				skip(tree, SkipNotFound)
 				continue
 			}
-			return nil, nil, nil, fmt.Errorf("backup: stat %s: %w", tree, err)
-		}
-		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
+			// v0.7's filepath.WalkDir called its callback once for the tree
+			// root itself before ever recursing, so a root that turned out
+			// not to be a directory (a symlink, a plain file, a FIFO) was
+			// classified exactly like any other non-directory entry found
+			// during the walk — skipped, not a hard failure (design §6.6:
+			// "跳过规则与稳定原因不变"). Only when the failure happened at
+			// an INTERMEDIATE ancestor of the tree root (not the root's own
+			// final component) does this remain a hard failure: that is a
+			// genuinely new defense this version adds (an ancestor replaced
+			// out from under the walk), not a v0.7 skip case.
+			if len(chain.comps) == len(comps)-1 &&
+				(errors.Is(err, ErrUnsafePath) || errors.Is(err, errNotADirectory)) {
+				skip(tree, SkipUnsupportedSourceType)
+				continue
 			}
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			rel, relErr := relLogicalPath(sourceRoot, p)
-			if relErr != nil {
-				return relErr
-			}
-			if d.IsDir() {
-				entries, readErr := os.ReadDir(p)
-				if readErr != nil {
-					return readErr
-				}
-				if len(entries) == 0 {
-					skip(rel, SkipEmptyDirectory)
-				}
-				return nil
-			}
-			info, infoErr := d.Info()
-			if infoErr != nil {
-				return infoErr
-			}
-			if !isPlainRegular(info) {
-				skip(rel, SkipUnsupportedSourceType)
-				return nil
-			}
-			pl, readErr := readPayload(p, rel)
-			if readErr != nil {
-				if errors.Is(readErr, ErrUnsupportedSourceType) {
-					skip(rel, SkipUnsupportedSourceType)
-					return nil
-				}
-				return readErr
-			}
-			payloads = append(payloads, pl)
-			return nil
-		})
-		if err != nil {
 			return nil, nil, nil, err
 		}
+		if err := walkSourceTree(ctx, chain.leaf(), tree, &payloads, skip); err != nil {
+			closeErr()
+			return nil, nil, nil, err
+		}
+		closeErr()
 	}
 
 	for _, name := range explicitFiles {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, err
 		}
-		p := filepath.Join(sourceRoot, filepath.FromSlash(name))
-		info, err := os.Lstat(p)
-		if err != nil {
-			if os.IsNotExist(err) {
+		chain, leaf, resErr := resolveUnderTrustedRoot(sourceRootFd, name, false, 0, dirAllowExisting)
+		if resErr != nil {
+			if chain != nil {
+				chain.closeOpened()
+			}
+			if errors.Is(resErr, os.ErrNotExist) {
 				skip(name, SkipNotFound)
 				continue
 			}
-			return nil, nil, nil, fmt.Errorf("backup: stat %s: %w", name, err)
+			return nil, nil, nil, resErr
 		}
-		if !isPlainRegular(info) {
-			return nil, nil, nil, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, name)
-		}
-		pl, err := readPayload(p, name)
-		if err != nil {
-			return nil, nil, nil, err
+		pl, readErr := readSourceFile(chain.leaf(), leaf, name)
+		chain.closeOpened()
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				skip(name, SkipNotFound)
+				continue
+			}
+			// Explicit files are hard requirements, not best-effort: an
+			// unsupported type here is reported, never silently skipped
+			// (design document, section 4; v0.7 parity).
+			return nil, nil, nil, readErr
 		}
 		payloads = append(payloads, pl)
 	}
@@ -225,46 +248,113 @@ func collect(ctx context.Context, sourceRoot string) ([]payload, []string, map[s
 	return payloads, skipped, reasons, nil
 }
 
-// isPlainRegular reports whether info describes a regular file with exactly one
-// link. Hard links are detected through Stat_t.Nlink because the Lstat mode
-// bits alone cannot distinguish them from ordinary files.
-func isPlainRegular(info fs.FileInfo) bool {
-	if !info.Mode().IsRegular() {
-		return false
+// walkSourceTree recurses dirFd (already open, O_NOFOLLOW'd) exactly like
+// v0.7's filepath.WalkDir did by path, opening each subdirectory fd-relative
+// (design §6.6) instead of re-resolving by path. rel is dirFd's own logical
+// path, used to build each entry's.
+func walkSourceTree(ctx context.Context, dirFd *os.File, rel string, payloads *[]payload, skip func(rel, reason string)) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
+	names, err := dirFd.Readdirnames(-1)
+	if err != nil {
+		return fmt.Errorf("backup: read %s: %w", rel, err)
 	}
-	return uint64(st.Nlink) == 1
+	if len(names) == 0 {
+		skip(rel, SkipEmptyDirectory)
+		return nil
+	}
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		childRel := rel + "/" + name
+		var st unix.Stat_t
+		if statErr := unix.Fstatat(int(dirFd.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+			if errors.Is(statErr, unix.ENOENT) {
+				continue // vanished between Readdirnames and here.
+			}
+			return fmt.Errorf("backup: inspect %s: %w", childRel, statErr)
+		}
+		switch {
+		case st.Mode&unix.S_IFMT == unix.S_IFDIR:
+			child, openErr := openChildDir(dirFd, name)
+			if openErr != nil {
+				if errors.Is(openErr, os.ErrNotExist) {
+					continue // vanished between Readdirnames and here.
+				}
+				return openErr
+			}
+			walkErr := walkSourceTree(ctx, child, childRel, payloads, skip)
+			child.Close()
+			if walkErr != nil {
+				return walkErr
+			}
+		case st.Mode&unix.S_IFMT == unix.S_IFREG && st.Nlink == 1:
+			pl, readErr := readSourceFile(dirFd, name, childRel)
+			if readErr != nil {
+				if errors.Is(readErr, ErrUnsupportedSourceType) {
+					skip(childRel, SkipUnsupportedSourceType)
+					continue
+				}
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue // vanished between Readdirnames and here.
+				}
+				return readErr
+			}
+			*payloads = append(*payloads, pl)
+		default:
+			// A symlink, hard link (Nlink != 1), FIFO, socket or device —
+			// the entry-level Fstatat above already caught it, so this
+			// never reaches readSourceFile's own re-check.
+			skip(childRel, SkipUnsupportedSourceType)
+		}
+	}
+	return nil
 }
 
-// readPayload opens the file without following symlinks and re-checks its type
-// on the opened descriptor, so a link swapped in after the directory scan can
-// neither be followed nor packed. O_NONBLOCK keeps a FIFO swapped in the same
-// way from blocking the open. Mode and ownership come from the same descriptor
-// the bytes are read from, and the bytes are read exactly once so the manifest
-// checksum and the archive payload can never disagree.
-func readPayload(p, rel string) (payload, error) {
-	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+// splitLogicalPath splits an already-known-safe logical path (one of this
+// package's own recursiveTrees/explicitFiles constants, never external
+// input) into its slash-separated components.
+func splitLogicalPath(logical string) []string {
+	var comps []string
+	start := 0
+	for i := 0; i < len(logical); i++ {
+		if logical[i] == '/' {
+			comps = append(comps, logical[start:i])
+			start = i + 1
+		}
+	}
+	return append(comps, logical[start:])
+}
+
+// readSourceFile opens name under dirFd without following a symlink and
+// re-checks its type and link count on the opened descriptor (design §6.6),
+// so a link swapped in after the directory scan can neither be followed nor
+// packed. O_NONBLOCK keeps a FIFO swapped in the same way from blocking the
+// open. Mode and ownership come from the same descriptor the bytes are read
+// from, and the bytes are read exactly once so the manifest checksum and the
+// archive payload can never disagree.
+func readSourceFile(dirFd *os.File, name, rel string) (payload, error) {
+	fd, err := unix.Openat(int(dirFd.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EMLINK) {
+		if errors.Is(err, unix.ENOENT) {
+			return payload{}, fmt.Errorf("%s: %w", rel, os.ErrNotExist)
+		}
+		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EMLINK) {
 			return payload{}, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, rel)
 		}
 		return payload{}, fmt.Errorf("backup: open %s: %w", rel, err)
 	}
+	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
 
-	info, err := f.Stat()
-	if err != nil {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return payload{}, fmt.Errorf("backup: stat %s: %w", rel, err)
 	}
-	if !isPlainRegular(info) {
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
 		return payload{}, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, rel)
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return payload{}, fmt.Errorf("backup: cannot read ownership of %s", rel)
 	}
 
 	data, err := io.ReadAll(f)
@@ -276,7 +366,7 @@ func readPayload(p, rel string) (payload, error) {
 		entry: FileEntry{
 			Path:   rel,
 			SHA256: hex.EncodeToString(sum[:]),
-			Mode:   info.Mode().Perm(),
+			Mode:   fs.FileMode(st.Mode & 0777),
 			UID:    st.Uid,
 			GID:    st.Gid,
 		},
@@ -284,38 +374,56 @@ func readPayload(p, rel string) (payload, error) {
 	}, nil
 }
 
-func relLogicalPath(sourceRoot, p string) (string, error) {
-	rel, err := filepath.Rel(sourceRoot, p)
-	if err != nil {
-		return "", fmt.Errorf("backup: resolve %s: %w", p, err)
-	}
-	rel = filepath.ToSlash(rel)
-	if err := ValidateLogicalPath(rel); err != nil {
-		return "", err
-	}
-	return rel, nil
-}
-
 // reserveDestination fixes the final archive path before any bytes are
-// written. Automatic names are reserved with O_EXCL so two runs in the same
-// second cannot overwrite each other; the returned release removes the
-// reservation when the run fails.
-func reserveDestination(opts CreateOptions, createdAt time.Time) (string, func(), error) {
+// written and returns the open output-directory fd (design §6.2's trusted
+// root: BackupDir, or --out's parent), the leaf name under it, the string
+// path for Manifest.ArchivePath, the reserved name's own fd (design §6.7's
+// pre-delete identity comparison; nil when nothing was reserved — see
+// below), and a release func that undoes the reservation when the run
+// fails. Automatic names are reserved with O_EXCL so two runs in the same
+// second cannot overwrite each other; --out never reserves anything ahead
+// of time (the eventual Renameat in writeArchive overwrites it atomically
+// either way, so there is no O_EXCL-created object for §6.7 to apply to
+// here) — release only removes a file this call itself is about to create,
+// never one the caller already had.
+func reserveDestination(opts CreateOptions, createdAt time.Time) (dirFd *os.File, leaf, fullPath string, self *os.File, release func() string, err error) {
 	if opts.Out != "" {
-		if _, err := os.Lstat(opts.Out); err == nil {
+		// A trailing separator makes Out ambiguous between "a file named
+		// after the last real component" and "a directory to write into" —
+		// filepath.Dir/Base would silently resolve it as the former
+		// (writing beside where the caller probably meant), where v0.7's
+		// path-based os.Rename instead failed outright on such a
+		// destination. Reject it the same way, rather than silently
+		// picking a guess.
+		if strings.HasSuffix(opts.Out, "/") {
+			return nil, "", "", nil, nil, fmt.Errorf("backup: --out %q must not end with a path separator", opts.Out)
+		}
+		dir := filepath.Dir(opts.Out)
+		base := filepath.Base(opts.Out)
+		outDirFd, openErr := openTrustedRoot(dir, false, 0)
+		if openErr != nil {
+			return nil, "", "", nil, nil, openErr
+		}
+		var st unix.Stat_t
+		statErr := unix.Fstatat(int(outDirFd.Fd()), base, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if statErr == nil {
 			// The run replaces a file the caller already had; removing it
 			// on failure would destroy data this package never created.
-			return opts.Out, func() {}, nil
-		} else if !os.IsNotExist(err) {
-			return "", nil, fmt.Errorf("backup: stat destination: %w", err)
+			return outDirFd, base, opts.Out, nil, func() string { return "" }, nil
 		}
-		return opts.Out, func() { _ = os.Remove(opts.Out) }, nil
+		if !errors.Is(statErr, unix.ENOENT) {
+			outDirFd.Close()
+			return nil, "", "", nil, nil, fmt.Errorf("backup: stat destination: %w", statErr)
+		}
+		return outDirFd, base, opts.Out, nil, func() string {
+			_ = unix.Unlinkat(int(outDirFd.Fd()), base, 0)
+			return ""
+		}, nil
 	}
-	if err := os.MkdirAll(opts.BackupDir, backupDirMode); err != nil {
-		return "", nil, fmt.Errorf("backup: create backup directory: %w", err)
-	}
-	if err := os.Chmod(opts.BackupDir, backupDirMode); err != nil {
-		return "", nil, fmt.Errorf("backup: tighten backup directory: %w", err)
+
+	backupDirFd, openErr := openTrustedRoot(opts.BackupDir, true, backupDirMode)
+	if openErr != nil {
+		return nil, "", "", nil, nil, openErr
 	}
 	stamp := createdAt.Format(archiveTimeLayout)
 	for i := 0; i <= maxNameCollisions; i++ {
@@ -323,82 +431,145 @@ func reserveDestination(opts CreateOptions, createdAt time.Time) (string, func()
 		if i > 0 {
 			name = fmt.Sprintf("backup-%s-%d.tar.gz", stamp, i)
 		}
-		dest := filepath.Join(opts.BackupDir, name)
-		f, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, archiveFileMode)
-		if err != nil {
-			if os.IsExist(err) {
+		fd, openErr := unix.Openat(int(backupDirFd.Fd()), name, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(archiveFileMode.Perm()))
+		if openErr != nil {
+			if errors.Is(openErr, unix.EEXIST) {
 				continue
 			}
-			return "", nil, fmt.Errorf("backup: reserve archive name: %w", err)
+			backupDirFd.Close()
+			return nil, "", "", nil, nil, fmt.Errorf("backup: reserve archive name: %w", openErr)
 		}
-		if err := f.Close(); err != nil {
-			return "", nil, fmt.Errorf("backup: reserve archive name: %w", err)
-		}
-		return dest, func() { _ = os.Remove(dest) }, nil
+		reserved := os.NewFile(uintptr(fd), name)
+		full := filepath.Join(opts.BackupDir, name)
+		return backupDirFd, name, full, reserved, func() string {
+			return removeStagedFileFd(backupDirFd, name, reserved)
+		}, nil
 	}
-	return "", nil, fmt.Errorf("backup: too many archives created at %s", stamp)
+	backupDirFd.Close()
+	return nil, "", "", nil, nil, fmt.Errorf("backup: too many archives created at %s", stamp)
 }
 
-// writeArchive stages the archive next to its destination and renames it into
-// place. The archive holds exactly one manifest.json plus one regular entry per
-// manifest file: no directory, symlink or hard link entries.
-func writeArchive(ctx context.Context, dest string, m Manifest, payloads []payload) (err error) {
+// randomArchiveTmpName returns a name that is, for practical purposes,
+// guaranteed unique: writeArchive's O_EXCL is what actually proves it, this
+// just makes a collision vanishingly unlikely.
+func randomArchiveTmpName() (string, error) {
+	var buf [12]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("backup: generate staging name: %w", err)
+	}
+	return ".backup-" + hex.EncodeToString(buf[:]) + ".tar.gz.tmp", nil
+}
+
+// writeArchive stages the archive under dirFd and renames it into place as
+// leaf (design §6.6). The archive holds exactly one manifest.json plus one
+// regular entry per manifest file: no directory, symlink or hard link
+// entries.
+func writeArchive(ctx context.Context, dirFd *os.File, leaf string, m Manifest, payloads []payload) (published bool, err error) {
 	manifestData, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		return fmt.Errorf("backup: encode manifest: %w", err)
+		return false, fmt.Errorf("backup: encode manifest: %w", err)
 	}
 
-	dir := filepath.Dir(dest)
-	tmp, err := os.CreateTemp(dir, ".backup-*.tar.gz.tmp")
+	tmpName, tmp, err := createArchiveStagingFile(dirFd)
 	if err != nil {
-		return fmt.Errorf("backup: create staging file: %w", err)
+		return false, err
 	}
-	tmpName := tmp.Name()
 	closed := false
 	defer func() {
+		// The design §6.7 identity comparison inside removeStagedFileFd
+		// needs tmp's own fd for Fstat, so it must run before tmp is
+		// closed, not after.
+		if err != nil {
+			if w := removeStagedFileFd(dirFd, tmpName, tmp); w != "" {
+				err = fmt.Errorf("%w (%s)", err, w)
+			}
+		}
 		if !closed {
 			_ = tmp.Close()
 		}
-		if err != nil {
-			_ = os.Remove(tmpName)
-		}
 	}()
-
-	if err = tmp.Chmod(archiveFileMode); err != nil {
-		return fmt.Errorf("backup: tighten staging file: %w", err)
-	}
 
 	gz := gzip.NewWriter(tmp)
 	tw := tar.NewWriter(gz)
 
 	if err = writeTarEntry(tw, ManifestName, manifestData, archiveFileMode, 0, 0, m.CreatedAt); err != nil {
-		return err
+		return false, err
 	}
 	for _, p := range payloads {
 		if err = ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
 		if err = writeTarEntry(tw, p.entry.Path, p.data, p.entry.Mode, p.entry.UID, p.entry.GID, m.CreatedAt); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if err = tw.Close(); err != nil {
-		return fmt.Errorf("backup: finish tar: %w", err)
+		return false, fmt.Errorf("backup: finish tar: %w", err)
 	}
 	if err = gz.Close(); err != nil {
-		return fmt.Errorf("backup: finish gzip: %w", err)
+		return false, fmt.Errorf("backup: finish gzip: %w", err)
 	}
 	if err = tmp.Sync(); err != nil {
-		return fmt.Errorf("backup: sync archive: %w", err)
+		return false, fmt.Errorf("backup: sync archive: %w", err)
 	}
+	// tmp stays open across the rename (not closed until it succeeds): a
+	// failed Renameat is itself a failure the deferred cleanup above must
+	// clean up after, and that cleanup's §6.7 identity comparison needs
+	// tmp's fd open to do it.
+	if err = unix.Renameat(int(dirFd.Fd()), tmpName, int(dirFd.Fd()), leaf); err != nil {
+		return false, fmt.Errorf("backup: publish archive: %w", err)
+	}
+	// Renameat succeeded: dirFd's entry named leaf is now this run's
+	// archive, complete and correctly named. Everything from here on is
+	// reported as an error if it fails, but published stays true — the
+	// caller must not run its reservation cleanup against what is now the
+	// real archive (design §6.7 applies to what this run is still trying
+	// to create, not to what it already finished publishing).
+	published = true
 	closed = true
 	if err = tmp.Close(); err != nil {
-		return fmt.Errorf("backup: close archive: %w", err)
+		return true, fmt.Errorf("backup: close archive: %w", err)
 	}
-	if err = os.Rename(tmpName, dest); err != nil {
-		return fmt.Errorf("backup: publish archive: %w", err)
+	if err = dirFd.Sync(); err != nil {
+		return true, fmt.Errorf("backup: sync output directory: %w", err)
 	}
-	return syncDir(dir)
+	return true, nil
+}
+
+// createArchiveStagingFile creates, under dirFd, a new file with a random
+// name (O_CREAT|O_EXCL, so it is provably this call's own inode), tightens
+// it to archiveFileMode on the fd (never by name), and returns both the name
+// — ready for the caller's Renameat — and the still-open fd.
+func createArchiveStagingFile(dirFd *os.File) (name string, f *os.File, err error) {
+	for attempt := 0; attempt < 10; attempt++ {
+		candidate, genErr := randomArchiveTmpName()
+		if genErr != nil {
+			return "", nil, genErr
+		}
+		fd, openErr := unix.Openat(int(dirFd.Fd()), candidate, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(archiveFileMode.Perm()))
+		if openErr != nil {
+			if errors.Is(openErr, unix.EEXIST) {
+				continue
+			}
+			return "", nil, fmt.Errorf("backup: create staging file: %w", openErr)
+		}
+		newFile := os.NewFile(uintptr(fd), candidate)
+		if chmodErr := newFile.Chmod(archiveFileMode); chmodErr != nil {
+			// This is itself a design §6.7 failure-cleanup delete (of the
+			// O_CREAT|O_EXCL file just created), so it gets the same
+			// pre-delete identity comparison as every other one, via the
+			// same helper — not a bare Unlinkat.
+			w := removeStagedFileFd(dirFd, candidate, newFile)
+			newFile.Close()
+			err := fmt.Errorf("backup: tighten staging file: %w", chmodErr)
+			if w != "" {
+				err = fmt.Errorf("%w (%s)", err, w)
+			}
+			return "", nil, err
+		}
+		return candidate, newFile, nil
+	}
+	return "", nil, fmt.Errorf("backup: could not reserve a staging name after 10 attempts")
 }
 
 func writeTarEntry(tw *tar.Writer, name string, data []byte, mode fs.FileMode, uid, gid uint32, modTime time.Time) error {
@@ -419,16 +590,4 @@ func writeTarEntry(tw *tar.Writer, name string, data []byte, mode fs.FileMode, u
 		return fmt.Errorf("backup: write %s: %w", name, err)
 	}
 	return nil
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("backup: open %s: %w", dir, err)
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return fmt.Errorf("backup: sync %s: %w", dir, err)
-	}
-	return d.Close()
 }

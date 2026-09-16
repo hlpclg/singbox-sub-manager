@@ -100,6 +100,16 @@ func openChildDir(parent *os.File, name string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), name), nil
 }
 
+// errNotADirectory is an internal-only sentinel (not part of design §5's
+// frozen public error set) wrapped around classifyDirOpenError's "ordinary
+// file, FIFO, socket or device standing where a directory is expected" case,
+// so a caller that needs to distinguish that specific classification from a
+// generic I/O failure — as collect's recursive-tree-root handling does, to
+// decide whether a non-directory tree root should be skipped like v0.7
+// rather than fail the whole run — can do it via errors.Is instead of
+// parsing message text.
+var errNotADirectory = errors.New("backup: not a directory")
+
 // classifyDirOpenError turns a failed, non-ENOENT attempt to open name as a
 // directory under parent into the error design §6.4 requires: a symbolic
 // link, or a directory that changed underneath the two syscalls, is
@@ -123,7 +133,7 @@ func classifyDirOpenError(parent *os.File, name string, openErr error) error {
 	case st.Mode&unix.S_IFMT == unix.S_IFDIR:
 		return fmt.Errorf("%w: %s changed while it was being opened", ErrUnsafePath, name)
 	default:
-		return fmt.Errorf("backup: %s is not a directory", name)
+		return fmt.Errorf("%w: %s", errNotADirectory, name)
 	}
 }
 
