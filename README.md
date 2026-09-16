@@ -489,9 +489,9 @@ sudo ./merge-nodes.sh
 sudo /usr/local/bin/proxyctl merge --nodes /etc/singbox-sub-manager/nodes.conf --output "/var/www/proxy-sub/$(sudo cat /var/lib/singbox-sub-manager/token)"
 ```
 
-两种方式都会原地覆盖已有订阅文件，保留原属主与权限。
+两种方式都会原地覆盖已有订阅文件：方式一（`merge-nodes.sh`）会把 `/var/www/proxy-sub` 下的属主与权限重置为 `caddy:caddy`、目录 755 / 文件 644（与安装脚本一致）；方式二只覆盖文件内容，保留原有属主与权限。
 
-**警告**：旧版本（v0.8.0 之前）的 `merge-nodes.sh` 内置 `PROXYCTL_VERSION=v0.7.1`。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载 v0.7.1 并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
+**警告**：旧版本 `merge-nodes.sh` 各自内置固定为本身发布版本的 `PROXYCTL_VERSION`（例如 v0.7.1 版脚本内置 `PROXYCTL_VERSION=v0.7.1`）。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载该旧版本并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
 
 ## 获取其他节点的连接信息
 
@@ -790,7 +790,7 @@ google.com
 2. 重新启动 TUN
 3. 删除旧订阅后重新添加
 4. 确认当前模式为 `Rule`
-5. 确认 Google Play 流量命中了 `节点选择`
+5. 确认 Google Play 流量命中了 `Google` 组（默认出口 `节点选择`；如已手动切换 `Google` 组，则跟随该切换结果）
 
 ### 6. 全局模式正常，规则模式异常
 
