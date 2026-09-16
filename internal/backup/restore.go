@@ -88,25 +88,50 @@ func publishStagedFile(chain *dirChain, tmp, dest string) error {
 // no longer matches what this call created — the caller decides how to
 // surface that alongside the returned error, since RollbackResult (unlike
 // Result) has no field for it.
-func publishNewFile(chain *dirChain, leaf string, data []byte, mode fs.FileMode, uid, gid uint32) (warning string, err error) {
+func publishNewFile(chain *dirChain, leaf string, data []byte, mode fs.FileMode, uid, gid uint32) error {
 	defer chain.closeOpened()
+	self, err := publishFileInChain(chain, leaf, data, mode, uid, gid)
+	if self != nil {
+		self.Close()
+	}
+	return err
+}
+
+// publishFileInChain is publishNewFile's core: stage data under chain.leaf()
+// with a random temporary name, then publish it as leaf through
+// publishFileFn, returning the published file's own fd — an fd does not
+// care that its name changed underneath it, so the same fd createStagingFile
+// opened is, after a successful Renameat, now the fd for leaf. Unlike
+// publishNewFile this does not close chain — for callers (CaptureSnapshot)
+// writing several files (payloads, then snapshot.json) under the same
+// transaction directory within one call, who keep the chain open across all
+// of them and close it once at the end, and who may want the returned fd
+// kept open too, for design §6.7's pre-delete identity comparison if a
+// later step in the same call forces cleaning this file back up. Any §6.7
+// "needs manual confirmation" warning from a failed publish's own cleanup
+// is folded into the returned error, since neither of this function's
+// callers has a separate place to put it (Result.Warnings is
+// Restore-specific; RollbackResult has no such field at all).
+func publishFileInChain(chain *dirChain, leaf string, data []byte, mode fs.FileMode, uid, gid uint32) (self *os.File, err error) {
 	// design §6.5 lists Openat(...O_CREAT...) itself among the mutating
 	// syscalls needing a fresh pre-verify, same as the Renameat inside
 	// publishFileFn below.
 	if err := prepareMutation(chain.fds, chain.comps); err != nil {
-		return "", err
+		return nil, err
 	}
 	tmpName, tmpFile, err := createStagingFile(chain.leaf(), mode, uid, gid, data)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if pubErr := publishFileFn(chain, tmpName, leaf); pubErr != nil {
-		warning = removeStagedFileFd(chain.leaf(), tmpName, tmpFile)
+		w := removeStagedFileFd(chain.leaf(), tmpName, tmpFile)
 		tmpFile.Close()
-		return warning, pubErr
+		if w != "" {
+			return nil, fmt.Errorf("%w (%s)", pubErr, w)
+		}
+		return nil, pubErr
 	}
-	tmpFile.Close()
-	return "", nil
+	return tmpFile, nil
 }
 
 // createStagingFile creates, under dir, a new file with a random name

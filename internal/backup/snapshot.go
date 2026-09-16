@@ -124,6 +124,22 @@ type RollbackResult struct {
 	FailureReasons map[string]string
 }
 
+// capturedFile names one file CaptureSnapshot itself has already published
+// into the transaction directory (a payload or snapshot.json), with the fd
+// obtained from publishFileInChain — still open, for design §6.7's
+// pre-delete identity comparison if a later step forces this call to clean
+// up what it already wrote.
+type capturedFile struct {
+	name string
+	self *os.File
+}
+
+// syncTxnDirFn is a no-op-swappable seam (same pattern as publishFileFn) so
+// a test can inject an fsync failure on the transaction directory or the
+// snapshot root without actually closing or otherwise invalidating the fd —
+// the fd must stay usable afterward for abandonCapture's own §6.7 cleanup.
+var syncTxnDirFn = func(f *os.File) error { return f.Sync() }
+
 // CaptureSnapshot copies every listed path byte for byte, together with its
 // mode and ownership, into a fresh transaction directory. It must complete
 // before a restore writes anything, so a failed restore can always be undone.
@@ -140,101 +156,234 @@ func CaptureSnapshot(ctx context.Context, opts CaptureOptions) (*RollbackSnapsho
 	}
 	createdAt := nowFn().UTC()
 
-	if err := os.MkdirAll(opts.SnapshotRoot, snapshotDirMode); err != nil {
-		return nil, fmt.Errorf("backup: create snapshot root: %w", err)
+	destRootFd, err := openTrustedRoot(opts.DestRoot, false, 0)
+	if err != nil {
+		return nil, fmt.Errorf("backup: open destination root: %w", err)
 	}
-	if err := os.Chmod(opts.SnapshotRoot, snapshotDirMode); err != nil {
-		return nil, fmt.Errorf("backup: tighten snapshot root: %w", err)
+	defer destRootFd.Close()
+
+	snapRootFd, err := openTrustedRoot(opts.SnapshotRoot, true, snapshotDirMode)
+	if err != nil {
+		return nil, fmt.Errorf("backup: open snapshot root: %w", err)
 	}
+	defer snapRootFd.Close()
 
 	id, err := newTransactionID(createdAt)
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(opts.SnapshotRoot, id)
-	if err := os.Mkdir(dir, snapshotDirMode); err != nil {
+	// Design §6.3's "must create" policy: a transaction ID collision is an
+	// error, never a silent reuse of whatever is already there.
+	txnChain, err := resolveParentDirs(snapRootFd, []string{id}, true, snapshotDirMode, dirMustCreate)
+	if err != nil {
+		if txnChain != nil {
+			txnChain.closeOpened()
+		}
 		return nil, fmt.Errorf("backup: create snapshot directory: %w", err)
-	}
-	if err := os.Chmod(dir, snapshotDirMode); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("backup: tighten snapshot directory: %w", err)
 	}
 
 	snap := &RollbackSnapshot{
 		SchemaVersion: snapshotSchemaVersion,
 		TransactionID: id,
 		CreatedAt:     createdAt,
-		Dir:           dir,
+		Dir:           filepath.Join(opts.SnapshotRoot, id),
+	}
+
+	var written []capturedFile
+	// abandonCapture undoes exactly what this call itself wrote (design
+	// §6.7): each recorded payload/metadata file by name, identity-checked
+	// against the fd held since it was published, then the transaction
+	// directory itself (also identity-checked, against its parent,
+	// snapRootFd) — which AT_REMOVEDIR leaves in place, unremoved, if
+	// anything this call did not write is present in it. Any "needs manual
+	// confirmation" text from a failed identity check (design §6.7) is
+	// returned, not discarded — CaptureSnapshot has nowhere else to put it
+	// (no Warnings field, unlike Result), so every caller folds it into the
+	// error it returns, exactly as publishFileInChain already does for a
+	// single file.
+	abandonCapture := func() string {
+		var warnings []string
+		for _, w := range written {
+			if msg := removeStagedFileFd(txnChain.leaf(), w.name, w.self); msg != "" {
+				warnings = append(warnings, msg)
+			}
+			w.self.Close()
+		}
+		warnings = append(warnings, removeCreatedDirsFd([]createdDirRef{{parent: txnChain.fds[0], name: txnChain.comps[0], self: txnChain.leaf()}})...)
+		txnChain.closeOpened()
+		return strings.Join(warnings, "; ")
+	}
+	fail := func(err error) (*RollbackSnapshot, error) {
+		if w := abandonCapture(); w != "" {
+			err = fmt.Errorf("%w (%s)", err, w)
+		}
+		return nil, err
 	}
 
 	paths := append([]string(nil), opts.Paths...)
 	sort.Strings(paths)
 	for i, logical := range paths {
-		if err := ctx.Err(); err != nil {
-			_ = os.RemoveAll(dir)
-			return nil, err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fail(ctxErr)
 		}
-		target, err := resolveUnderRoot(opts.DestRoot, logical)
+		entry, data, err := captureOneTarget(destRootFd, logical, i)
 		if err != nil {
-			_ = os.RemoveAll(dir)
-			return nil, err
+			return fail(err)
 		}
-		entry := SnapshotEntry{Path: logical}
-
-		info, err := os.Lstat(target)
-		switch {
-		case err != nil && os.IsNotExist(err):
-			entry.Exists = false
-		case err != nil:
-			_ = os.RemoveAll(dir)
-			return nil, fmt.Errorf("backup: stat %s: %w", logical, err)
-		default:
-			if !info.Mode().IsRegular() {
-				_ = os.RemoveAll(dir)
-				return nil, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, logical)
+		if entry.Exists {
+			self, pubErr := publishFileInChain(txnChain, entry.Payload, data, snapshotFileMode, 0, 0)
+			if pubErr != nil {
+				return fail(pubErr)
 			}
-			pl, err := readPayload(target, logical)
-			if err != nil {
-				_ = os.RemoveAll(dir)
-				return nil, err
-			}
-			entry.Exists = true
-			entry.Mode = pl.entry.Mode
-			entry.UID = pl.entry.UID
-			entry.GID = pl.entry.GID
-			entry.SHA256 = pl.entry.SHA256
-			entry.Payload = fmt.Sprintf("payload-%04d.bin", i)
-			if err := writeFileAtomic(dir, entry.Payload, pl.data, snapshotFileMode, 0, 0, false); err != nil {
-				_ = os.RemoveAll(dir)
-				return nil, err
-			}
+			written = append(written, capturedFile{name: entry.Payload, self: self})
 		}
 		snap.Entries = append(snap.Entries, entry)
 	}
 
 	meta, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("backup: encode snapshot metadata: %w", err)
+		return fail(fmt.Errorf("backup: encode snapshot metadata: %w", err))
 	}
-	if err := writeFileAtomic(dir, snapshotMetaName, meta, snapshotFileMode, 0, 0, false); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
+	metaSelf, err := publishFileInChain(txnChain, snapshotMetaName, meta, snapshotFileMode, 0, 0)
+	if err != nil {
+		return fail(err)
 	}
-	if err := syncDir(dir); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
+	written = append(written, capturedFile{name: snapshotMetaName, self: metaSelf})
+
+	// The written fds stay open across both syncs (not closed until they
+	// succeed): a failed fsync is itself a failure this function must clean
+	// up after (design §6.7), and abandonCapture's identity comparison
+	// needs them open to do that, exactly like every other failure path
+	// above.
+	if err := syncTxnDirFn(txnChain.leaf()); err != nil {
+		return fail(fmt.Errorf("backup: sync snapshot directory: %w", err))
 	}
-	if err := syncDir(opts.SnapshotRoot); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
+	if err := syncTxnDirFn(snapRootFd); err != nil {
+		return fail(fmt.Errorf("backup: sync snapshot root: %w", err))
 	}
+	for _, w := range written {
+		w.self.Close()
+	}
+	txnChain.closeOpened()
 	return snap, nil
 }
 
-// LoadSnapshot reads an image previously written by CaptureSnapshot.
+// captureOneTarget resolves logical under destRootFd's trusted root,
+// re-verifies the chain immediately before touching the target (design
+// §6.5's "CaptureSnapshot 读取目标之前"), and if the target exists, reads it
+// — CaptureSnapshot's own fd-relative version of archive.go's readPayload
+// (design §6.6): opened without following a symbolic link, then the opened
+// descriptor's own type and link count are re-checked, exactly as v0.7's
+// path-based version did. A missing parent or missing leaf both mean
+// Exists=false, matching v0.7's Lstat-based check.
+func captureOneTarget(destRootFd *os.File, logical string, index int) (SnapshotEntry, []byte, error) {
+	entry := SnapshotEntry{Path: logical}
+
+	chain, leaf, resErr := resolveUnderTrustedRoot(destRootFd, logical, false, 0, dirAllowExisting)
+	if resErr != nil {
+		if chain != nil {
+			chain.closeOpened()
+		}
+		if errors.Is(resErr, os.ErrNotExist) {
+			return entry, nil, nil
+		}
+		return SnapshotEntry{}, nil, resErr
+	}
+	defer chain.closeOpened()
+	if err := prepareMutation(chain.fds, chain.comps); err != nil {
+		return SnapshotEntry{}, nil, err
+	}
+	parentFd := int(chain.leaf().Fd())
+
+	// The classification Fstatat below and the read Openat further down are
+	// both fd-relative against this same just-reverified parentFd — design
+	// §6.5's "nothing else between prepareMutation and the syscall" is about
+	// not re-resolving anything by path in between, not about issuing
+	// exactly one syscall; two reads against an already-verified fd don't
+	// reopen any window prepareMutation just closed.
+	var st unix.Stat_t
+	statErr := unix.Fstatat(parentFd, leaf, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(statErr, os.ErrNotExist) {
+		return entry, nil, nil
+	}
+	if statErr != nil {
+		return SnapshotEntry{}, nil, fmt.Errorf("backup: stat %s: %w", logical, statErr)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return SnapshotEntry{}, nil, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, logical)
+	}
+
+	fd, openErr := unix.Openat(parentFd, leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if openErr != nil {
+		if openErr == unix.ELOOP {
+			return SnapshotEntry{}, nil, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, logical)
+		}
+		return SnapshotEntry{}, nil, fmt.Errorf("backup: open %s: %w", logical, openErr)
+	}
+	f := os.NewFile(uintptr(fd), leaf)
+	defer f.Close()
+	var fst unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &fst); err != nil {
+		return SnapshotEntry{}, nil, fmt.Errorf("backup: stat %s: %w", logical, err)
+	}
+	if fst.Mode&unix.S_IFMT != unix.S_IFREG || fst.Nlink != 1 {
+		return SnapshotEntry{}, nil, fmt.Errorf("%w: %s", ErrUnsupportedSourceType, logical)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return SnapshotEntry{}, nil, fmt.Errorf("backup: read %s: %w", logical, err)
+	}
+	sum := sha256.Sum256(data)
+	entry.Exists = true
+	entry.Mode = fs.FileMode(fst.Mode & 0777)
+	entry.UID = fst.Uid
+	entry.GID = fst.Gid
+	entry.SHA256 = hex.EncodeToString(sum[:])
+	entry.Payload = fmt.Sprintf("payload-%04d.bin", index)
+	return entry, data, nil
+}
+
+// LoadSnapshot reads an image previously written by CaptureSnapshot. dir is
+// a trusted root (design §3.1's supplementary table), resolved by following
+// symbolic links exactly like v0.7; snapshot.json itself is opened relative
+// to dir's own fd, without following a symbolic link there.
 func LoadSnapshot(dir string) (*RollbackSnapshot, error) {
-	data, err := os.ReadFile(filepath.Join(dir, snapshotMetaName))
+	// openTrustedRoot already wraps its own error with "backup: open
+	// <dir>: ...", so it is returned as-is rather than wrapped again.
+	dirFd, err := openTrustedRoot(dir, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dirFd.Close()
+	snap, err := readSnapshotMetadata(dirFd)
+	if err != nil {
+		return nil, err
+	}
+	snap.Dir = dir
+	return snap, nil
+}
+
+// readSnapshotMetadata reads and parses snapshot.json relative to dirFd
+// (already open and, design §6.5, re-verified by the caller if that
+// applies to how dirFd was obtained), applying design §3.1's payload-name
+// check to Exists=true entries only — CaptureSnapshot never produces a
+// Payload this rejects, so a rejection here means the metadata was tampered
+// with or corrupted, not that a normal snapshot became unloadable.
+func readSnapshotMetadata(dirFd *os.File) (*RollbackSnapshot, error) {
+	fd, err := unix.Openat(int(dirFd.Fd()), snapshotMetaName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("backup: open snapshot metadata: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), snapshotMetaName)
+	defer f.Close()
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return nil, fmt.Errorf("backup: stat snapshot metadata: %w", statErr)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("backup: snapshot metadata is not a regular file")
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("backup: read snapshot metadata: %w", err)
 	}
@@ -249,8 +398,12 @@ func LoadSnapshot(dir string) (*RollbackSnapshot, error) {
 		if err := ValidateLogicalPath(e.Path); err != nil {
 			return nil, err
 		}
+		if e.Exists {
+			if err := validatePayloadName(e.Payload); err != nil {
+				return nil, err
+			}
+		}
 	}
-	snap.Dir = dir
 	return &snap, nil
 }
 
@@ -387,12 +540,10 @@ func Rollback(ctx context.Context, snapshot *RollbackSnapshot, opts RollbackOpti
 			fail(entry.Path, reason, resErr)
 			continue
 		}
-		if warning, writeErr := publishNewFile(chain, leaf, data, entry.Mode, entry.UID, entry.GID); writeErr != nil {
+		if writeErr := publishNewFile(chain, leaf, data, entry.Mode, entry.UID, entry.GID); writeErr != nil {
 			// RollbackResult has no Warnings field (契约冻结); design §6.7's
-			// "注明该路径需人工确认" is folded into the error itself instead.
-			if warning != "" {
-				writeErr = fmt.Errorf("%w (%s)", writeErr, warning)
-			}
+			// "注明该路径需人工确认", when applicable, is already folded
+			// into writeErr by publishFileInChain.
 			reason := FailWrite
 			if errors.Is(writeErr, ErrUnsafePath) {
 				reason = FailUnsafePath
@@ -464,6 +615,11 @@ func readRollbackPayload(dirRootFd *os.File, payload string) ([]byte, error) {
 
 // CleanupSnapshot removes an image. Call it only once the transaction is over:
 // either the restore succeeded and was verified, or the rollback finished.
+// Per design §3.1's supplementary table, the trusted root is snapshot.Dir's
+// *parent* — snapshot.Dir itself is not trusted as a root, since removing
+// the transaction directory needs its parent's fd, and following a symbolic
+// link at snapshot.Dir would send the recursive delete below outside the
+// snapshot root entirely.
 func CleanupSnapshot(ctx context.Context, snapshot *RollbackSnapshot) error {
 	if snapshot == nil || snapshot.Dir == "" {
 		return nil
@@ -471,8 +627,67 @@ func CleanupSnapshot(ctx context.Context, snapshot *RollbackSnapshot) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(snapshot.Dir); err != nil {
+	parentFd, err := openTrustedRoot(filepath.Dir(snapshot.Dir), false, 0)
+	if err != nil {
+		return fmt.Errorf("backup: open %s: %w", filepath.Dir(snapshot.Dir), err)
+	}
+	defer parentFd.Close()
+	name := filepath.Base(snapshot.Dir)
+	// Design §6.5: this intentional delete is re-verified first — trivially
+	// here, since the chain is just the root itself with nothing between it
+	// and name, but the hooks and the (no-op) walk still run, consistent
+	// with every other intentional delete in this package.
+	if err := prepareMutation([]*os.File{parentFd}, nil); err != nil {
+		return err
+	}
+	if err := removeTreeFd(parentFd, name); err != nil {
 		return fmt.Errorf("backup: remove snapshot %s: %w", snapshot.TransactionID, err)
+	}
+	return nil
+}
+
+// removeTreeFd recursively removes the directory parent/name, exactly like
+// os.RemoveAll but never following a symbolic link at any level (design
+// §6.6): each subdirectory is entered via Openat(O_NOFOLLOW|O_DIRECTORY);
+// anything else — a file, or a symbolic link regardless of what it points
+// to — is removed by a plain Unlinkat, never traversed into.
+func removeTreeFd(parent *os.File, name string) error {
+	dirFd, err := openChildDir(parent, name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	entries, readErr := dirFd.Readdirnames(-1)
+	if readErr != nil {
+		dirFd.Close()
+		return fmt.Errorf("backup: read %s: %w", name, readErr)
+	}
+	for _, entry := range entries {
+		var st unix.Stat_t
+		if statErr := unix.Fstatat(int(dirFd.Fd()), entry, &st, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			dirFd.Close()
+			return fmt.Errorf("backup: inspect %s/%s: %w", name, entry, statErr)
+		}
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			if err := removeTreeFd(dirFd, entry); err != nil {
+				dirFd.Close()
+				return err
+			}
+			continue
+		}
+		if err := unix.Unlinkat(int(dirFd.Fd()), entry, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+			dirFd.Close()
+			return fmt.Errorf("backup: remove %s/%s: %w", name, entry, err)
+		}
+	}
+	dirFd.Close()
+	if err := unix.Unlinkat(int(parent.Fd()), name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("backup: remove %s: %w", name, err)
 	}
 	return nil
 }
@@ -481,14 +696,23 @@ func CleanupSnapshot(ctx context.Context, snapshot *RollbackSnapshot) error {
 // the active transaction and never removes the most recent image, which is the
 // one an operator would still need to investigate a failed restore. Removal
 // problems are returned as warnings, not errors: pruning must not fail a
-// restore.
+// restore. Per design §6.6, this does not go through the path-based
+// LoadSnapshot: snapshotRoot is the trusted root, each transaction directory
+// is opened relative to it without following a symbolic link, and its
+// metadata is read relative to that fd.
 func PruneSnapshots(snapshotRoot string, now time.Time, maxAge time.Duration, activeID string) []string {
-	entries, err := os.ReadDir(snapshotRoot)
+	rootFd, err := openTrustedRoot(snapshotRoot, false, 0)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return []string{fmt.Sprintf("cannot list snapshots in %s: %v", snapshotRoot, err)}
+	}
+	defer rootFd.Close()
+
+	names, readErr := rootFd.Readdirnames(-1)
+	if readErr != nil {
+		return []string{fmt.Sprintf("cannot list snapshots in %s: %v", snapshotRoot, readErr)}
 	}
 
 	type candidate struct {
@@ -497,19 +721,31 @@ func PruneSnapshots(snapshotRoot string, now time.Time, maxAge time.Duration, ac
 	}
 	var candidates []candidate
 	var warnings []string
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == activeID {
+	for _, name := range names {
+		if name == activeID {
 			continue
 		}
-		dir := filepath.Join(snapshotRoot, e.Name())
-		snap, err := LoadSnapshot(dir)
-		if err != nil {
+		var st unix.Stat_t
+		if statErr := unix.Fstatat(int(rootFd.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+			continue // vanished between Readdirnames and here.
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+			continue // not a directory: v0.7's e.IsDir() check skipped these too, silently.
+		}
+		dirFd, openErr := openChildDir(rootFd, name)
+		if openErr != nil {
 			// Keep anything this package cannot recognise: it is either a
 			// damaged image worth investigating or not ours to delete.
-			warnings = append(warnings, fmt.Sprintf("keeping unreadable snapshot %s: %v", e.Name(), err))
+			warnings = append(warnings, fmt.Sprintf("keeping unreadable snapshot %s: %v", name, openErr))
 			continue
 		}
-		candidates = append(candidates, candidate{name: e.Name(), age: snap.CreatedAt})
+		snap, loadErr := readSnapshotMetadata(dirFd)
+		dirFd.Close()
+		if loadErr != nil {
+			warnings = append(warnings, fmt.Sprintf("keeping unreadable snapshot %s: %v", name, loadErr))
+			continue
+		}
+		candidates = append(candidates, candidate{name: name, age: snap.CreatedAt})
 	}
 	if len(candidates) <= 1 {
 		return warnings
@@ -521,7 +757,11 @@ func PruneSnapshots(snapshotRoot string, now time.Time, maxAge time.Duration, ac
 		if now.Sub(c.age) <= maxAge {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(snapshotRoot, c.name)); err != nil {
+		if err := prepareMutation([]*os.File{rootFd}, nil); err != nil {
+			warnings = append(warnings, fmt.Sprintf("cannot prune stale snapshot %s: %v", c.name, err))
+			continue
+		}
+		if err := removeTreeFd(rootFd, c.name); err != nil {
 			warnings = append(warnings, fmt.Sprintf("cannot prune stale snapshot %s: %v", c.name, err))
 		}
 	}
