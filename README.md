@@ -174,7 +174,7 @@ Hysteria2 密钥保存于：
 4. 更新订阅
 5. 开启 TUN
 6. 模式选择 `Rule`
-7. 在 `节点选择` 中选择 `自动选择` 或指定节点
+7. 在 `节点选择` 中选择 `自动选择`（测速）、`故障转移`（节点故障时自动切换）或指定节点
 
 配置默认包含：
 
@@ -185,7 +185,10 @@ Hysteria2 密钥保存于：
 - 国内直连
 - 国外代理
 - Google Play 下载修正规则
-- OpenAI、Claude、Google、GitHub 等优先代理规则
+- 3 个基础策略组：`节点选择`（手动选择）、`自动选择`（url-test 测速）、`故障转移`（fallback 故障转移）
+- 11 个服务策略组，可在客户端单独为每个服务切换出口：
+  - 默认出口为 `节点选择`：`AI服务`（OpenAI、Claude）、`GitHub`、`流媒体`（YouTube、Netflix、Spotify）、`Disney`、`TikTok`、`Telegram`、`Google`
+  - 默认出口为 `DIRECT`：`Bilibili`、`Apple`、`Microsoft`、`游戏`
 
 ## Shadowrocket 使用方法
 
@@ -225,6 +228,8 @@ US-HY2|3.3.3.3|443|PASSWORD|OBFS_PASSWORD|www.bing.com
 ```text
 节点名 | 服务器IP或域名 | 端口 | Hysteria2密码 | 混淆密码 | SNI
 ```
+
+节点名不得与内置策略组名或 `DIRECT`、`REJECT` 相同——即 `节点选择`、`自动选择`、`故障转移`、`AI服务`、`GitHub`、`流媒体`、`Disney`、`TikTok`、`Telegram`、`Google`、`Bilibili`、`Apple`、`Microsoft`、`游戏`、`DIRECT`、`REJECT`，共 16 个保留名。已启用节点使用其中任一名称时，`merge` 与 `validate` 会失败并在输出中指出冲突的节点名；禁用节点不受影响。
 
 重新运行安装脚本会读取 `nodes.conf` 并生成订阅，同时保留当前节点的 token 和密钥：
 
