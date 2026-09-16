@@ -574,6 +574,31 @@ func TestCreate_OutOverridesNamingAndRetentionPath(t *testing.T) {
 	}
 }
 
+// 独立终审 N1 回归: a trailing separator on --out is rejected outright,
+// rather than silently writing beside the path the caller almost certainly
+// meant (filepath.Dir/Base would treat the last real component as the file
+// name, e.g. "/var/backups/" would write to "/var/backups", one level up
+// from what it looks like).
+func TestCreate_RejectsOutWithATrailingSeparator(t *testing.T) {
+	src := newSource(t, defaultSource)
+	// The intended destination directory must already exist for this to
+	// exercise the actual bug: filepath.Dir/Base on a path ending in "/"
+	// resolve to (out, base(out)) — not (parent(out), base(out)) — so an
+	// unguarded reserveDestination would silently write to out/base(out)
+	// (e.g. ".../backups/backups") instead of failing.
+	out := filepath.Join(t.TempDir(), "backups")
+	if err := os.MkdirAll(out, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if _, err := Create(context.Background(), CreateOptions{SourceRoot: src, Out: out + "/", Now: fixedNow}); err == nil {
+		t.Fatal("Create succeeded with a trailing separator on --out")
+	}
+	if names := dirNames(t, out); len(names) != 0 {
+		t.Errorf("%s holds %v, want nothing written into it", out, names)
+	}
+}
+
 func TestCreate_RequiresDestination(t *testing.T) {
 	src := newSource(t, defaultSource)
 	if _, err := Create(context.Background(), CreateOptions{SourceRoot: src, Now: fixedNow}); err == nil {
@@ -702,11 +727,11 @@ func TestCreate_FailedArchiveWriteRemovesReservedName(t *testing.T) {
 
 	wantErr := errors.New("archive write failed")
 	original := writeArchiveFn
-	writeArchiveFn = func(ctx context.Context, dest string, m Manifest, payloads []payload) error {
-		if _, err := os.Stat(dest); err != nil {
+	writeArchiveFn = func(ctx context.Context, dirFd *os.File, leaf string, m Manifest, payloads []payload) (bool, error) {
+		if _, err := os.Stat(filepath.Join(backupDir, leaf)); err != nil {
 			t.Errorf("archive name was not reserved before writing: %v", err)
 		}
-		return wantErr
+		return false, wantErr
 	}
 	defer func() { writeArchiveFn = original }()
 
@@ -724,7 +749,12 @@ func TestWriteArchive_CancellationRemovesStagingFileAndKeepsReservation(t *testi
 	backupDir := filepath.Join(t.TempDir(), "backups")
 	opts := CreateOptions{SourceRoot: src, BackupDir: backupDir, Now: fixedNow}
 
-	payloads, skipped, reasons, err := collect(context.Background(), src)
+	sourceRootFd, err := openTrustedRoot(src, false, 0)
+	if err != nil {
+		t.Fatalf("open source root: %v", err)
+	}
+	defer sourceRootFd.Close()
+	payloads, skipped, reasons, err := collect(context.Background(), sourceRootFd)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -733,23 +763,31 @@ func TestWriteArchive_CancellationRemovesStagingFileAndKeepsReservation(t *testi
 		m.Files = append(m.Files, p.entry)
 	}
 
-	dest, release, err := reserveDestination(opts, fixedClock)
+	dirFd, leaf, _, self, release, err := reserveDestination(opts, fixedClock)
 	if err != nil {
 		t.Fatalf("reserveDestination: %v", err)
 	}
+	defer dirFd.Close()
+	defer self.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := writeArchive(ctx, dest, m, payloads); !errors.Is(err, context.Canceled) {
+	published, err := writeArchive(ctx, dirFd, leaf, m, payloads)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("writeArchive err = %v, want context.Canceled", err)
+	}
+	if published {
+		t.Errorf("published = true, want false: the run was cancelled before the rename")
 	}
 
 	names := dirNames(t, backupDir)
-	if len(names) != 1 || names[0] != filepath.Base(dest) {
-		t.Fatalf("backup dir holds %v, want only the reserved name %s", names, filepath.Base(dest))
+	if len(names) != 1 || names[0] != leaf {
+		t.Fatalf("backup dir holds %v, want only the reserved name %s", names, leaf)
 	}
 
-	release()
+	if w := release(); w != "" {
+		t.Errorf("release() reported a warning: %s", w)
+	}
 	if names := dirNames(t, backupDir); len(names) != 0 {
 		t.Errorf("backup dir holds %v after release, want nothing", names)
 	}
@@ -787,7 +825,9 @@ func TestCreate_OutFailureKeepsAPreExistingFile(t *testing.T) {
 
 	wantErr := errors.New("archive write failed")
 	original := writeArchiveFn
-	writeArchiveFn = func(ctx context.Context, dest string, m Manifest, payloads []payload) error { return wantErr }
+	writeArchiveFn = func(ctx context.Context, dirFd *os.File, leaf string, m Manifest, payloads []payload) (bool, error) {
+		return false, wantErr
+	}
 	defer func() { writeArchiveFn = original }()
 
 	if _, err := Create(context.Background(), CreateOptions{SourceRoot: src, Out: out, Now: fixedNow}); !errors.Is(err, wantErr) {
@@ -809,11 +849,11 @@ func TestCreate_OutFailureRemovesAFileThisRunCreated(t *testing.T) {
 
 	wantErr := errors.New("archive write failed")
 	original := writeArchiveFn
-	writeArchiveFn = func(ctx context.Context, dest string, m Manifest, payloads []payload) error {
-		if err := os.WriteFile(dest, []byte("half"), 0600); err != nil {
+	writeArchiveFn = func(ctx context.Context, dirFd *os.File, leaf string, m Manifest, payloads []payload) (bool, error) {
+		if err := os.WriteFile(filepath.Join(base, leaf), []byte("half"), 0600); err != nil {
 			t.Fatalf("simulate a published file: %v", err)
 		}
-		return wantErr
+		return false, wantErr
 	}
 	defer func() { writeArchiveFn = original }()
 
@@ -822,6 +862,36 @@ func TestCreate_OutFailureRemovesAFileThisRunCreated(t *testing.T) {
 	}
 	if names := dirNames(t, base); len(names) != 0 {
 		t.Errorf("destination dir holds %v after a failed run, want nothing", names)
+	}
+}
+
+// T4 (design §6.4): a symlinked parent under SourceRoot is ErrUnsafePath,
+// driving Create's source-side traversal exactly like the existing
+// TestRestore_/TestCaptureSnapshot_/TestRollback_RejectsSymlinkedParentDirectory
+// drive the other three operations. The shared classification logic itself
+// is exhaustively tested once, at the primitive level, in
+// TestClassifyDirOpenError (dirfd_test.go); this confirms Create's own
+// wiring surfaces it correctly.
+func TestCreate_RejectsSymlinkedParentDirectory(t *testing.T) {
+	src := sourceWithout(t, caddyPath)
+	outside := filepath.Join(filepath.Dir(src), "outside")
+	if err := os.MkdirAll(outside, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "Caddyfile"), []byte("secret\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(src, "etc", "caddy")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	_, err := Create(context.Background(), CreateOptions{SourceRoot: src, BackupDir: backupDir, Now: fixedNow})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want ErrUnsafePath", err)
+	}
+	if names := dirNames(t, backupDir); len(names) != 0 {
+		t.Errorf("backup dir holds %v after a rejected source, want nothing", names)
 	}
 }
 
@@ -848,5 +918,123 @@ func TestCreate_SkipsMissingRecursiveTreeRoot(t *testing.T) {
 		if strings.HasPrefix(f.Path, tree) {
 			t.Errorf("%s must not be packed", f.Path)
 		}
+	}
+}
+
+// 独立终审 B2 回归: a recursive tree ROOT that turned out not to be a
+// directory (here, a symlink) is skipped exactly like v0.7's
+// filepath.WalkDir treated it — a non-directory entry found during the walk
+// — not a hard failure of the whole backup. Only a replaced ANCESTOR of the
+// tree root (etc/caddy in the sibling T4 test, not the tree root itself)
+// is new, intentional hardening.
+func TestCreate_SkipsARecursiveTreeRootThatIsASymlink(t *testing.T) {
+	var present []sourceFile
+	for _, f := range defaultSource {
+		if strings.HasPrefix(f.rel, "etc/singbox-sub-manager/") {
+			continue
+		}
+		present = append(present, f)
+	}
+	src := newSource(t, present)
+	outside := filepath.Join(filepath.Dir(src), "outside-tree-root")
+	if err := os.MkdirAll(outside, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "OUTSIDE"), []byte("x"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(src, "etc", "singbox-sub-manager")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	backupDir := filepath.Join(t.TempDir(), "backups")
+
+	m, err := Create(context.Background(), CreateOptions{SourceRoot: src, BackupDir: backupDir, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	const tree = "etc/singbox-sub-manager"
+	if got := m.SkippedReasons[tree]; got != SkipUnsupportedSourceType {
+		t.Errorf("reason for %s = %q, want %q", tree, got, SkipUnsupportedSourceType)
+	}
+	for _, f := range m.Files {
+		if f.Path == "OUTSIDE" || strings.Contains(f.Path, "OUTSIDE") {
+			t.Errorf("archive contains bytes read through the symlinked tree root: %s", f.Path)
+		}
+	}
+}
+
+// 独立终审 B1 回归 (a): the reserved archive name's §6.7 identity comparison
+// must not be skipped — if the reservation is replaced by a different
+// object before a later failure triggers cleanup, the returned error says
+// so, and the replacement is left in place rather than silently deleted.
+func TestCreate_FailureCleanupReportsAnIdentityMismatchOnAReplacedReservedName(t *testing.T) {
+	src := newSource(t, defaultSource)
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	leaf := "backup-" + fixedClock.Format(archiveTimeLayout) + ".tar.gz"
+
+	wantErr := errors.New("archive write failed")
+	original := writeArchiveFn
+	writeArchiveFn = func(ctx context.Context, dirFd *os.File, leaf string, m Manifest, payloads []payload) (bool, error) {
+		full := filepath.Join(backupDir, leaf)
+		if err := os.Remove(full); err != nil {
+			t.Fatalf("remove reserved name: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("intruder"), 0600); err != nil {
+			t.Fatalf("replace reserved name: %v", err)
+		}
+		return false, wantErr
+	}
+	defer func() { writeArchiveFn = original }()
+
+	_, err := Create(context.Background(), CreateOptions{SourceRoot: src, BackupDir: backupDir, Now: fixedNow})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want it to wrap %v", err, wantErr)
+	}
+	if !strings.Contains(err.Error(), "needs manual confirmation") {
+		t.Errorf("err = %v, want it to mention the replaced name needs manual confirmation", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(backupDir, leaf))
+	if readErr != nil || string(data) != "intruder" {
+		t.Errorf("the replaced reserved name was touched: data=%q err=%v", data, readErr)
+	}
+}
+
+// 独立终审 NB-1 回归: once writeArchiveFn's rename has actually succeeded
+// (published=true), a later failure in the same call must not run the
+// reservation cleanup — it would run against the archive this call itself
+// just finished writing (§6.7 applies to what a run is still trying to
+// create, not to what it already published). Create still reports the
+// error, but the archive it just wrote is left exactly as published.
+func TestCreate_DoesNotCleanUpAReservationAfterAPublishSucceeded(t *testing.T) {
+	src := newSource(t, defaultSource)
+	backupDir := filepath.Join(t.TempDir(), "backups")
+	leaf := "backup-" + fixedClock.Format(archiveTimeLayout) + ".tar.gz"
+
+	wantErr := errors.New("sync failed after publish")
+	original := writeArchiveFn
+	writeArchiveFn = func(ctx context.Context, dirFd *os.File, leaf string, m Manifest, payloads []payload) (bool, error) {
+		published, err := writeArchive(ctx, dirFd, leaf, m, payloads)
+		if !published || err != nil {
+			t.Fatalf("writeArchive: published=%v err=%v, want a clean publish to build on", published, err)
+		}
+		// Simulate a failure that strikes only after the rename succeeded
+		// (e.g. the output directory's own Fsync).
+		return true, wantErr
+	}
+	defer func() { writeArchiveFn = original }()
+
+	_, err := Create(context.Background(), CreateOptions{SourceRoot: src, BackupDir: backupDir, Now: fixedNow})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want it to wrap %v", err, wantErr)
+	}
+	if strings.Contains(err.Error(), "needs manual confirmation") {
+		t.Errorf("err = %v, want no cleanup warning: nothing should have tried to clean up the published archive", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(backupDir, leaf))
+	if readErr != nil {
+		t.Fatalf("the published archive was removed: %v", readErr)
+	}
+	if len(readArchiveEntries(t, filepath.Join(backupDir, leaf))) == 0 {
+		t.Errorf("the surviving file at %s is not a valid archive: %q", leaf, data)
 	}
 }
