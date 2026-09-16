@@ -286,13 +286,23 @@ func resolveOneComponent(chain []*os.File, comps []string, i int, create bool, m
 // caller about to perform its own leaf-level mutation or read must call
 // prepareMutation(chain.fds, chain.comps) once more, immediately before that
 // syscall, exactly as design §6.5 describes for a single operation.
+//
+// On error, the returned chain is never nil once at least the root has been
+// opened by the caller — it is the (possibly partial) chain built so far,
+// still open, with chain.created recording exactly which of its directories
+// this call itself created before the failure. The caller owns it either
+// way: it must always chain.closeOpened() it, and — because whether a
+// newly-created directory should be deleted on failure is a decision that
+// belongs to the caller, not this shared primitive (design §6.3's table:
+// Restore cleans them up, Rollback does not) — it is the caller's
+// responsibility to remove any directories in chain.created it decides not
+// to keep, before closing.
 func resolveParentDirs(root *os.File, comps []string, create bool, mode fs.FileMode, policy dirPolicy) (*dirChain, error) {
 	c := &dirChain{fds: []*os.File{root}}
 	for i := range comps {
 		fd, created, err := resolveOneComponent(c.fds, comps, i, create, mode, policy)
 		if err != nil {
-			c.closeOpened()
-			return nil, err
+			return c, err
 		}
 		c.fds = append(c.fds, fd)
 		c.comps = append(c.comps, comps[i])
@@ -311,6 +321,11 @@ func resolveParentDirs(root *os.File, comps []string, create bool, mode fs.FileM
 // callers perform the actual create/replace/delete/read syscall themselves,
 // relative to chain.leaf(), immediately after their own prepareMutation
 // call.
+//
+// Same ownership contract as resolveParentDirs: a nil chain means nothing
+// was opened at all (logical was rejected before any filesystem access); a
+// non-nil chain, error or not, is the caller's to close and, on error, to
+// decide what to do with chain.created.
 func resolveUnderTrustedRoot(root *os.File, logical string, create bool, mode fs.FileMode, policy dirPolicy) (chain *dirChain, leaf string, err error) {
 	if err := ValidateLogicalPath(logical); err != nil {
 		return nil, "", err
@@ -319,7 +334,7 @@ func resolveUnderTrustedRoot(root *os.File, logical string, create bool, mode fs
 	parents, leaf := comps[:len(comps)-1], comps[len(comps)-1]
 	chain, err = resolveParentDirs(root, parents, create, mode, policy)
 	if err != nil {
-		return nil, "", err
+		return chain, "", err
 	}
 	return chain, leaf, nil
 }

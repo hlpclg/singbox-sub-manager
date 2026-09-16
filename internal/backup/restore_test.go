@@ -895,8 +895,8 @@ func TestRestore_Cancellation(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		original := publishFileFn
-		publishFileFn = func(tmp, dst string) error {
-			err := publishFile(tmp, dst)
+		publishFileFn = func(chain *dirChain, tmp, dst string) error {
+			err := publishStagedFile(chain, tmp, dst)
 			cancel()
 			return err
 		}
@@ -1364,8 +1364,8 @@ func TestRestore_Timeout(t *testing.T) {
 	defer cancel()
 
 	original := publishFileFn
-	publishFileFn = func(tmp, dst string) error {
-		err := publishFile(tmp, dst)
+	publishFileFn = func(chain *dirChain, tmp, dst string) error {
+		err := publishStagedFile(chain, tmp, dst)
 		// Let the deadline pass before the next path is published.
 		<-ctx.Done()
 		return err
@@ -1393,7 +1393,7 @@ func TestRestore_LockReleasedOnPanic(t *testing.T) {
 	l := &fakeLocker{}
 
 	original := publishFileFn
-	publishFileFn = func(tmp, dst string) error { panic("publish exploded") }
+	publishFileFn = func(chain *dirChain, tmp, dst string) error { panic("publish exploded") }
 	defer func() { publishFileFn = original }()
 
 	func() {
@@ -1452,4 +1452,546 @@ func TestRestore_PrunesStaleSnapshotsBeforeCapturing(t *testing.T) {
 	if _, err := os.Stat(res.Preimage.Dir); err != nil {
 		t.Errorf("this restore's image is missing: %v", err)
 	}
+}
+
+// --- Task 2 acceptance matrix (design §7.1): T1-写, T2-写, P1, T7, T9, T10 ---
+//
+// The symlink-replacement tests below all use the technique design §7.1
+// specifies: the real directory is renamed within root, then a symlink to
+// an outside location takes its original name. Whatever fd this package
+// already holds for that directory still refers to the real (now renamed)
+// inode; only a re-resolution by name would follow the symlink.
+
+// T1-写: fd-relative staging and publish.
+func TestRestore_T1Write_SucceedsUnderTheRenamedDirectory(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outside := t.TempDir()
+
+	// Both "etc" and "caddy" pre-exist, so resolveUnderTrustedRoot's own
+	// walk takes the EEXIST branch for each (one hookBeforeMutation call
+	// per component) before returning the fully-resolved chain to Restore;
+	// its own pre-staging re-verify is the 3rd call — the one positioned,
+	// per design §7.1's T1-写 row, right before the staging Openat(O_CREAT).
+	calls := 0
+	orig := hookBeforeMutation
+	defer func() { hookBeforeMutation = orig }()
+	hookBeforeMutation = func() {
+		calls++
+		if calls != 3 {
+			return
+		}
+		if err := os.Rename(filepath.Join(dest, "etc", "caddy"), filepath.Join(dest, "etc", "caddy.moved")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(dest, "etc", "caddy")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want ErrUnsafePath", err)
+	}
+	if calls < 3 {
+		t.Fatalf("hookBeforeMutation fired %d times, want at least 3 (the injection never ran)", calls)
+	}
+	if res.FailureReasons[caddyPath] != FailUnsafePath {
+		t.Errorf("reason for %s = %q, want %q", caddyPath, res.FailureReasons[caddyPath], FailUnsafePath)
+	}
+	if names := dirNames(t, outside); len(names) != 0 {
+		t.Errorf("the restore wrote %v outside the destination root", names)
+	}
+}
+
+// T2-写: the ancestor-chain re-verification catches a directory moved
+// entirely out of root, in the window between opening it and re-verifying.
+func TestRestore_T2Write_AncestorReverificationCatchesAMoveOutOfRoot(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outside := t.TempDir()
+
+	// Both "etc" and "caddy" pre-exist, so resolveUnderTrustedRoot's own
+	// walk takes the EEXIST branch for each (one hookAfterOpen call per
+	// component, neither doing anything more than a trivial pre-Mkdirat
+	// check) before returning the fully-resolved chain to Restore, whose
+	// own pre-staging re-verify is the 3rd call — that is where "caddy"
+	// (already open, held from the walk above) needs to move for this test
+	// to isolate the re-verification Restore's own staging step performs,
+	// rather than the one already covered at the private level (Task 1).
+	calls := 0
+	orig := hookAfterOpen
+	defer func() { hookAfterOpen = orig }()
+	hookAfterOpen = func() {
+		calls++
+		if calls != 3 {
+			return
+		}
+		if err := os.Rename(filepath.Join(dest, "etc", "caddy"), filepath.Join(outside, "caddy")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want ErrUnsafePath", err)
+	}
+	if calls < 3 {
+		t.Fatalf("hookAfterOpen fired %d times, want at least 3 (the injection never ran)", calls)
+	}
+	if res.FailureReasons[caddyPath] != FailUnsafePath {
+		t.Errorf("reason for %s = %q, want %q", caddyPath, res.FailureReasons[caddyPath], FailUnsafePath)
+	}
+	if names := dirNames(t, filepath.Join(outside, "caddy")); len(names) != 0 {
+		t.Errorf("the restore wrote into the moved-out directory: %v", names)
+	}
+}
+
+// Regression: failure cleanup must remove a directory the currently-failing
+// chain itself created, not just directories created by an earlier,
+// already-staged file. createdDirs entries record the fd of the directory's
+// *parent*; if that fd belongs to the chain that is about to fail and gets
+// closed before cleanup runs, the cleanup call silently no-ops (Unlinkat on
+// a closed fd) and the directory survives.
+func TestRestore_FailureCleanupRemovesADirectoryCreatedByTheSameFailingChain(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// "caddy" does not exist yet: this restore itself must create it
+	// (recorded into createdDirs, parent fd = "etc"'s) before its own
+	// pre-staging re-verify fails — by renaming "etc" itself (an ancestor,
+	// not "caddy"), so "caddy" is left behind fully intact, as a plain
+	// empty directory, now under "etc.moved". Cleanup must still remove it:
+	// the parent fd it needs (etc's) was opened long before the rename and
+	// is unaffected by renaming the directory it refers to — unless that fd
+	// was already (incorrectly) closed before cleanup ran.
+	calls := 0
+	orig := hookAfterOpen
+	defer func() { hookAfterOpen = orig }()
+	hookAfterOpen = func() {
+		calls++
+		if calls != 4 {
+			return
+		}
+		if err := os.Rename(filepath.Join(dest, "etc"), filepath.Join(dest, "etc.moved")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want ErrUnsafePath", err)
+	}
+	if calls < 4 {
+		t.Fatalf("hookAfterOpen fired %d times, want at least 4 (the injection never ran)", calls)
+	}
+	if res.FailureReasons[caddyPath] != FailUnsafePath {
+		t.Errorf("reason for %s = %q, want %q", caddyPath, res.FailureReasons[caddyPath], FailUnsafePath)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "etc.moved", "caddy")); !os.IsNotExist(statErr) {
+		t.Errorf("the directory this restore itself created, under the renamed ancestor, was not cleaned up: stat err = %v", statErr)
+	}
+}
+
+// Design §6.7's pre-delete identity comparison: a directory replaced by a
+// different, still-empty real directory would pass AT_REMOVEDIR's own
+// emptiness check regardless — it is not ENOTEMPTY, since T10 already
+// covers that case with a non-empty replacement — so only the identity
+// comparison against the fd held since creation can tell them apart.
+func TestRestore_FailureCleanupSkipsADirectoryReplacedByADifferentEmptyOne(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc"), 0755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "var"), 0755); err != nil {
+		t.Fatalf("mkdir var: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "var", "lib"), []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	// "caddy" does not exist yet: this restore creates it, stages Caddyfile
+	// under it, and moves on to "token" — whose "lib" component is blocked,
+	// triggering abandonStaging. Somewhere in token's own resolution (call
+	// #6: "var" is call #1 via resolveUnderTrustedRoot's own trivial
+	// pre-Mkdirat check plus this test's earlier caddy creation accounting
+	// for #2-4, "var"'s EEXIST branch is #5, "lib"'s pre-Mkdirat check is
+	// #6), replace "caddy" — well after it was fully created and verified —
+	// with a different, still-empty real directory.
+	calls := 0
+	orig := hookAfterOpen
+	defer func() { hookAfterOpen = orig }()
+	hookAfterOpen = func() {
+		calls++
+		if calls != 6 {
+			return
+		}
+		// caddy already holds this run's own staged Caddyfile tmp file by
+		// this point (staging happened at hookAfterOpen call #4, above) —
+		// RemoveAll clears it before the empty replacement takes its place.
+		caddy := filepath.Join(dest, "etc", "caddy")
+		if err := os.RemoveAll(caddy); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if err := os.Mkdir(caddy, 0700); err != nil {
+			t.Fatalf("mkdir replacement: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if err == nil {
+		t.Fatal("Restore succeeded although the token path is blocked")
+	}
+	if calls < 6 {
+		t.Fatalf("hookAfterOpen fired %d times, want at least 6 (the injection never ran)", calls)
+	}
+	if res.FailureReasons[caddyPath] != FailStagedDiscarded {
+		t.Errorf("reason for %s = %q, want %q", caddyPath, res.FailureReasons[caddyPath], FailStagedDiscarded)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "etc", "caddy")); statErr != nil {
+		t.Errorf("the replacement directory (not the one this run created) was deleted: %v", statErr)
+	}
+	if len(res.Warnings) == 0 {
+		t.Errorf("want a warning that the replaced directory needs manual confirmation")
+	}
+}
+
+// Design §6.7's pre-delete identity comparison, staged-file half (the
+// directory half is covered above): a staging file replaced — same name,
+// different inode — before this run's own failure cleanup gets to it must
+// be left alone, not deleted by name.
+func TestRestore_FailureCleanupSkipsAStagedFileReplacedByADifferentFile(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc"), 0755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "var"), 0755); err != nil {
+		t.Fatalf("mkdir var: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "var", "lib"), []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	// Same call-count reasoning as the directory-replacement test above:
+	// call #6 is "lib"'s pre-Mkdirat check, well after caddy's own staging
+	// file (created at call #4's step) already exists.
+	calls := 0
+	orig := hookAfterOpen
+	defer func() { hookAfterOpen = orig }()
+	hookAfterOpen = func() {
+		calls++
+		if calls != 6 {
+			return
+		}
+		entries, err := os.ReadDir(filepath.Join(dest, "etc", "caddy"))
+		if err != nil {
+			t.Fatalf("read caddy dir: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("caddy dir has %d entries, want 1 (the staging file)", len(entries))
+		}
+		tmp := filepath.Join(dest, "etc", "caddy", entries[0].Name())
+		if err := os.Remove(tmp); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if err := os.WriteFile(tmp, []byte("not this run's staging file"), 0600); err != nil {
+			t.Fatalf("write replacement: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if err == nil {
+		t.Fatal("Restore succeeded although the token path is blocked")
+	}
+	if calls < 6 {
+		t.Fatalf("hookAfterOpen fired %d times, want at least 6 (the injection never ran)", calls)
+	}
+	entries, readErr := os.ReadDir(filepath.Join(dest, "etc", "caddy"))
+	if readErr != nil {
+		t.Fatalf("read caddy dir: %v", readErr)
+	}
+	if len(entries) != 1 {
+		t.Errorf("caddy dir entries = %v, want the replacement file left untouched", entries)
+	} else if data, _ := os.ReadFile(filepath.Join(dest, "etc", "caddy", entries[0].Name())); string(data) != "not this run's staging file" {
+		t.Errorf("the replacement file was deleted or modified: %q", data)
+	}
+	if len(res.Warnings) == 0 {
+		t.Errorf("want a warning that the replaced staging file needs manual confirmation")
+	}
+}
+
+// P1a: static-layout regression for the preview path (two independent
+// defenses — Fstatat's own type check and the O_NOFOLLOW read — so no
+// single mutation isolates it; see design §7.1's P1 row).
+func TestRestore_P1a_PreviewSymlinkRegression(t *testing.T) {
+	archive := validArchive(t)
+
+	t.Run("a symlinked leaf is an overwrite with no old digest", func(t *testing.T) {
+		dest := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(dest, "var", "lib", "singbox-sub-manager"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		outsideFile := filepath.Join(t.TempDir(), "secret")
+		if err := os.WriteFile(outsideFile, []byte("secret\n"), 0600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := os.Symlink(outsideFile, filepath.Join(dest, filepath.FromSlash(caddyPath))); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		res, err := Restore(context.Background(), archive, RestoreOptions{DryRun: true, DestRoot: dest})
+		if err != nil {
+			t.Fatalf("Restore: %v", err)
+		}
+		got := diffFor(res.Preview, caddyPath)
+		if got.Action != ActionOverwrite || got.OldSHA256 != "" {
+			t.Errorf("diff = %+v, want ActionOverwrite with no old digest", got)
+		}
+	})
+
+	t.Run("a symlinked parent is rejected", func(t *testing.T) {
+		dest := t.TempDir()
+		outside := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dest, "etc"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(dest, "etc", "caddy")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		_, err := Restore(context.Background(), archive, RestoreOptions{DryRun: true, DestRoot: dest})
+		if !errors.Is(err, ErrUnsafePath) {
+			t.Fatalf("err = %v, want ErrUnsafePath", err)
+		}
+	})
+}
+
+// P1b: the preview read of a leaf already proven regular by Fstatat does not
+// follow a symlink swapped in right before the read.
+func TestRestore_P1b_PreviewDoesNotFollowSymlinkSwappedInBeforeRead(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, filepath.FromSlash(caddyPath)), []byte(caddyBody), 0640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "var", "lib", "singbox-sub-manager"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Same bytes as the archive: a bug that follows the symlink would read
+	// this and misreport the diff as ActionUnchanged instead of Overwrite.
+	outsideFile := filepath.Join(t.TempDir(), "outside-caddy")
+	if err := os.WriteFile(outsideFile, []byte(caddyBody), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	orig := hookBeforeMutation
+	defer func() { hookBeforeMutation = orig }()
+	hookBeforeMutation = func() {
+		target := filepath.Join(dest, filepath.FromSlash(caddyPath))
+		if err := os.Remove(target); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if err := os.Symlink(outsideFile, target); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DryRun: true, DestRoot: dest})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	got := diffFor(res.Preview, caddyPath)
+	if got.Action != ActionOverwrite || got.OldSHA256 != "" {
+		t.Errorf("diff = %+v, want ActionOverwrite with no old digest (must not follow the swapped-in symlink)", got)
+	}
+}
+
+func diffFor(preview []FileDiff, path string) FileDiff {
+	for _, d := range preview {
+		if d.Path == path {
+			return d
+		}
+	}
+	return FileDiff{}
+}
+
+// T7: an existing parent directory's permissions and ownership are left
+// untouched, end to end.
+func TestRestore_T7_ExistingDirectoryPermissionsNotWidened(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	existing := filepath.Join(dest, "etc", "caddy")
+	if err := os.MkdirAll(existing, 0750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	wantUID, wantGID := uint32(os.Geteuid()), uint32(os.Getegid())
+	if os.Geteuid() == 0 {
+		wantUID, wantGID = 4321, 4322
+		if err := os.Chown(existing, int(wantUID), int(wantGID)); err != nil {
+			t.Fatalf("chown: %v", err)
+		}
+	} else {
+		t.Logf("not running as root: ownership is only checked against %d:%d", wantUID, wantGID)
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if len(res.Failed) != 0 {
+		t.Fatalf("failed = %v, reasons %v", res.Failed, res.FailureReasons)
+	}
+	if mode := permOf(t, existing); mode != 0750 {
+		t.Errorf("existing directory mode = %v, want unchanged 0750", mode)
+	}
+	if uid, gid := ownerOf(t, existing); uid != wantUID || gid != wantGID {
+		t.Errorf("existing directory ownership = %d:%d, want unchanged %d:%d", uid, gid, wantUID, wantGID)
+	}
+	// A directory this restore itself had to create still gets the default
+	// mode, regardless of the existing sibling above.
+	created := filepath.Join(dest, "var", "lib", "singbox-sub-manager")
+	if mode := permOf(t, created); mode != restoreDirMode {
+		t.Errorf("newly created directory mode = %v, want %v", mode, restoreDirMode)
+	}
+}
+
+// T9: failure cleanup does not itself re-verify (design §6.7's deliberate
+// exception) — otherwise the very replacement that triggered the cleanup
+// would also block it, leaving the staging file behind.
+func TestRestore_T9_FailureCleanupSkipsReverification(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outside := t.TempDir()
+
+	// Same 3rd-call targeting as T1-write above: the swap needs to happen at
+	// Restore's own pre-staging re-verify so that staging actually succeeds
+	// under the moved directory first, giving the later publish-time
+	// re-verify failure something to clean up.
+	calls := 0
+	orig := hookBeforeMutation
+	defer func() { hookBeforeMutation = orig }()
+	hookBeforeMutation = func() {
+		calls++
+		if calls != 3 {
+			return
+		}
+		if err := os.Rename(filepath.Join(dest, "etc", "caddy"), filepath.Join(dest, "etc", "caddy.moved")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(dest, "etc", "caddy")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want ErrUnsafePath", err)
+	}
+	if calls < 3 {
+		t.Fatalf("hookBeforeMutation fired %d times, want at least 3 (the injection never ran)", calls)
+	}
+	if res.FailureReasons[caddyPath] != FailUnsafePath {
+		t.Errorf("reason for %s = %q, want %q", caddyPath, res.FailureReasons[caddyPath], FailUnsafePath)
+	}
+	if files := tempFilesUnder(t, filepath.Join(dest, "etc", "caddy.moved")); len(files) != 0 {
+		t.Errorf("staging files left behind under the moved directory: %v (cleanup must not skip on a re-verify failure)", files)
+	}
+}
+
+// T10: the structural guarantee that survives even the one race this
+// package cannot close (design §3.3's safety premise B) — Mkdirat succeeding
+// does not prove the fd opened right after it is the directory this call
+// just created, so failure cleanup must never recurse or it could delete
+// content a swapped-in real directory already held.
+func TestRestore_T10_RealDirectoryReplacementStructuralGuarantee(t *testing.T) {
+	archive := validArchive(t)
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc"), 0755); err != nil {
+		t.Fatalf("mkdir etc: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dest, "var"), 0755); err != nil {
+		t.Fatalf("mkdir var: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "var", "lib"), []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	replacement := filepath.Join(t.TempDir(), "replacement")
+	if err := os.MkdirAll(replacement, 0750); err != nil {
+		t.Fatalf("mkdir replacement: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(replacement, "keep"), []byte("keep me\n"), 0600); err != nil {
+		t.Fatalf("write keep: %v", err)
+	}
+
+	fired := false
+	orig := hookAfterMkdirat
+	defer func() { hookAfterMkdirat = orig }()
+	hookAfterMkdirat = func() {
+		if fired {
+			return
+		}
+		fired = true
+		caddy := filepath.Join(dest, "etc", "caddy")
+		if err := os.Rename(caddy, filepath.Join(dest, "etc", "caddy.orig")); err != nil {
+			t.Fatalf("rename away: %v", err)
+		}
+		if err := os.Rename(replacement, caddy); err != nil {
+			t.Fatalf("swap in: %v", err)
+		}
+	}
+
+	res, err := Restore(context.Background(), archive, RestoreOptions{DestRoot: dest})
+	if err == nil {
+		t.Fatal("Restore succeeded, want a staging failure once the swapped-in directory is discovered non-empty")
+	}
+	if res.FailureReasons[tokenPath] != FailStaging {
+		t.Errorf("reason for %s = %q, want %q", tokenPath, res.FailureReasons[tokenPath], FailStaging)
+	}
+	if res.FailureReasons[caddyPath] != FailStagedDiscarded {
+		t.Errorf("reason for %s = %q, want %q", caddyPath, res.FailureReasons[caddyPath], FailStagedDiscarded)
+	}
+
+	// The structural guarantee (design §3.3 guarantee 4, §6.7): failure
+	// cleanup never recurses and never deletes a non-empty directory. It
+	// does remove, by fd, the staging file this run itself put into the
+	// swapped-in directory.
+	entries, readErr := os.ReadDir(filepath.Join(dest, "etc", "caddy"))
+	if readErr != nil {
+		t.Fatalf("read swapped-in directory: %v", readErr)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != "keep" {
+		t.Errorf("swapped-in directory contents = %v, want only \"keep\" (the staging file must be gone, keep untouched)", names)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "etc", "caddy.orig")); statErr != nil {
+		t.Errorf("the original, empty directory was removed: %v", statErr)
+	}
+	// Deliberately not asserted: the swapped-in directory's own mode.
+	// Design §6.3/§7.1 T10 flags Fchmod landing on it as a known limitation
+	// (safety premise B), not a guarantee this test locks in.
 }

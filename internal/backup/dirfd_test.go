@@ -330,7 +330,13 @@ func TestResolveParentDirs_PreMkdiratVerificationCatchesAMovedAncestor(t *testin
 		}
 	}
 
-	_, err := resolveParentDirs(rootFd, []string{"etc", "caddy"}, true, 0755, dirAllowExisting)
+	// On error, resolveParentDirs returns the partial chain still open (the
+	// caller owns closing it and deciding what to do with chain.created) —
+	// close it here even though this test does not need chain.created.
+	chain, err := resolveParentDirs(rootFd, []string{"etc", "caddy"}, true, 0755, dirAllowExisting)
+	if chain != nil {
+		defer chain.closeOpened()
+	}
 	if !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("err = %v, want ErrUnsafePath", err)
 	}
@@ -542,7 +548,10 @@ func TestResolveUnderTrustedRoot_T6_RejectsSymlinkAncestor(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	_, _, err := resolveUnderTrustedRoot(rootFd, "etc/caddy/Caddyfile", false, 0, dirAllowExisting)
+	chain, _, err := resolveUnderTrustedRoot(rootFd, "etc/caddy/Caddyfile", false, 0, dirAllowExisting)
+	if chain != nil {
+		defer chain.closeOpened()
+	}
 	if !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("err = %v, want ErrUnsafePath", err)
 	}

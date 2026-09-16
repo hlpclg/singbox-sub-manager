@@ -2,6 +2,8 @@ package backup
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io/fs"
 	"os"
@@ -492,5 +494,275 @@ func TestPruneSnapshots_KeepsUnreadableDirectories(t *testing.T) {
 	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Errorf("an unreadable directory was pruned: %v", err)
+	}
+}
+
+// Regression: a missing intermediate parent (as opposed to a missing leaf,
+// which is a normal already-deleted success) is FailDelete, matching v0.7's
+// actual behavior — os.Remove(target) tolerated the leaf itself being gone,
+// but the syncDir(parent) call right after it failed whenever the parent
+// was gone too.
+func TestRollback_DeleteWithMissingParentIsFailDeleteNotSuccess(t *testing.T) {
+	dest := t.TempDir() // "etc" (and everything under it) does not exist.
+	snap := &RollbackSnapshot{
+		SchemaVersion: snapshotSchemaVersion,
+		TransactionID: "test-txn",
+		CreatedAt:     fixedClock,
+		Dir:           t.TempDir(),
+		Entries: []SnapshotEntry{
+			{Path: caddyPath, Exists: false},
+		},
+	}
+
+	res, err := Rollback(context.Background(), snap, RollbackOptions{DestRoot: dest})
+	if err == nil {
+		t.Fatal("Rollback succeeded with a missing intermediate parent")
+	}
+	if len(res.Deleted) != 0 {
+		t.Errorf("deleted = %v, want none (a missing parent is a failure, not a silent success)", res.Deleted)
+	}
+	if res.FailureReasons[caddyPath] != FailDelete {
+		t.Errorf("reason = %q, want %q", res.FailureReasons[caddyPath], FailDelete)
+	}
+}
+
+// --- Task 2 acceptance matrix (design §7.1): T1-删, T2-删, P2, P3-回滚 ---
+//
+// Same symlink-replacement technique as the Restore-side tests in
+// restore_test.go: the real directory is renamed within root, then a
+// symlink to an outside location takes its original name.
+
+// T1-删: fd-relative delete of an Exists=false target.
+func TestRollback_T1Delete_SucceedsUnderTheRenamedDirectory(t *testing.T) {
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	snapRoot := filepath.Join(t.TempDir(), "restore-snapshots")
+	snap, err := CaptureSnapshot(context.Background(), CaptureOptions{
+		DestRoot: dest, SnapshotRoot: snapRoot, Paths: []string{caddyPath}, Now: fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("CaptureSnapshot: %v", err)
+	}
+	if snap.Entries[0].Exists {
+		t.Fatalf("test setup: want the target to not exist at capture time")
+	}
+	// The restore this rollback undoes created the file.
+	if err := os.WriteFile(filepath.Join(dest, filepath.FromSlash(caddyPath)), []byte("restored\n"), 0640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "Caddyfile"), []byte("attacker file\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	fired := false
+	orig := hookBeforeMutation
+	defer func() { hookBeforeMutation = orig }()
+	hookBeforeMutation = func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := os.Rename(filepath.Join(dest, "etc", "caddy"), filepath.Join(dest, "etc", "caddy.moved")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(dest, "etc", "caddy")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+
+	res, err := Rollback(context.Background(), snap, RollbackOptions{DestRoot: dest})
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if len(res.Deleted) != 1 || res.Deleted[0] != caddyPath {
+		t.Errorf("deleted = %v, want %s deleted", res.Deleted, caddyPath)
+	}
+	if data, readErr := os.ReadFile(filepath.Join(outside, "Caddyfile")); readErr != nil || string(data) != "attacker file\n" {
+		t.Errorf("the outside file was touched: data=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "etc", "caddy.moved", "Caddyfile")); !os.IsNotExist(statErr) {
+		t.Errorf("the real Caddyfile under the moved directory was not deleted: %v", statErr)
+	}
+}
+
+// T2-删: the ancestor-chain re-verification catches a directory moved
+// entirely out of root before the delete.
+func TestRollback_T2Delete_AncestorReverificationCatchesAMoveOutOfRoot(t *testing.T) {
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dest, "etc", "caddy"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	snapRoot := filepath.Join(t.TempDir(), "restore-snapshots")
+	snap, err := CaptureSnapshot(context.Background(), CaptureOptions{
+		DestRoot: dest, SnapshotRoot: snapRoot, Paths: []string{caddyPath}, Now: fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("CaptureSnapshot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, filepath.FromSlash(caddyPath)), []byte("restored\n"), 0640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	outside := t.TempDir()
+
+	fired := false
+	orig := hookAfterOpen
+	defer func() { hookAfterOpen = orig }()
+	hookAfterOpen = func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := os.Rename(filepath.Join(dest, "etc", "caddy"), filepath.Join(outside, "caddy")); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+	}
+
+	res, err := Rollback(context.Background(), snap, RollbackOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want ErrUnsafePath", err)
+	}
+	if res.FailureReasons[caddyPath] != FailUnsafePath {
+		t.Errorf("reason = %q, want %q", res.FailureReasons[caddyPath], FailUnsafePath)
+	}
+	if names := dirNames(t, filepath.Join(outside, "caddy")); len(names) != 1 {
+		t.Errorf("moved-out directory contents = %v, want only the untouched Caddyfile", names)
+	}
+}
+
+// P2: reading a snapshot payload does not follow a symlink swapped in for
+// it, even when the swapped-in target's bytes and recorded checksum match.
+func TestRollback_P2_PayloadReadDoesNotFollowSymlink(t *testing.T) {
+	dest := newDest(t, []destFile{{caddyPath, "original caddy\n", 0640}})
+	snapRoot := filepath.Join(t.TempDir(), "restore-snapshots")
+	snap, err := CaptureSnapshot(context.Background(), CaptureOptions{
+		DestRoot: dest, SnapshotRoot: snapRoot, Paths: []string{caddyPath}, Now: fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("CaptureSnapshot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, filepath.FromSlash(caddyPath)), []byte("tampered target\n"), 0640); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+
+	outsideFile := filepath.Join(t.TempDir(), "outside-payload")
+	outsideBody := "attacker-controlled bytes\n"
+	if err := os.WriteFile(outsideFile, []byte(outsideBody), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	payloadPath := filepath.Join(snap.Dir, snap.Entries[0].Payload)
+	if err := os.Remove(payloadPath); err != nil {
+		t.Fatalf("remove payload: %v", err)
+	}
+	if err := os.Symlink(outsideFile, payloadPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// Recorded checksum matches the outside bytes, so only "did the read
+	// follow the symlink" decides the outcome, not the checksum check.
+	sum := sha256.Sum256([]byte(outsideBody))
+	snap.Entries[0].SHA256 = hex.EncodeToString(sum[:])
+
+	res, err := Rollback(context.Background(), snap, RollbackOptions{DestRoot: dest})
+	if err == nil {
+		t.Fatal("Rollback succeeded with a symlinked payload")
+	}
+	if res.FailureReasons[caddyPath] != FailReadSnapshot {
+		t.Errorf("reason = %q, want %q", res.FailureReasons[caddyPath], FailReadSnapshot)
+	}
+	if data, _ := readDestFile(t, dest, caddyPath); data != "tampered target\n" {
+		t.Errorf("target = %q, want it left untouched by the rejected rollback", data)
+	}
+}
+
+// P3-回滚: the payload-name-is-a-single-component check applies only to
+// Exists=true entries. A hand-built mixed snapshot value drives both halves
+// in one Rollback call: an Exists=false entry with an empty payload must
+// still delete its target, and an Exists=true entry with an unsafe payload
+// name must be rejected without touching its target.
+func TestRollback_P3_PayloadNameValidationOnlyAppliesToExistsTrue(t *testing.T) {
+	dest := newDest(t, []destFile{
+		{"etc/caddy/Caddyfile", "keep me\n", 0640},
+		{"var/lib/singbox-sub-manager/token", "created by restore\n", 0600},
+	})
+	base := t.TempDir()
+	snapDir := filepath.Join(base, "txn")
+	if err := os.MkdirAll(snapDir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outsideBody := "escaped bytes\n"
+	if err := os.WriteFile(filepath.Join(base, "outside"), []byte(outsideBody), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	sum := sha256.Sum256([]byte(outsideBody))
+
+	snap := &RollbackSnapshot{
+		SchemaVersion: snapshotSchemaVersion,
+		TransactionID: "test-txn",
+		CreatedAt:     fixedClock,
+		Dir:           snapDir,
+		Entries: []SnapshotEntry{
+			{Path: "var/lib/singbox-sub-manager/token", Exists: false, Payload: ""},
+			{Path: "etc/caddy/Caddyfile", Exists: true, Mode: 0640, SHA256: hex.EncodeToString(sum[:]), Payload: "../outside"},
+		},
+	}
+
+	res, err := Rollback(context.Background(), snap, RollbackOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want it to wrap ErrUnsafePath", err)
+	}
+	if len(res.Deleted) != 1 || res.Deleted[0] != "var/lib/singbox-sub-manager/token" {
+		t.Errorf("deleted = %v, want the Exists=false entry deleted despite its empty payload", res.Deleted)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "var/lib/singbox-sub-manager/token")); !os.IsNotExist(statErr) {
+		t.Errorf("the created-by-restore target survived: %v", statErr)
+	}
+	if res.FailureReasons["etc/caddy/Caddyfile"] != FailReadSnapshot {
+		t.Errorf("reason = %q, want %q", res.FailureReasons["etc/caddy/Caddyfile"], FailReadSnapshot)
+	}
+	if data, _ := readDestFile(t, dest, "etc/caddy/Caddyfile"); data != "keep me\n" {
+		t.Errorf("Caddyfile = %q, want it untouched", data)
+	}
+}
+
+// Regression: a rejected payload (unsafe name, missing, tampered) must not
+// leave newly-created parent directories behind under DestRoot. Rollback
+// never cleans those up on failure (unlike Restore), so v0.7 order —
+// nothing about DestRoot is touched until after the payload is read and
+// checksummed — must be preserved: v0.7 created nothing for a rejected
+// payload, since resolveUnderRoot never created directories at all.
+func TestRollback_RejectedPayloadCreatesNothingUnderDestRoot(t *testing.T) {
+	dest := t.TempDir()
+	base := t.TempDir()
+	snapDir := filepath.Join(base, "txn")
+	if err := os.MkdirAll(snapDir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "outside"), []byte("escaped\n"), 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	sum := sha256.Sum256([]byte("escaped\n"))
+
+	snap := &RollbackSnapshot{
+		SchemaVersion: snapshotSchemaVersion,
+		TransactionID: "test-txn",
+		CreatedAt:     fixedClock,
+		Dir:           snapDir,
+		Entries: []SnapshotEntry{
+			{Path: caddyPath, Exists: true, Mode: 0640, SHA256: hex.EncodeToString(sum[:]), Payload: "../outside"},
+		},
+	}
+
+	res, err := Rollback(context.Background(), snap, RollbackOptions{DestRoot: dest})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("err = %v, want it to wrap ErrUnsafePath", err)
+	}
+	if res.FailureReasons[caddyPath] != FailReadSnapshot {
+		t.Errorf("reason = %q, want %q", res.FailureReasons[caddyPath], FailReadSnapshot)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "etc")); !os.IsNotExist(statErr) {
+		t.Errorf("a rejected payload caused Rollback to create directories under DestRoot: stat err = %v", statErr)
 	}
 }

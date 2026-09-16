@@ -6,12 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -270,6 +275,35 @@ func Rollback(ctx context.Context, snapshot *RollbackSnapshot, opts RollbackOpti
 		}
 	}
 
+	destRootFd, rootErr := openTrustedRoot(opts.DestRoot, false, 0)
+	if rootErr != nil {
+		for _, entry := range snapshot.Entries {
+			fail(entry.Path, FailWrite, rootErr)
+		}
+		return res, rootErr
+	}
+	defer destRootFd.Close()
+
+	// The payload root (snapshot.Dir) is only needed for Exists=true
+	// entries; opened lazily and reused so a snapshot holding only
+	// Exists=false entries never has to touch it at all.
+	var payloadRootFd *os.File
+	defer func() {
+		if payloadRootFd != nil {
+			payloadRootFd.Close()
+		}
+	}()
+	openPayloadRoot := func() (*os.File, error) {
+		if payloadRootFd == nil {
+			fd, err := openTrustedRoot(snapshot.Dir, false, 0)
+			if err != nil {
+				return nil, err
+			}
+			payloadRootFd = fd
+		}
+		return payloadRootFd, nil
+	}
+
 	for i, entry := range snapshot.Entries {
 		if err := ctx.Err(); err != nil {
 			reason := FailCanceled
@@ -286,28 +320,53 @@ func Rollback(ctx context.Context, snapshot *RollbackSnapshot, opts RollbackOpti
 			return res, firstErr
 		}
 
-		target, err := resolveUnderRoot(opts.DestRoot, entry.Path)
-		if err != nil {
-			fail(entry.Path, FailUnsafePath, err)
-			continue
-		}
-
 		if !entry.Exists {
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-				fail(entry.Path, FailDelete, fmt.Errorf("backup: remove %s: %w", entry.Path, err))
+			// Intentional delete of a target the original restore created
+			// (design §6.6): re-verify the parent chain, Unlinkat, Fsync.
+			chain, leaf, resErr := resolveUnderTrustedRoot(destRootFd, entry.Path, false, 0, dirAllowExisting)
+			if resErr != nil {
+				if chain != nil {
+					chain.closeOpened()
+				}
+				if errors.Is(resErr, ErrUnsafePath) {
+					fail(entry.Path, FailUnsafePath, resErr)
+				} else {
+					// Covers a missing intermediate parent too (v0.7
+					// parity, not a success): os.Remove(target) tolerated
+					// the target itself already being gone, but the
+					// syncDir(parent) right after it failed whenever the
+					// parent itself was also missing — so that case was
+					// always FailDelete, never a silent "already deleted".
+					fail(entry.Path, FailDelete, resErr)
+				}
 				continue
 			}
-			if err := syncDir(filepath.Dir(target)); err != nil {
-				fail(entry.Path, FailDelete, err)
+			if delErr := deleteRollbackTarget(chain, leaf); delErr != nil {
+				reason := FailDelete
+				if errors.Is(delErr, ErrUnsafePath) {
+					reason = FailUnsafePath
+				}
+				fail(entry.Path, reason, delErr)
 				continue
 			}
 			res.Deleted = append(res.Deleted, entry.Path)
 			continue
 		}
 
-		data, err := os.ReadFile(filepath.Join(snapshot.Dir, entry.Payload))
-		if err != nil {
-			fail(entry.Path, FailReadSnapshot, fmt.Errorf("backup: read snapshot payload for %s: %w", entry.Path, err))
+		// Read and validate the payload before touching DestRoot at all
+		// (v0.7 order: resolve happened, but nothing was created, until
+		// after the payload was read and checksummed). An entry this call
+		// is going to reject must not leave newly created parent
+		// directories behind under DestRoot — Rollback never cleans those
+		// up (design §6.3's table), unlike Restore.
+		dirFd, dirErr := openPayloadRoot()
+		if dirErr != nil {
+			fail(entry.Path, FailReadSnapshot, fmt.Errorf("backup: open snapshot directory: %w", dirErr))
+			continue
+		}
+		data, readErr := readRollbackPayload(dirFd, entry.Payload)
+		if readErr != nil {
+			fail(entry.Path, FailReadSnapshot, fmt.Errorf("backup: read snapshot payload for %s: %w", entry.Path, readErr))
 			continue
 		}
 		sum := sha256.Sum256(data)
@@ -315,14 +374,92 @@ func Rollback(ctx context.Context, snapshot *RollbackSnapshot, opts RollbackOpti
 			fail(entry.Path, FailReadSnapshot, fmt.Errorf("%w: snapshot payload for %s", ErrChecksumMismatch, entry.Path))
 			continue
 		}
-		if err := writeFileAtomic(opts.DestRoot, entry.Path, data, entry.Mode, entry.UID, entry.GID, true); err != nil {
-			fail(entry.Path, FailWrite, err)
+
+		chain, leaf, resErr := resolveUnderTrustedRoot(destRootFd, entry.Path, true, restoreDirMode, dirAllowExisting)
+		if resErr != nil {
+			if chain != nil {
+				chain.closeOpened()
+			}
+			reason := FailWrite
+			if errors.Is(resErr, ErrUnsafePath) {
+				reason = FailUnsafePath
+			}
+			fail(entry.Path, reason, resErr)
+			continue
+		}
+		if warning, writeErr := publishNewFile(chain, leaf, data, entry.Mode, entry.UID, entry.GID); writeErr != nil {
+			// RollbackResult has no Warnings field (契约冻结); design §6.7's
+			// "注明该路径需人工确认" is folded into the error itself instead.
+			if warning != "" {
+				writeErr = fmt.Errorf("%w (%s)", writeErr, warning)
+			}
+			reason := FailWrite
+			if errors.Is(writeErr, ErrUnsafePath) {
+				reason = FailUnsafePath
+			}
+			fail(entry.Path, reason, writeErr)
 			continue
 		}
 		res.Restored = append(res.Restored, entry.Path)
 	}
 
 	return res, firstErr
+}
+
+// deleteRollbackTarget performs Rollback's intentional delete of a target
+// (design §6.6): re-verify the chain, Unlinkat the leaf, Fsync the parent.
+// Always closes chain. An already-missing leaf is not an error, matching
+// v0.7's os.IsNotExist-tolerant os.Remove.
+func deleteRollbackTarget(chain *dirChain, leaf string) error {
+	defer chain.closeOpened()
+	if err := prepareMutation(chain.fds, chain.comps); err != nil {
+		return err
+	}
+	parentFd := int(chain.leaf().Fd())
+	if err := unix.Unlinkat(parentFd, leaf, 0); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return fmt.Errorf("backup: remove %s: %w", leaf, err)
+	}
+	return chain.leaf().Sync()
+}
+
+// validatePayloadName rejects any SnapshotEntry.Payload that is not a
+// single path component (design §3.1's supplementary table): the
+// fd-relative Openat readRollbackPayload uses resolves ".." and multi-level
+// names, and O_NOFOLLOW does not stop "..", so this check — callers apply it
+// only to Exists=true entries — is what keeps a payload read inside the
+// transaction directory. CaptureSnapshot never produces a Payload this
+// rejects.
+func validatePayloadName(payload string) error {
+	if payload == "" || payload == "." || payload == ".." || strings.Contains(payload, "/") {
+		return fmt.Errorf("%w: invalid snapshot payload name %q", ErrUnsafePath, payload)
+	}
+	return nil
+}
+
+// readRollbackPayload reads an Exists=true entry's payload relative to
+// dirRootFd (the trusted root at snapshot.Dir), without following a
+// symbolic link, and re-checks the opened descriptor is a regular file.
+func readRollbackPayload(dirRootFd *os.File, payload string) ([]byte, error) {
+	if err := validatePayloadName(payload); err != nil {
+		return nil, err
+	}
+	fd, err := unix.Openat(int(dirRootFd.Fd()), payload, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("backup: open payload %s: %w", payload, err)
+	}
+	f := os.NewFile(uintptr(fd), payload)
+	defer f.Close()
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return nil, fmt.Errorf("backup: stat payload %s: %w", payload, statErr)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("backup: payload %s is not a regular file", payload)
+	}
+	return io.ReadAll(f)
 }
 
 // CleanupSnapshot removes an image. Call it only once the transaction is over:
