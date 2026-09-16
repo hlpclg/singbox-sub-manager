@@ -60,7 +60,17 @@ const (
 // non-zero, the opened root's fd — not its name — is Fchmod'd to mode.
 func openTrustedRoot(path string, create bool, mode fs.FileMode) (*os.File, error) {
 	if create {
-		if err := os.MkdirAll(path, mode); err != nil {
+		// A caller's umask must not leave the created directory (or any
+		// missing ancestor MkdirAll also creates) without the search
+		// permission this call's own Open needs next — Fchmod below cannot
+		// fix that up after the fact for a non-root caller, since fixing a
+		// directory's mode by fd first requires opening it. Mkdirat itself
+		// already gets an equivalent guarantee via resolveOneComponent; this
+		// mirrors it for MkdirAll's top-level, path-based creation.
+		old := unix.Umask(0)
+		err := os.MkdirAll(path, mode)
+		unix.Umask(old)
+		if err != nil {
 			return nil, fmt.Errorf("backup: create %s: %w", path, err)
 		}
 	}
@@ -249,7 +259,14 @@ func resolveOneComponent(chain []*os.File, comps []string, i int, create bool, m
 	if err := prepareMutation(chain, comps[:i]); err != nil {
 		return nil, false, err
 	}
-	if mkErr := unix.Mkdirat(int(parent.Fd()), name, uint32(mode.Perm())); mkErr != nil {
+	// Same reasoning as openTrustedRoot: a restrictive caller umask must not
+	// mask the requested mode down to something this call's own Openat below
+	// cannot pass as non-root — Fchmod runs on an fd opened after Mkdirat,
+	// so it cannot rescue an Openat that already failed because of it.
+	umaskOld := unix.Umask(0)
+	mkErr := unix.Mkdirat(int(parent.Fd()), name, uint32(mode.Perm()))
+	unix.Umask(umaskOld)
+	if mkErr != nil {
 		if !errors.Is(mkErr, unix.EEXIST) {
 			return nil, false, fmt.Errorf("backup: create %s: %w", name, mkErr)
 		}

@@ -231,7 +231,7 @@ func CaptureSnapshot(ctx context.Context, opts CaptureOptions) (*RollbackSnapsho
 			return fail(err)
 		}
 		if entry.Exists {
-			self, pubErr := publishFileInChain(txnChain, entry.Payload, data, snapshotFileMode, 0, 0)
+			self, pubErr := publishFileInChain(txnChain, entry.Payload, data, snapshotFileMode, uint32(os.Geteuid()), uint32(os.Getegid()))
 			if pubErr != nil {
 				return fail(pubErr)
 			}
@@ -244,7 +244,7 @@ func CaptureSnapshot(ctx context.Context, opts CaptureOptions) (*RollbackSnapsho
 	if err != nil {
 		return fail(fmt.Errorf("backup: encode snapshot metadata: %w", err))
 	}
-	metaSelf, err := publishFileInChain(txnChain, snapshotMetaName, meta, snapshotFileMode, 0, 0)
+	metaSelf, err := publishFileInChain(txnChain, snapshotMetaName, meta, snapshotFileMode, uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
 		return fail(err)
 	}

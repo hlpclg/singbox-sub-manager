@@ -114,6 +114,9 @@ func TestV070Fixture_ReadManifestMatchesVerify(t *testing.T) {
 }
 
 func TestV070Fixture_RestoreReproducesBytesModesAndOwnership(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("this fixture's recorded owner is fixed at build time (root, per the generation method above); reproducing it requires root")
+	}
 	dest := t.TempDir()
 	l := &fakeLocker{}
 
