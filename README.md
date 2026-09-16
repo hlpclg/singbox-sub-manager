@@ -246,7 +246,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.6.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.8.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
@@ -474,6 +474,24 @@ sudo ./install-proxy.sh rollback --to backup-20260909T100000Z.tar.gz
 重跑安装脚本会把 proxyctl 拉回安装脚本内置的 `PROXYCTL_VERSION`：`update` 之后如果再执行 `sudo ./install-proxy.sh <domain>`，二进制会被降级回安装脚本固定的版本。升级后需要重跑安装时，用 `sudo PROXYCTL_VERSION=<tag> ./install-proxy.sh <domain>` 指定当前版本。
 
 `rollback` 不带参数时使用最近一次会话：先恢复配置（如果该会话有快照），再校验并恢复二进制对。会话里只有配置快照而没有暂存二进制时，会明确告诉你「二进制未变更」。找不到任何会话或归档时报错退出，不会静默无操作。
+
+### 升级到 v0.8.0 后重新生成订阅
+
+`sudo ./install-proxy.sh update` 只升级 `proxyctl` 二进制，**不会**重新生成订阅文件；已有的 `clash.yaml` / `sr.txt` 仍是升级前渲染出的旧内容。升级到 v0.8.0 后，用以下任一方式重新生成订阅，才能拿到新增的 14 个策略组：
+
+```bash
+# 方式一：下载 v0.8.0 tag 下固定版本的 merge-nodes.sh（不要用 main 分支）
+curl -fsSLO https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/v0.8.0/merge-nodes.sh
+chmod +x merge-nodes.sh
+sudo ./merge-nodes.sh
+
+# 方式二：直接调用已升级的 proxyctl 二进制
+sudo /usr/local/bin/proxyctl merge --nodes /etc/singbox-sub-manager/nodes.conf --output "/var/www/proxy-sub/$(sudo cat /var/lib/singbox-sub-manager/token)"
+```
+
+两种方式都会原地覆盖已有订阅文件，保留原属主与权限。
+
+**警告**：旧版本（v0.8.0 之前）的 `merge-nodes.sh` 内置 `PROXYCTL_VERSION=v0.7.1`。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载 v0.7.1 并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
 
 ## 获取其他节点的连接信息
 

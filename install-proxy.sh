@@ -53,7 +53,7 @@ CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="${PROXYCTL_BIN:-/usr/local/bin/proxyctl}"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.7.1}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.8.0}"
 PROXYCTL_VALIDATED_BIN=""
 UPDATES_DIR="${UPDATES_DIR:-$STATE_DIR/updates}"
 BACKUPS_DIR="${BACKUPS_DIR:-$STATE_DIR/backups}"
@@ -740,7 +740,7 @@ EOF
   mv "$clash_tmp" "$output_dir/clash.yaml"
   mv "$sr_tmp" "$output_dir/sr.txt"
   chmod 0644 "$output_dir/clash.yaml" "$output_dir/sr.txt"
-  log "Generated $node_count node subscription files with shell renderer"
+  log "Generated $node_count node subscription files with shell renderer (no service policy groups)"
 }
 
 run_proxyctl_merge() {
@@ -750,7 +750,7 @@ run_proxyctl_merge() {
   if [[ -n "$PROXYCTL_VALIDATED_BIN" && -x "$PROXYCTL_VALIDATED_BIN" ]]; then
     "$PROXYCTL_VALIDATED_BIN" merge --nodes "$nodes_file" --output "$output_dir"
   else
-    log_warn "Validated proxyctl unavailable; using built-in shell renderer."
+    log_warn "Validated proxyctl unavailable; falling back to shell renderer (no service policy groups). Install proxyctl ${PROXYCTL_VERSION} and re-run merge to regenerate the full subscription."
     write_subscriptions_with_shell "$nodes_file" "$output_dir"
   fi
 }
