@@ -19,6 +19,9 @@ func writeNodes(t *testing.T, content string) string {
 
 const sectioned = "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p1\nOBFS_PASSWORD=o1\nSNI=www.bing.com\nENABLED=true\n\n[US]\nSERVER=5.6.7.8\nPORT=8443\nPASSWORD=p2\nOBFS_PASSWORD=o2\nSNI=www.apple.com\nENABLED=true\n"
 
+const testVlessUUID = "12345678-1234-1234-1234-123456789abc"
+const testVlessPublicKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+
 func TestNodeList(t *testing.T) {
 	p := writeNodes(t, sectioned)
 	var out, errb bytes.Buffer
@@ -168,6 +171,95 @@ func TestNodeMigrateLegacyToSectioned(t *testing.T) {
 	errb.Reset()
 	if code := run([]string{"node", "migrate", "--nodes", p}, &out, &errb); code != 0 {
 		t.Fatalf("second migrate code=%d err=%s", code, errb.String())
+	}
+}
+
+func TestNodeAddVlessReality(t *testing.T) {
+	p := writeNodes(t, "")
+	var out, errb bytes.Buffer
+	code := run([]string{
+		"node", "add", "--nodes", p,
+		"--name", "JP-Reality", "--type", "vless-reality",
+		"--server", "1.2.3.4", "--port", "443", "--sni", "www.bing.com",
+		"--uuid", testVlessUUID, "--public-key", testVlessPublicKey,
+	}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("add code=%d err=%s", code, errb.String())
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "TYPE=vless-reality") || !strings.Contains(string(data), "UUID="+testVlessUUID) {
+		t.Fatalf("file after add: %s", string(data))
+	}
+}
+
+func TestNodeAddRejectsCrossTypeFlags(t *testing.T) {
+	p := writeNodes(t, "")
+	var out, errb bytes.Buffer
+	code := run([]string{
+		"node", "add", "--nodes", p,
+		"--name", "JP-Reality", "--type", "vless-reality",
+		"--server", "1.2.3.4", "--port", "443", "--sni", "www.bing.com",
+		"--uuid", testVlessUUID, "--public-key", testVlessPublicKey,
+		"--password", "should-not-be-allowed",
+	}, &out, &errb)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when --password is passed with --type vless-reality, got 0")
+	}
+	if !strings.Contains(errb.String(), "password") {
+		t.Fatalf("expected error to mention the conflicting flag, got: %s", errb.String())
+	}
+}
+
+func TestNodeAddDefaultsToHysteria2Type(t *testing.T) {
+	p := writeNodes(t, "")
+	var out, errb bytes.Buffer
+	code := run([]string{
+		"node", "add", "--nodes", p,
+		"--name", "JP", "--server", "1.2.3.4", "--port", "443", "--sni", "www.bing.com",
+		"--password", "p", "--obfs-password", "o",
+	}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("add code=%d err=%s", code, errb.String())
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "TYPE=hysteria2") {
+		t.Fatalf("file after add: %s", string(data))
+	}
+}
+
+func TestNodeEditRejectsCrossTypeFlags(t *testing.T) {
+	vlessSectioned := "[JP-Reality]\nTYPE=vless-reality\nSERVER=1.2.3.4\nPORT=443\nUUID=" + testVlessUUID + "\nPUBLIC_KEY=" + testVlessPublicKey + "\nSNI=www.bing.com\nENABLED=true\n"
+	p := writeNodes(t, vlessSectioned)
+	var out, errb bytes.Buffer
+	code := run([]string{"node", "edit", "JP-Reality", "--nodes", p, "--password", "nope"}, &out, &errb)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit when editing a vless-reality node with --password, got 0")
+	}
+}
+
+func TestNodeEditVlessRealityField(t *testing.T) {
+	vlessSectioned := "[JP-Reality]\nTYPE=vless-reality\nSERVER=1.2.3.4\nPORT=443\nUUID=" + testVlessUUID + "\nPUBLIC_KEY=" + testVlessPublicKey + "\nSNI=www.bing.com\nENABLED=true\n"
+	p := writeNodes(t, vlessSectioned)
+	var out, errb bytes.Buffer
+	code := run([]string{"node", "edit", "JP-Reality", "--nodes", p, "--server", "5.6.7.8"}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("edit code=%d err=%s", code, errb.String())
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), "SERVER=5.6.7.8") {
+		t.Fatalf("file after edit: %s", string(data))
+	}
+}
+
+func TestNodeListShowsTypeColumn(t *testing.T) {
+	vlessSectioned := "[JP-Reality]\nTYPE=vless-reality\nSERVER=1.2.3.4\nPORT=443\nUUID=" + testVlessUUID + "\nPUBLIC_KEY=" + testVlessPublicKey + "\nSNI=www.bing.com\nENABLED=true\n"
+	p := writeNodes(t, vlessSectioned)
+	var out, errb bytes.Buffer
+	if code := run([]string{"node", "list", "--nodes", p}, &out, &errb); code != 0 {
+		t.Fatalf("list code=%d err=%s", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "vless-reality") {
+		t.Fatalf("expected TYPE column to show vless-reality, got: %s", out.String())
 	}
 }
 
