@@ -491,7 +491,7 @@ sudo /usr/local/bin/proxyctl merge --nodes /etc/singbox-sub-manager/nodes.conf -
 
 两种方式都会原地覆盖已有订阅文件：方式一（`merge-nodes.sh`）会把 `/var/www/proxy-sub` 下的属主与权限重置为 `caddy:caddy`、目录 755 / 文件 644（与安装脚本一致）；方式二只覆盖文件内容，保留原有属主与权限。
 
-**警告**：旧版本 `merge-nodes.sh` 各自内置固定为本身发布版本的 `PROXYCTL_VERSION`（例如 v0.7.1 版脚本内置 `PROXYCTL_VERSION=v0.7.1`）。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载该旧版本并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
+**警告**：旧版本 `merge-nodes.sh` 内置较旧的 `PROXYCTL_VERSION`（例如 v0.7.1 脚本默认使用 v0.7.1）。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载该旧版本并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
 
 ## 获取其他节点的连接信息
 
