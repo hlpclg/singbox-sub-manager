@@ -273,3 +273,92 @@ func TestValidateUnknownTypeRejected(t *testing.T) {
 		t.Fatal("expected error for unknown node type")
 	}
 }
+
+func TestLoadSectionedVlessReality(t *testing.T) {
+	p := writeTemp(t, "[JP-Reality]\nTYPE=vless-reality\nSERVER=1.2.3.4\nPORT=443\nUUID=12345678-1234-1234-1234-123456789abc\nPUBLIC_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\nSHORT_ID=0123456789abcdef\nSNI=www.bing.com\nENABLED=true\n")
+	ns, format, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if format != FormatSectioned {
+		t.Fatalf("format = %v, want FormatSectioned", format)
+	}
+	if len(ns) != 1 || ns[0].Type != TypeVlessReality || ns[0].UUID != "12345678-1234-1234-1234-123456789abc" {
+		t.Fatalf("unexpected node: %+v", ns[0])
+	}
+}
+
+func TestLoadSectionedWithoutTypeDefaultsHysteria2(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=pass\nOBFS_PASSWORD=obfs\nSNI=www.bing.com\n")
+	ns, _, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ns[0].Type != TypeHysteria2 {
+		t.Fatalf("Type = %q, want %q", ns[0].Type, TypeHysteria2)
+	}
+}
+
+func TestLoadSectionedRejectsPasswordOnVlessReality(t *testing.T) {
+	p := writeTemp(t, "[JP-Reality]\nTYPE=vless-reality\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=leaked\nUUID=12345678-1234-1234-1234-123456789abc\nPUBLIC_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: PASSWORD is not a valid key for type vless-reality")
+	}
+}
+
+func TestLoadSectionedRejectsUUIDOnHysteria2(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nUUID=12345678-1234-1234-1234-123456789abc\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: UUID is not a valid key for implicit type hysteria2")
+	}
+}
+
+func TestLoadSectionedRejectsLateTypeInImplicitMode(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nPORT=443\nTYPE=hysteria2\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: TYPE must be the first key")
+	}
+}
+
+func TestLoadSectionedRejectsDuplicateType(t *testing.T) {
+	p := writeTemp(t, "[JP-Reality]\nTYPE=vless-reality\nSERVER=1.2.3.4\nPORT=443\nTYPE=vless-reality\nUUID=12345678-1234-1234-1234-123456789abc\nPUBLIC_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: duplicate TYPE key")
+	}
+}
+
+func TestLoadSectionedRejectsDuplicateKey(t *testing.T) {
+	p := writeTemp(t, "[JP]\nSERVER=1.2.3.4\nSERVER=5.6.7.8\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: duplicate SERVER key")
+	}
+}
+
+func TestLoadSectionedRejectsEmptyTypeValue(t *testing.T) {
+	p := writeTemp(t, "[JP]\nTYPE=\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: empty TYPE value")
+	}
+}
+
+func TestLoadSectionedRejectsUnknownTypeValue(t *testing.T) {
+	p := writeTemp(t, "[JP]\nTYPE=tuic\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: unknown TYPE value")
+	}
+}
+
+func TestLoadSectionedRejectsEmptySection(t *testing.T) {
+	p := writeTemp(t, "[JP]\n\n[US]\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=s\n")
+	if _, _, err := Load(p); err == nil {
+		t.Fatal("expected error: section JP has no keys")
+	}
+}
+
+func TestLoadSectionedMissingPortReportsPort(t *testing.T) {
+	p := writeTemp(t, "[JP-Reality]\nTYPE=vless-reality\nSNI=s\n")
+	_, _, err := Load(p)
+	if err == nil || !strings.Contains(err.Error(), "PORT") {
+		t.Fatalf("Load = %v, want an error mentioning missing PORT", err)
+	}
+}
