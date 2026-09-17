@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +22,20 @@ var twoEnabledNodes = []nodes.Node{
 // clashConfig is a minimal decode target for the tests in this file.
 type clashConfig struct {
 	Proxies []struct {
-		Name string `yaml:"name"`
+		Name              string `yaml:"name"`
+		Type              string `yaml:"type"`
+		Server            string `yaml:"server"`
+		Port              int    `yaml:"port"`
+		UUID              string `yaml:"uuid"`
+		Network           string `yaml:"network"`
+		TLS               bool   `yaml:"tls"`
+		ServerName        string `yaml:"servername"`
+		Flow              string `yaml:"flow"`
+		ClientFingerprint string `yaml:"client-fingerprint"`
+		RealityOpts       struct {
+			PublicKey string `yaml:"public-key"`
+			ShortID   string `yaml:"short-id"`
+		} `yaml:"reality-opts"`
 	} `yaml:"proxies"`
 	ProxyGroups []struct {
 		Name    string   `yaml:"name"`
@@ -510,4 +524,90 @@ func TestWriteConflictNoFilesystemSideEffects(t *testing.T) {
 			t.Errorf("expected output directory %q to not exist after conflict, stat err=%v", dir, err)
 		}
 	})
+}
+
+var vlessRealityNode = nodes.Node{
+	Name: "JP-Reality", Type: nodes.TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "www.bing.com",
+	UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", ShortID: "0123456789abcdef",
+	Enabled: true,
+}
+
+func TestClashVlessRealityProxyFields(t *testing.T) {
+	cfg := decodeClash(t, Clash([]nodes.Node{vlessRealityNode}))
+	if len(cfg.Proxies) != 1 {
+		t.Fatalf("expected 1 proxy, got %d", len(cfg.Proxies))
+	}
+	p := cfg.Proxies[0]
+	if p.Name != "JP-Reality" || p.Type != "vless" || p.Server != "1.2.3.4" || p.Port != 443 {
+		t.Fatalf("basic fields mismatch: %+v", p)
+	}
+	if p.UUID != vlessRealityNode.UUID || p.Network != "tcp" || !p.TLS || p.ServerName != "www.bing.com" {
+		t.Fatalf("connection fields mismatch: %+v", p)
+	}
+	if p.Flow != "xtls-rprx-vision" || p.ClientFingerprint != "chrome" {
+		t.Fatalf("fixed reality params mismatch: %+v", p)
+	}
+	if p.RealityOpts.PublicKey != vlessRealityNode.PublicKey || p.RealityOpts.ShortID != vlessRealityNode.ShortID {
+		t.Fatalf("reality-opts mismatch: %+v", p.RealityOpts)
+	}
+}
+
+func TestShadowrocketVlessRealityURI(t *testing.T) {
+	out := Shadowrocket([]nodes.Node{vlessRealityNode})
+	line := strings.TrimSpace(out)
+	u, err := url.Parse(line)
+	if err != nil {
+		t.Fatalf("invalid URI: %v", err)
+	}
+	if u.Scheme != "vless" {
+		t.Fatalf("scheme = %q, want vless", u.Scheme)
+	}
+	if u.User.Username() != vlessRealityNode.UUID {
+		t.Fatalf("userinfo = %q, want UUID", u.User.String())
+	}
+	if u.Host != "1.2.3.4:443" {
+		t.Fatalf("host = %q, want 1.2.3.4:443", u.Host)
+	}
+	q := u.Query()
+	want := map[string]string{
+		"encryption": "none", "security": "reality", "sni": "www.bing.com",
+		"fp": "chrome", "pbk": vlessRealityNode.PublicKey, "sid": vlessRealityNode.ShortID,
+		"spx": "/", "flow": "xtls-rprx-vision", "type": "tcp",
+	}
+	for k, v := range want {
+		if got := q.Get(k); got != v {
+			t.Errorf("query[%q] = %q, want %q", k, got, v)
+		}
+	}
+	if u.Fragment != "JP-Reality" {
+		t.Fatalf("fragment = %q, want JP-Reality", u.Fragment)
+	}
+	if u.Path != "" {
+		t.Fatalf("path = %q, want empty (vless-reality does not set a URL path)", u.Path)
+	}
+}
+
+func TestShadowrocketIPv6HostBracketed(t *testing.T) {
+	n := vlessRealityNode
+	n.Server = "2001:db8::1"
+	out := strings.TrimSpace(Shadowrocket([]nodes.Node{n}))
+	u, err := url.Parse(out)
+	if err != nil {
+		t.Fatalf("invalid URI: %v", err)
+	}
+	if u.Host != "[2001:db8::1]:443" {
+		t.Fatalf("host = %q, want bracketed IPv6 host", u.Host)
+	}
+}
+
+func TestWriteRejectsInvalidNodeBeforeCreatingOutput(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "does-not-exist-yet")
+	invalid := []nodes.Node{{Name: "JP-Reality", Type: nodes.TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s"}} // missing UUID/PublicKey
+	if err := Write(dir, invalid); err == nil {
+		t.Fatal("expected Write to reject an invalid node")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("expected output directory to not exist after validation failure, stat err=%v", err)
+	}
 }
