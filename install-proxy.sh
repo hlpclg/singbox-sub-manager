@@ -53,7 +53,7 @@ CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="${PROXYCTL_BIN:-/usr/local/bin/proxyctl}"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.8.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.9.0}"
 PROXYCTL_VALIDATED_BIN=""
 UPDATES_DIR="${UPDATES_DIR:-$STATE_DIR/updates}"
 BACKUPS_DIR="${BACKUPS_DIR:-$STATE_DIR/backups}"
@@ -505,6 +505,22 @@ validate_node_fields() {
   fi
 }
 
+# nodes_conf_is_sectioned reports (via exit status) whether $1's first
+# meaningful (non-blank, non-comment) line starts a [section] header.
+# Detection matches internal/nodes.detectFormat exactly.
+nodes_conf_is_sectioned() {
+  local file="$1"
+  local line
+  [[ -f "$file" && -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == \[*  ]] && return 0
+    return 1
+  done < "$file"
+  return 1
+}
+
 write_subscriptions_with_shell() {
   local nodes_file="$1"
   local output_dir="$2"
@@ -750,6 +766,9 @@ run_proxyctl_merge() {
   if [[ -n "$PROXYCTL_VALIDATED_BIN" && -x "$PROXYCTL_VALIDATED_BIN" ]]; then
     "$PROXYCTL_VALIDATED_BIN" merge --nodes "$nodes_file" --output "$output_dir"
   else
+    if nodes_conf_is_sectioned "$nodes_file"; then
+      die "nodes.conf is in sectioned format; the shell fallback renderer only supports legacy Hysteria2 format. Install a validated proxyctl binary and re-run merge."
+    fi
     log_warn "Validated proxyctl unavailable; falling back to shell renderer (no service policy groups). Install proxyctl ${PROXYCTL_VERSION} and re-run merge to regenerate the full subscription."
     write_subscriptions_with_shell "$nodes_file" "$output_dir"
   fi
@@ -1075,6 +1094,8 @@ if [[ ! -f "$NODES_CONF" ]]; then
 # managed-by: installer
 $NODE_NAME|$PUBLIC_IP|$HY2_PORT|$PASSWORD|$OBFS_PASSWORD|$SNI
 EOF
+elif nodes_conf_is_sectioned "$NODES_CONF"; then
+  log_warn "nodes.conf is in sectioned format; skipping automatic IP/port sync. Run 'proxyctl node add|edit $NODE_NAME --server $PUBLIC_IP --port $HY2_PORT --sni $SNI [--password ... --obfs-password ...]' manually (use 'add' if the node was removed after migration; include --password/--obfs-password if this install regenerated config.env)."
 else
   # Update existing managed node or append
   if grep -q "# managed-by: installer" "$NODES_CONF"; then
