@@ -33,8 +33,8 @@ HARNESS="$TEST_DIR/harness.sh"
   printf '%s\n' '#!/usr/bin/env bash'
   printf '%s\n' 'log() { echo "[INFO] $1"; }'
   printf '%s\n' 'log_warn() { echo "[WARN] $1" >&2; }'
-  printf '%s\n' 'die() { echo "[FATAL] $1" >&2; return 1; }'
-  for fn in sha256_file trim yaml_quote contains_control_chars url_encode_component validate_node_fields write_subscriptions_with_shell install_proxyctl run_proxyctl_merge; do
+  printf '%s\n' 'die() { echo "[FATAL] $1" >&2; exit 1; }'
+  for fn in sha256_file trim yaml_quote contains_control_chars url_encode_component validate_node_fields nodes_conf_is_sectioned write_subscriptions_with_shell install_proxyctl run_proxyctl_merge; do
     extract_function "$fn"
   done
 } > "$HARNESS"
@@ -261,4 +261,64 @@ grep -Fq '无法下载或校验 proxyctl' "$merge_dir/stderr" || {
 }
 echo "merge-nodes-path-isolation PASSED"
 
-echo "All 10 proxyctl scenarios passed"
+# nodes_conf_is_sectioned: five input shapes.
+(
+  export PROXYCTL_BIN="$TEST_DIR/unused-proxyctl"
+  export PROXYCTL_VERSION="v0.9.0"
+  export PROXYCTL_VALIDATED_BIN=""
+  # shellcheck disable=SC1090
+  source "$HARNESS"
+
+  legacy_file="$TEST_DIR/is-sectioned/legacy.conf"
+  sectioned_file="$TEST_DIR/is-sectioned/sectioned.conf"
+  comments_file="$TEST_DIR/is-sectioned/comments.conf"
+  empty_file="$TEST_DIR/is-sectioned/empty.conf"
+  missing_file="$TEST_DIR/is-sectioned/does-not-exist.conf"
+  unreadable_file="$TEST_DIR/is-sectioned/unreadable.conf"
+  mkdir -p "$TEST_DIR/is-sectioned"
+  printf '%s\n' 'Node1|1.2.3.4|443|pass|obfs|example.com' > "$legacy_file"
+  printf '%s\n' '[Node1]' 'TYPE=hysteria2' > "$sectioned_file"
+  printf '%s\n' '# just a comment' '' > "$comments_file"
+  : > "$empty_file"
+  printf '%s\n' '[Node1]' 'TYPE=hysteria2' > "$unreadable_file"
+  chmod 000 "$unreadable_file"
+
+  nodes_conf_is_sectioned "$legacy_file" && { echo "legacy misdetected as sectioned" >&2; exit 1; }
+  nodes_conf_is_sectioned "$sectioned_file" || { echo "sectioned not detected" >&2; exit 1; }
+  nodes_conf_is_sectioned "$comments_file" && { echo "comments-only misdetected as sectioned" >&2; exit 1; }
+  nodes_conf_is_sectioned "$empty_file" && { echo "empty file misdetected as sectioned" >&2; exit 1; }
+  nodes_conf_is_sectioned "$missing_file" && { echo "missing file misdetected as sectioned" >&2; exit 1; }
+  if [[ ! -r "$unreadable_file" ]]; then
+    nodes_conf_is_sectioned "$unreadable_file" && { echo "unreadable file misdetected as sectioned" >&2; exit 1; }
+  else
+    echo "note: running as a user that can read a chmod 000 file (likely root); skipping unreadable-file sub-case" >&2
+  fi
+  chmod 644 "$unreadable_file"
+  exit 0
+)
+echo "nodes_conf_is_sectioned-detection PASSED"
+
+# run_proxyctl_merge refuses to shell-render a sectioned nodes.conf.
+(
+  export PROXYCTL_BIN="$TEST_DIR/unused-proxyctl-2"
+  export PROXYCTL_VERSION="v0.9.0"
+  export PROXYCTL_VALIDATED_BIN=""
+  reject_dir="$TEST_DIR/sectioned-reject"
+  mkdir -p "$reject_dir/out"
+  printf '%s\n' '[Node1]' 'TYPE=vless-reality' 'SERVER=1.2.3.4' 'PORT=443' \
+    'UUID=12345678-1234-1234-1234-123456789abc' \
+    'PUBLIC_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8' \
+    'SNI=example.com' > "$reject_dir/nodes.conf"
+  # shellcheck disable=SC1090
+  source "$HARNESS"
+  set +e
+  reject_output="$(run_proxyctl_merge "$reject_dir/nodes.conf" "$reject_dir/out" 2>&1)"
+  reject_status=$?
+  set -e
+  [[ "$reject_status" -ne 0 ]] || { echo "expected run_proxyctl_merge to fail for a sectioned nodes.conf" >&2; exit 1; }
+  [[ ! -e "$reject_dir/out/clash.yaml" ]] || { echo "clash.yaml must not be written when rejecting" >&2; exit 1; }
+  grep -Fq 'shell fallback renderer only supports legacy' <<<"$reject_output" || { echo "unexpected rejection message: $reject_output" >&2; exit 1; }
+)
+echo "run_proxyctl_merge-sectioned-rejection PASSED"
+
+echo "All 12 proxyctl scenarios passed"

@@ -246,7 +246,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.8.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.9.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
@@ -276,6 +276,10 @@ proxyctl node list
 proxyctl node add --name JP-HY2 --server 1.2.3.4 --port 443 \
   --password 'xxx' --obfs-password 'yyy' --sni www.bing.com
 
+# 新增 VLESS Reality 节点
+proxyctl node add --name JP-Reality --type vless-reality --server 1.2.3.4 --port 443 \
+  --uuid <uuid> --public-key <reality-public-key> --short-id '' --sni www.microsoft.com
+
 # 修改字段（只改传入项；--name 可改名）
 proxyctl node edit JP-HY2 --port 8443
 
@@ -301,6 +305,18 @@ proxyctl node migrate
 ```
 
 迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。
+
+### 添加 VLESS Reality 节点
+
+VLESS Reality 只支持分节格式；仍在用竖线格式的机器必须先执行一次：
+
+```bash
+proxyctl node migrate
+```
+
+再用 `proxyctl node add --type vless-reality ...` 添加节点。VLESS Reality 节点的 `flow`（`xtls-rprx-vision`）、`fingerprint`（`chrome`）和传输方式（裸 TCP）是固定值，不支持自定义。
+
+**版本兼容警告**：一旦 `nodes.conf` 写入 `TYPE=` 字段（执行过 `node migrate`、`node add` 或任何其他节点管理命令之后），就不能再被 v0.8.x 的 `proxyctl` 或 `merge-nodes.sh` 解析——它们会报 `unknown key "TYPE"` 并失败。升级到 v0.9.0 后，必须同时把 `install-proxy.sh`/`merge-nodes.sh` 换成 v0.9.0 tag 下的版本，不要混用旧脚本。
 
 ## 健康检查（proxyctl health）
 
@@ -492,6 +508,18 @@ sudo /usr/local/bin/proxyctl merge --nodes /etc/singbox-sub-manager/nodes.conf -
 两种方式都会原地覆盖已有订阅文件：方式一（`merge-nodes.sh`）会把 `/var/www/proxy-sub` 下的属主与权限重置为 `caddy:caddy`、目录 755 / 文件 644（与安装脚本一致）；方式二只覆盖文件内容，保留原有属主与权限。
 
 **警告**：旧版本 `merge-nodes.sh` 内置较旧的 `PROXYCTL_VERSION`（例如 v0.7.1 脚本默认使用 v0.7.1）。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载该旧版本并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
+
+### 升级到 v0.9.0 后使用 VLESS Reality
+
+`sudo ./install-proxy.sh update` 只升级 `proxyctl` 二进制。若要在现有机器上添加 VLESS Reality 节点，先确认 `nodes.conf` 已是分节格式（`proxyctl node migrate`），再用 `proxyctl node add --type vless-reality ...`。
+
+**警告**：和 v0.8.0 一样，旧版本 `merge-nodes.sh`/`install-proxy.sh` 内置的 `PROXYCTL_VERSION` 会在发现本机 `proxyctl` 版本不同时把它降级。`nodes.conf` 一旦写入 `TYPE=` 字段，降级后的 v0.8.x 二进制会直接读取失败（报 `unknown key "TYPE"`），而不只是渲染出旧模板——务必使用下面固定到 `v0.9.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/v0.9.0/merge-nodes.sh
+chmod +x merge-nodes.sh
+sudo ./merge-nodes.sh
+```
 
 ## 获取其他节点的连接信息
 

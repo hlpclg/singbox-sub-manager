@@ -1,6 +1,7 @@
 # 每个节点一个 [名称] 段。名称仅允许字母/数字/. _ -
 # 用 proxyctl 管理：proxyctl node add / edit / remove / enable / disable / list
 [JP-HY2]
+TYPE=hysteria2
 SERVER=203.0.113.10
 PORT=443
 PASSWORD=CHANGE_ME_PASSWORD
@@ -9,9 +10,22 @@ SNI=www.bing.com
 ENABLED=true
 
 [SG-HY2]
+TYPE=hysteria2
 SERVER=198.51.100.20
 PORT=443
 PASSWORD=CHANGE_ME_PASSWORD
 OBFS_PASSWORD=CHANGE_ME_OBFS
 SNI=www.bing.com
+ENABLED=true
+
+# VLESS Reality 节点示例（v0.9+）：UUID/PUBLIC_KEY 用 CHANGE_ME_* 占位符，
+# 实际使用前替换成你自己在服务端生成的 Reality 参数。
+[JP-Reality]
+TYPE=vless-reality
+SERVER=203.0.113.30
+PORT=443
+UUID=CHANGE_ME_UUID
+PUBLIC_KEY=CHANGE_ME_PUBLIC_KEY
+SHORT_ID=
+SNI=www.microsoft.com
 ENABLED=true

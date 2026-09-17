@@ -3,6 +3,7 @@ package nodes
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -113,5 +114,62 @@ func TestEnabledFilter(t *testing.T) {
 	got := Enabled(sample())
 	if len(got) != 1 || got[0].Name != "JP" {
 		t.Fatalf("Enabled filter = %+v", got)
+	}
+}
+
+func TestSerializeWritesExplicitType(t *testing.T) {
+	out := Serialize([]Node{{Name: "JP", Server: "1.2.3.4", Port: 443, Password: "p", ObfsPassword: "o", SNI: "s", Enabled: true}})
+	if !strings.Contains(out, "TYPE=hysteria2\n") {
+		t.Fatalf("Serialize output missing TYPE=hysteria2: %q", out)
+	}
+}
+
+func TestSerializeVlessRealityOmitsHysteria2Fields(t *testing.T) {
+	out := Serialize([]Node{{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", ShortID: "0123456789abcdef",
+		Enabled: true,
+	}})
+	if !strings.Contains(out, "TYPE=vless-reality\n") {
+		t.Fatalf("missing TYPE=vless-reality: %q", out)
+	}
+	if strings.Contains(out, "PASSWORD=") || strings.Contains(out, "OBFS_PASSWORD=") {
+		t.Fatalf("vless-reality output must not contain hysteria2 fields: %q", out)
+	}
+	if !strings.Contains(out, "UUID=12345678-1234-1234-1234-123456789abc\n") {
+		t.Fatalf("missing UUID field: %q", out)
+	}
+}
+
+func TestVlessRealitySectionedRoundTrip(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "www.bing.com",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", ShortID: "0123456789abcdef",
+		Enabled: true,
+	}
+	p := filepath.Join(t.TempDir(), "nodes.conf")
+	if err := WriteFile(p, []Node{n}); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	ns, _, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(ns) != 1 || ns[0] != n {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", ns[0], n)
+	}
+	if Serialize(ns) != Serialize([]Node{n}) {
+		t.Fatalf("serialize not idempotent after round trip")
+	}
+}
+
+func TestWriteFileRejectsInvalidNode(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "nodes.conf")
+	bad := []Node{{Name: "JP", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s"}} // missing UUID/PublicKey
+	if err := WriteFile(p, bad); err == nil {
+		t.Fatal("expected WriteFile to reject an invalid node before writing")
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("WriteFile must not create the file when validation fails, stat err=%v", err)
 	}
 }

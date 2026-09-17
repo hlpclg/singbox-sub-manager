@@ -14,11 +14,19 @@ func Serialize(ns []Node) string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
+		typ := effectiveType(n.Type)
 		fmt.Fprintf(&b, "[%s]\n", n.Name)
+		fmt.Fprintf(&b, "TYPE=%s\n", typ)
 		fmt.Fprintf(&b, "SERVER=%s\n", n.Server)
 		fmt.Fprintf(&b, "PORT=%d\n", n.Port)
-		fmt.Fprintf(&b, "PASSWORD=%s\n", n.Password)
-		fmt.Fprintf(&b, "OBFS_PASSWORD=%s\n", n.ObfsPassword)
+		if typ == TypeVlessReality {
+			fmt.Fprintf(&b, "UUID=%s\n", n.UUID)
+			fmt.Fprintf(&b, "PUBLIC_KEY=%s\n", n.PublicKey)
+			fmt.Fprintf(&b, "SHORT_ID=%s\n", n.ShortID)
+		} else {
+			fmt.Fprintf(&b, "PASSWORD=%s\n", n.Password)
+			fmt.Fprintf(&b, "OBFS_PASSWORD=%s\n", n.ObfsPassword)
+		}
 		fmt.Fprintf(&b, "SNI=%s\n", n.SNI)
 		fmt.Fprintf(&b, "ENABLED=%t\n", n.Enabled)
 	}
@@ -28,6 +36,11 @@ func Serialize(ns []Node) string {
 // WriteFile atomically writes ns in sectioned format at 0600, backing up any
 // existing file to path+".bak" first.
 func WriteFile(path string, ns []Node) error {
+	for _, n := range ns {
+		if err := Validate(n); err != nil {
+			return err
+		}
+	}
 	if existing, err := os.ReadFile(path); err == nil {
 		if err := os.WriteFile(path+".bak", existing, 0600); err != nil {
 			return fmt.Errorf("backup: %w", err)
@@ -65,7 +78,7 @@ func Find(ns []Node, name string) (int, bool) {
 }
 
 func Add(ns []Node, n Node) ([]Node, error) {
-	if err := validateFields(n); err != nil {
+	if err := Validate(n); err != nil {
 		return nil, err
 	}
 	if _, ok := Find(ns, n.Name); ok {
@@ -76,7 +89,7 @@ func Add(ns []Node, n Node) ([]Node, error) {
 }
 
 func Replace(ns []Node, oldName string, updated Node) ([]Node, error) {
-	if err := validateFields(updated); err != nil {
+	if err := Validate(updated); err != nil {
 		return nil, err
 	}
 	idx, ok := Find(ns, oldName)

@@ -110,9 +110,13 @@ func cmdNodeList(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tSERVER:PORT\tSNI\tENABLED")
+	fmt.Fprintln(tw, "NAME\tTYPE\tSERVER:PORT\tSNI\tENABLED")
 	for _, n := range ns {
-		fmt.Fprintf(tw, "%s\t%s:%d\t%s\t%t\n", n.Name, n.Server, n.Port, n.SNI, n.Enabled)
+		typ := n.Type
+		if typ == "" {
+			typ = nodes.TypeHysteria2
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s:%d\t%s\t%t\n", n.Name, typ, n.Server, n.Port, n.SNI, n.Enabled)
 	}
 	tw.Flush()
 	return 0
@@ -220,22 +224,58 @@ func cmdNodeAdd(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	path := fs.String("nodes", defaultNodesPath, "node configuration file")
 	name := fs.String("name", "", "node name")
+	nodeType := fs.String("type", "hysteria2", "node type: hysteria2 or vless-reality")
 	server := fs.String("server", "", "server address")
 	port := fs.Int("port", 0, "port")
 	password := fs.String("password", "", "password")
 	obfs := fs.String("obfs-password", "", "obfs password")
 	sni := fs.String("sni", "", "sni")
+	uuid := fs.String("uuid", "", "uuid (vless-reality)")
+	publicKey := fs.String("public-key", "", "reality public key (vless-reality)")
+	shortID := fs.String("short-id", "", "reality short id (vless-reality, optional)")
 	enabled := fs.Bool("enabled", true, "enabled")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	typ := nodes.NodeType(*nodeType)
+	if typ != nodes.TypeHysteria2 && typ != nodes.TypeVlessReality {
+		fmt.Fprintf(stderr, "error: unknown --type %q\n", *nodeType)
+		return 2
+	}
+
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
+	switch typ {
+	case nodes.TypeHysteria2:
+		if set["uuid"] || set["public-key"] || set["short-id"] {
+			fmt.Fprintln(stderr, "error: --uuid/--public-key/--short-id are not allowed with --type hysteria2")
+			return 2
+		}
+	case nodes.TypeVlessReality:
+		if set["password"] || set["obfs-password"] {
+			fmt.Fprintln(stderr, "error: --password/--obfs-password are not allowed with --type vless-reality")
+			return 2
+		}
 	}
 
 	var missing []string
 	nName := resolveField("name", *name, false, &missing)
 	nServer := resolveField("server", *server, false, &missing)
 	nSNI := resolveField("sni", *sni, false, &missing)
-	nPassword := resolveField("password", *password, true, &missing)
-	nObfs := resolveField("obfs-password", *obfs, true, &missing)
+
+	var nPassword, nObfs, nUUID, nPublicKey string
+	switch typ {
+	case nodes.TypeHysteria2:
+		nPassword = resolveField("password", *password, true, &missing)
+		nObfs = resolveField("obfs-password", *obfs, true, &missing)
+	case nodes.TypeVlessReality:
+		nUUID = resolveField("uuid", *uuid, true, &missing)
+		nPublicKey = resolveField("public-key", *publicKey, true, &missing)
+	}
+	nShortID := *shortID
+
 	nPort := *port
 	if nPort == 0 {
 		if !isTTY(os.Stdin) {
@@ -254,8 +294,10 @@ func cmdNodeAdd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	updated, err := nodes.Add(ns, nodes.Node{
-		Name: nName, Server: nServer, Port: nPort,
-		Password: nPassword, ObfsPassword: nObfs, SNI: nSNI, Enabled: *enabled,
+		Name: nName, Type: typ, Server: nServer, Port: nPort,
+		Password: nPassword, ObfsPassword: nObfs,
+		UUID: nUUID, PublicKey: nPublicKey, ShortID: nShortID,
+		SNI: nSNI, Enabled: *enabled,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
@@ -285,6 +327,9 @@ func cmdNodeEdit(args []string, stdout, stderr io.Writer) int {
 	password := fs.String("password", "", "password")
 	obfs := fs.String("obfs-password", "", "obfs password")
 	sni := fs.String("sni", "", "sni")
+	uuid := fs.String("uuid", "", "uuid")
+	publicKey := fs.String("public-key", "", "reality public key")
+	shortID := fs.String("short-id", "", "reality short id")
 	var enabled bool
 	fs.BoolVar(&enabled, "enabled", true, "enabled")
 
@@ -311,6 +356,20 @@ func cmdNodeEdit(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	n := ns[idx]
+
+	switch n.Type {
+	case nodes.TypeVlessReality:
+		if set["password"] || set["obfs-password"] {
+			fmt.Fprintln(stderr, "error: --password/--obfs-password are not allowed on a vless-reality node")
+			return 2
+		}
+	default:
+		if set["uuid"] || set["public-key"] || set["short-id"] {
+			fmt.Fprintln(stderr, "error: --uuid/--public-key/--short-id are not allowed on a hysteria2 node")
+			return 2
+		}
+	}
+
 	if set["name"] {
 		n.Name = *newName
 	}
@@ -328,6 +387,15 @@ func cmdNodeEdit(args []string, stdout, stderr io.Writer) int {
 	}
 	if set["sni"] {
 		n.SNI = *sni
+	}
+	if set["uuid"] {
+		n.UUID = *uuid
+	}
+	if set["public-key"] {
+		n.PublicKey = *publicKey
+	}
+	if set["short-id"] {
+		n.ShortID = *shortID
 	}
 	if set["enabled"] {
 		n.Enabled = enabled
