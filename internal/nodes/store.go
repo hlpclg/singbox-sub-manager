@@ -65,7 +65,7 @@ func Find(ns []Node, name string) (int, bool) {
 }
 
 func Add(ns []Node, n Node) ([]Node, error) {
-	if err := validateFields(n); err != nil {
+	if err := Validate(n); err != nil {
 		return nil, err
 	}
 	if _, ok := Find(ns, n.Name); ok {
@@ -76,7 +76,7 @@ func Add(ns []Node, n Node) ([]Node, error) {
 }
 
 func Replace(ns []Node, oldName string, updated Node) ([]Node, error) {
-	if err := validateFields(updated); err != nil {
+	if err := Validate(updated); err != nil {
 		return nil, err
 	}
 	idx, ok := Find(ns, oldName)

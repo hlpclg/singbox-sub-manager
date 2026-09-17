@@ -33,7 +33,7 @@ func parseLegacy(lines []string) ([]Node, error) {
 		if seen[n.Name] {
 			return nil, fmt.Errorf("line %d: duplicate node name %q", lineNo, n.Name)
 		}
-		if err := validateFields(n); err != nil {
+		if err := Validate(n); err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNo, err)
 		}
 		seen[n.Name] = true
@@ -76,7 +76,7 @@ func parseSectioned(lines []string) ([]Node, error) {
 		default:
 			return fmt.Errorf("node %q: invalid ENABLED value %q (want true or false)", cur.Name, curEnabled)
 		}
-		if err := validateFields(*cur); err != nil {
+		if err := Validate(*cur); err != nil {
 			return err
 		}
 		out = append(out, *cur)

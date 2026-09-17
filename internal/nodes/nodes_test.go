@@ -3,6 +3,7 @@ package nodes
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -161,5 +162,114 @@ func TestValidateName(t *testing.T) {
 		if err := ValidateName(n); err == nil {
 			t.Errorf("ValidateName(%q) = nil, want error", n)
 		}
+	}
+}
+
+func TestValidateHysteria2EmptyTypeDefaultsToHysteria2(t *testing.T) {
+	n := Node{Name: "JP", Server: "1.2.3.4", Port: 443, Password: "p", ObfsPassword: "o", SNI: "s", Enabled: true}
+	if err := Validate(n); err != nil {
+		t.Fatalf("Validate with empty Type should default to hysteria2: %v", err)
+	}
+}
+
+func TestValidateVlessRealityAccepted(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "www.bing.com",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", ShortID: "0123456789abcdef",
+		Enabled: true,
+	}
+	if err := Validate(n); err != nil {
+		t.Fatalf("Validate(valid vless-reality node) = %v, want nil", err)
+	}
+}
+
+func TestValidateVlessRealityShortIDOptional(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "www.bing.com",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+		Enabled: true,
+	}
+	if err := Validate(n); err != nil {
+		t.Fatalf("Validate(empty ShortID) = %v, want nil", err)
+	}
+}
+
+func TestValidateVlessRealityRejectsHysteria2Fields(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+		Password: "leaked",
+	}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error when a vless-reality node carries a Password")
+	}
+}
+
+func TestValidateHysteria2RejectsVlessRealityFields(t *testing.T) {
+	n := Node{
+		Name: "JP", Server: "1.2.3.4", Port: 443, Password: "p", ObfsPassword: "o", SNI: "s",
+		UUID: "12345678-1234-1234-1234-123456789abc",
+	}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error when a hysteria2 node carries a UUID")
+	}
+}
+
+func TestValidateVlessRealityRejectsBadUUID(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "not-a-uuid", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+	}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error for malformed UUID")
+	}
+}
+
+func TestValidateVlessRealityRejectsPaddedPublicKey(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+	}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error for padded base64 public key")
+	}
+}
+
+func TestValidateVlessRealityRejectsWrongLengthPublicKey(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODw",
+	}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error for a public key that does not decode to 32 bytes")
+	}
+}
+
+func TestValidateVlessRealityRejectsOddLengthShortID(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "12345678-1234-1234-1234-123456789abc", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+		ShortID: "abc",
+	}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error for odd-length ShortID")
+	}
+}
+
+func TestValidateChangeMeBeforeFormatCheck(t *testing.T) {
+	n := Node{
+		Name: "JP-Reality", Type: TypeVlessReality, Server: "1.2.3.4", Port: 443, SNI: "s",
+		UUID: "CHANGE_ME_UUID", PublicKey: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+	}
+	err := Validate(n)
+	if err == nil || !strings.Contains(err.Error(), "CHANGE_ME") {
+		t.Fatalf("Validate(CHANGE_ME_UUID) = %v, want a CHANGE_ME placeholder error (not a UUID-format error)", err)
+	}
+}
+
+func TestValidateUnknownTypeRejected(t *testing.T) {
+	n := Node{Name: "JP", Type: NodeType("tuic"), Server: "1.2.3.4", Port: 443, SNI: "s"}
+	if err := Validate(n); err == nil {
+		t.Fatal("expected error for unknown node type")
 	}
 }
