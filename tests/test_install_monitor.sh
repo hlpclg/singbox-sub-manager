@@ -9,7 +9,7 @@ TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 # shellcheck disable=SC2016
-grep -Fq 'PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.7.1}"' "$SCRIPT"
+grep -Fq 'PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.8.0}"' "$SCRIPT"
 grep -Fq 'monitor --help' "$SCRIPT"
 grep -Fq 'SuccessExitStatus=2' "$SCRIPT"
 grep -Fq 'OnCalendar=*:0/5' "$SCRIPT"
@@ -23,7 +23,7 @@ grep -Fq 'systemctl disable proxyctl-monitor.timer' "$SCRIPT"
 grep -Fq 'systemctl stop proxyctl-monitor.timer' "$SCRIPT"
 grep -Fq 'Failed to activate proxyctl-monitor timer.' "$SCRIPT"
 grep -Fq 'MONITOR_UNIT_DIR="${MONITOR_UNIT_DIR:-/etc/systemd/system}"' "$SCRIPT"
-grep -Fq 'PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.7.1}"' "$ROOT/merge-nodes.sh"
+grep -Fq 'PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.8.0}"' "$ROOT/merge-nodes.sh"
 
 SNIPPET="$(awk '
 /# 11\. Monitor/ { active=1 }

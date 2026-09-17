@@ -200,9 +200,11 @@ setup_wrong_download_version() {
 }
 verify_shell_fallback() {
   [[ -z "$PROXYCTL_VALIDATED_BIN" ]]
-  run_proxyctl_merge "$NODES_CONF" "$CASE_DIR/out"
+  local fallback_output
+  fallback_output="$(run_proxyctl_merge "$NODES_CONF" "$CASE_DIR/out" 2>&1)"
   [[ -s "$CASE_DIR/out/clash.yaml" ]]
   [[ -s "$CASE_DIR/out/sr.txt" ]]
+  grep -Fq 'no service policy groups' <<<"$fallback_output"
 }
 run_install_case wrong-download-version setup_wrong_download_version verify_shell_fallback
 

@@ -10,7 +10,6 @@ import (
 
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 	"github.com/hlpclg/singbox-sub-manager/internal/render"
-	"gopkg.in/yaml.v3"
 )
 
 var Version = "dev"
@@ -121,67 +120,20 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	if err := render.CheckNodeNames(ns); err != nil {
+		fmt.Fprintln(stderr, "validation failed:", err)
+		return 1
+	}
+
 	clashYaml := render.Clash(ns)
 	if strings.Contains(clashYaml, "CHANGE_ME") {
 		fmt.Fprintln(stderr, "validation failed: generated clash.yaml contains placeholder 'CHANGE_ME'")
 		return 1
 	}
 
-	var config struct {
-		Proxies []struct {
-			Name     string `yaml:"name"`
-			Type     string `yaml:"type"`
-			Server   string `yaml:"server"`
-			Port     int    `yaml:"port"`
-			Password string `yaml:"password"`
-			SNI      string `yaml:"sni"`
-		} `yaml:"proxies"`
-		ProxyGroups []struct {
-			Name    string   `yaml:"name"`
-			Proxies []string `yaml:"proxies"`
-		} `yaml:"proxy-groups"`
-		RuleProviders map[string]interface{} `yaml:"rule-providers"`
-		Rules         []string               `yaml:"rules"`
-	}
-
-	dec := yaml.NewDecoder(strings.NewReader(clashYaml))
-	dec.KnownFields(false)
-	if err := dec.Decode(&config); err != nil {
-		fmt.Fprintln(stderr, "validation failed: generated clash.yaml is invalid YAML:", err)
+	if err := validateClashYAML(clashYaml); err != nil {
+		fmt.Fprintln(stderr, "validation failed:", err)
 		return 1
-	}
-
-	proxySet := make(map[string]bool)
-	proxySet["DIRECT"] = true
-	proxySet["REJECT"] = true
-	proxySet["自动选择"] = true
-	proxySet["节点选择"] = true
-
-	for _, p := range config.Proxies {
-		if proxySet[p.Name] {
-			fmt.Fprintf(stderr, "validation failed: duplicate proxy name %q found in clash.yaml\n", p.Name)
-			return 1
-		}
-		proxySet[p.Name] = true
-	}
-
-	for _, pg := range config.ProxyGroups {
-		for _, p := range pg.Proxies {
-			if !proxySet[p] {
-				fmt.Fprintf(stderr, "validation failed: proxy group %q references unknown proxy %q\n", pg.Name, p)
-				return 1
-			}
-		}
-	}
-
-	for _, r := range config.Rules {
-		parts := strings.Split(r, ",")
-		if len(parts) >= 2 && parts[0] == "RULE-SET" {
-			if _, ok := config.RuleProviders[parts[1]]; !ok {
-				fmt.Fprintf(stderr, "validation failed: rule references unknown RULE-SET %q\n", parts[1])
-				return 1
-			}
-		}
 	}
 
 	sr := render.Shadowrocket(ns)

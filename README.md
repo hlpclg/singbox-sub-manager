@@ -174,7 +174,7 @@ Hysteria2 密钥保存于：
 4. 更新订阅
 5. 开启 TUN
 6. 模式选择 `Rule`
-7. 在 `节点选择` 中选择 `自动选择` 或指定节点
+7. 在 `节点选择` 中选择 `自动选择`（测速）、`故障转移`（节点故障时自动切换）或指定节点
 
 配置默认包含：
 
@@ -185,7 +185,10 @@ Hysteria2 密钥保存于：
 - 国内直连
 - 国外代理
 - Google Play 下载修正规则
-- OpenAI、Claude、Google、GitHub 等优先代理规则
+- 3 个基础策略组：`节点选择`（手动选择）、`自动选择`（url-test 测速）、`故障转移`（fallback 故障转移）
+- 11 个服务策略组，可在客户端单独为每个服务切换出口：
+  - 默认出口为 `节点选择`：`AI服务`（OpenAI、Claude）、`GitHub`、`流媒体`（YouTube、Netflix、Spotify）、`Disney`、`TikTok`、`Telegram`、`Google`
+  - 默认出口为 `DIRECT`：`Bilibili`、`Apple`、`Microsoft`、`游戏`
 
 ## Shadowrocket 使用方法
 
@@ -226,6 +229,8 @@ US-HY2|3.3.3.3|443|PASSWORD|OBFS_PASSWORD|www.bing.com
 节点名 | 服务器IP或域名 | 端口 | Hysteria2密码 | 混淆密码 | SNI
 ```
 
+节点名不得与内置策略组名或 `DIRECT`、`REJECT` 相同——即 `节点选择`、`自动选择`、`故障转移`、`AI服务`、`GitHub`、`流媒体`、`Disney`、`TikTok`、`Telegram`、`Google`、`Bilibili`、`Apple`、`Microsoft`、`游戏`、`DIRECT`、`REJECT`，共 16 个保留名。已启用节点使用其中任一名称时，`merge` 与 `validate` 会失败并在输出中指出冲突的节点名；禁用节点不受影响。
+
 重新运行安装脚本会读取 `nodes.conf` 并生成订阅，同时保留当前节点的 token 和密钥：
 
 ```bash
@@ -241,7 +246,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.6.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.8.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
@@ -469,6 +474,24 @@ sudo ./install-proxy.sh rollback --to backup-20260909T100000Z.tar.gz
 重跑安装脚本会把 proxyctl 拉回安装脚本内置的 `PROXYCTL_VERSION`：`update` 之后如果再执行 `sudo ./install-proxy.sh <domain>`，二进制会被降级回安装脚本固定的版本。升级后需要重跑安装时，用 `sudo PROXYCTL_VERSION=<tag> ./install-proxy.sh <domain>` 指定当前版本。
 
 `rollback` 不带参数时使用最近一次会话：先恢复配置（如果该会话有快照），再校验并恢复二进制对。会话里只有配置快照而没有暂存二进制时，会明确告诉你「二进制未变更」。找不到任何会话或归档时报错退出，不会静默无操作。
+
+### 升级到 v0.8.0 后重新生成订阅
+
+`sudo ./install-proxy.sh update` 只升级 `proxyctl` 二进制，**不会**重新生成订阅文件；已有的 `clash.yaml` / `sr.txt` 仍是升级前渲染出的旧内容。升级到 v0.8.0 后，用以下任一方式重新生成订阅，才能拿到新增的 14 个策略组：
+
+```bash
+# 方式一：下载 v0.8.0 tag 下固定版本的 merge-nodes.sh（不要用 main 分支）
+curl -fsSLO https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/v0.8.0/merge-nodes.sh
+chmod +x merge-nodes.sh
+sudo ./merge-nodes.sh
+
+# 方式二：直接调用已升级的 proxyctl 二进制
+sudo /usr/local/bin/proxyctl merge --nodes /etc/singbox-sub-manager/nodes.conf --output "/var/www/proxy-sub/$(sudo cat /var/lib/singbox-sub-manager/token)"
+```
+
+两种方式都会原地覆盖已有订阅文件：方式一（`merge-nodes.sh`）会把 `/var/www/proxy-sub` 下的属主与权限重置为 `caddy:caddy`、目录 755 / 文件 644（与安装脚本一致）；方式二只覆盖文件内容，保留原有属主与权限。
+
+**警告**：旧版本 `merge-nodes.sh` 内置较旧的 `PROXYCTL_VERSION`（例如 v0.7.1 脚本默认使用 v0.7.1）。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载该旧版本并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
 
 ## 获取其他节点的连接信息
 
@@ -767,7 +790,7 @@ google.com
 2. 重新启动 TUN
 3. 删除旧订阅后重新添加
 4. 确认当前模式为 `Rule`
-5. 确认 Google Play 流量命中了 `节点选择`
+5. 确认 Google Play 流量命中了 `Google` 组（默认出口 `节点选择`；如已手动切换 `Google` 组，则跟随该切换结果）
 
 ### 6. 全局模式正常，规则模式异常
 
