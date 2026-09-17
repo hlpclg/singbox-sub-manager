@@ -9,7 +9,7 @@ import (
 )
 
 func TestCheckNode_Success(t *testing.T) {
-	node := nodes.Node{Name: "test"}
+	node := nodes.Node{Name: "test", Server: "1.2.3.4", Port: 443, Password: "p", ObfsPassword: "o", SNI: "s"}
 
 	oldRun := runSingbox
 	oldTest := testProxy
@@ -37,7 +37,7 @@ func TestCheckNode_Success(t *testing.T) {
 }
 
 func TestCheckNode_ProxyFail(t *testing.T) {
-	node := nodes.Node{Name: "test"}
+	node := nodes.Node{Name: "test", Server: "1.2.3.4", Port: 443, Password: "p", ObfsPassword: "o", SNI: "s"}
 
 	oldRun := runSingbox
 	oldTest := testProxy
