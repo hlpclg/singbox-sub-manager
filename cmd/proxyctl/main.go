@@ -110,12 +110,8 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	}
 
 	for _, n := range ns {
-		if strings.Contains(n.Password, "CHANGE_ME") || strings.Contains(n.ObfsPassword, "CHANGE_ME") {
-			fmt.Fprintf(stderr, "validation failed: placeholder 'CHANGE_ME' found in node %q\n", n.Name)
-			return 1
-		}
-		if n.Server == "" || n.Port <= 0 || n.Port > 65535 || n.Password == "" || n.SNI == "" {
-			fmt.Fprintf(stderr, "validation failed: node %q is missing required hysteria2 fields or has invalid port\n", n.Name)
+		if err := nodes.Validate(n); err != nil {
+			fmt.Fprintln(stderr, "validation failed:", err)
 			return 1
 		}
 	}
@@ -137,14 +133,26 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	}
 
 	sr := render.Shadowrocket(ns)
+	if strings.TrimSpace(sr) == "" {
+		fmt.Fprintln(stderr, "validation failed: generated Shadowrocket output is empty")
+		return 1
+	}
 	lines := strings.Split(strings.TrimSpace(sr), "\n")
+	if len(lines) != len(ns) {
+		fmt.Fprintf(stderr, "validation failed: generated %d Shadowrocket URI line(s), want %d\n", len(lines), len(ns))
+		return 1
+	}
 	for i, l := range lines {
 		u, err := url.Parse(l)
 		if err != nil {
 			fmt.Fprintf(stderr, "validation failed: generated Shadowrocket URI at line %d is invalid: %v\n", i+1, err)
 			return 1
 		}
-		if u.Scheme != "hysteria2" {
+		wantScheme := "hysteria2"
+		if ns[i].Type == nodes.TypeVlessReality {
+			wantScheme = "vless"
+		}
+		if u.Scheme != wantScheme {
 			fmt.Fprintf(stderr, "validation failed: generated Shadowrocket URI at line %d has wrong scheme\n", i+1)
 			return 1
 		}

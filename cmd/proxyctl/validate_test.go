@@ -378,3 +378,24 @@ func TestValidateClashYAMLAcceptsRenderedOutput(t *testing.T) {
 		t.Errorf("expected nil error for render.Clash output, got %v", err)
 	}
 }
+
+func TestValidateAcceptsMixedProtocols(t *testing.T) {
+	mixed := "[JP]\nTYPE=hysteria2\nSERVER=1.2.3.4\nPORT=443\nPASSWORD=p\nOBFS_PASSWORD=o\nSNI=www.bing.com\nENABLED=true\n\n" +
+		"[JP-Reality]\nTYPE=vless-reality\nSERVER=5.6.7.8\nPORT=443\nUUID=12345678-1234-1234-1234-123456789abc\nPUBLIC_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\nSNI=www.bing.com\nENABLED=true\n"
+	p := writeNodes(t, mixed)
+	var out, errb bytes.Buffer
+	code := run([]string{"validate", "--nodes", p}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("validate code=%d err=%s out=%s", code, errb.String(), out.String())
+	}
+}
+
+func TestValidateRejectsVlessRealityMissingFields(t *testing.T) {
+	bad := "[JP-Reality]\nTYPE=vless-reality\nSERVER=5.6.7.8\nPORT=443\nSNI=www.bing.com\nENABLED=true\n"
+	p := writeNodes(t, bad)
+	var out, errb bytes.Buffer
+	code := run([]string{"validate", "--nodes", p}, &out, &errb)
+	if code == 0 {
+		t.Fatal("expected validate to fail for a vless-reality node missing UUID/PublicKey")
+	}
+}
