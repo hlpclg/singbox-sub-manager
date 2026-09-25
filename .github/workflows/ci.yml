@@ -20,6 +20,7 @@ jobs:
         run: |
           bash -n install-proxy.sh
           bash -n merge-nodes.sh
+          bash -n tests/test_reality_probe.sh
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
@@ -30,6 +31,7 @@ jobs:
           shellcheck tests/test_install_proxyctl.sh
           shellcheck tests/test_install_monitor.sh
           shellcheck tests/test_install_update.sh
+          shellcheck tests/test_reality_probe.sh
       - name: Go fmt
         run: if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then echo "Go code is not formatted"; exit 1; fi
       - name: Shell tests
@@ -38,6 +40,14 @@ jobs:
           bash tests/test_install_json.sh
           bash tests/test_install_monitor.sh
           bash tests/test_install_update.sh
+          # --verify-assets only: downloads and SHA256-verifies the pinned
+          # sing-box release. It needs network but not root or a real
+          # systemd host, so normal CI can run it without pretending to
+          # have real systemd (plan Task 1). The real-runtime gates in
+          # internal/realitynode/probe_integration_test.go (reality_integration
+          # build tag) need a real Debian/Ubuntu VM and are not run here;
+          # see docs/reality-node-validation.md.
+          bash tests/test_reality_probe.sh --verify-assets
 
       - name: Go test
         run: go test -v ./...

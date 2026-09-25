@@ -44,6 +44,7 @@ jobs:
           sudo apt-get install -y shellcheck
           shellcheck install-proxy.sh merge-nodes.sh
           shellcheck tests/test_install_json.sh tests/test_install_proxyctl.sh tests/test_install_monitor.sh tests/test_install_update.sh
+          shellcheck tests/test_reality_probe.sh
       - name: Build and validate proxyctl
         run: |
           mkdir -p dist
@@ -60,6 +61,11 @@ jobs:
           bash tests/test_install_update.sh
           cd dist
           sha256sum proxyctl-linux-* > checksums.txt
+      - name: Verify pinned Reality runtime assets
+        # --verify-assets only (network, no root/systemd needed); see
+        # docs/reality-node-validation.md for what the real-runtime gates
+        # in internal/realitynode need and why they don't run here.
+        run: bash tests/test_reality_probe.sh --verify-assets
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
