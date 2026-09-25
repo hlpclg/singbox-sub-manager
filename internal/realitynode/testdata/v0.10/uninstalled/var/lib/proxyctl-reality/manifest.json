@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "state": "uninstalled",
+  "singbox_current": "1.14.1",
+  "singbox_previous": "",
+  "entries": [
+    {"path": "/var/lib/proxyctl-reality", "mode": 448, "uid": 0, "gid": 0},
+    {"path": "/var/lib/proxyctl-reality/secrets.json", "mode": 384, "uid": 0, "gid": 0, "schema": 1},
+    {"path": "/var/lib/proxyctl-reality/instance.json", "mode": 384, "uid": 0, "gid": 0, "schema": 1}
+  ]
+}

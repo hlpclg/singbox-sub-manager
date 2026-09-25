@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "state": "installed",
+  "singbox_current": "1.14.1",
+  "singbox_previous": "",
+  "entries": [
+    {"path": "/etc/systemd/system/proxyctl-reality.service", "mode": 420, "uid": 0, "gid": 0, "sha256": "f7f4e8c93b2a9d8d54363a1b5706fea32ce616234364c8d2f959c5a5ecb87b99"},
+    {"path": "/etc/proxyctl-reality", "mode": 448, "uid": 0, "gid": 0},
+    {"path": "/etc/proxyctl-reality/config.json", "mode": 384, "uid": 0, "gid": 0, "sha256": "03ddc177c19aad4d054c0d72ce2c857c8ff998e595cec96e0092633cf81eaabc"},
+    {"path": "/var/lib/proxyctl-reality", "mode": 448, "uid": 0, "gid": 0},
+    {"path": "/var/lib/proxyctl-reality/secrets.json", "mode": 384, "uid": 0, "gid": 0, "schema": 1},
+    {"path": "/var/lib/proxyctl-reality/instance.json", "mode": 384, "uid": 0, "gid": 0, "schema": 1},
+    {"path": "/usr/local/lib/proxyctl-reality", "mode": 493, "uid": 0, "gid": 0},
+    {"path": "/usr/local/lib/proxyctl-reality/versions", "mode": 493, "uid": 0, "gid": 0},
+    {"path": "/usr/local/lib/proxyctl-reality/versions/1.14.1", "mode": 493, "uid": 0, "gid": 0},
+    {"path": "/usr/local/lib/proxyctl-reality/versions/1.14.1/sing-box", "mode": 493, "uid": 0, "gid": 0, "sha256": "2f653cdf25cdcdf4b945677e4dd925d24b8d50c63be612dd977e5271dbe9e49a"}
+  ]
+}
