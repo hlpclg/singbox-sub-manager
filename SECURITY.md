@@ -41,3 +41,16 @@
 - **锁不提供全局串行保证。** 详见 `README.md`「锁的适用范围（已知限制）」一节列出的、仍可能与之并发的旧路径（`install-proxy.sh` 在未持有恢复锁的窗口内调用 `merge`、用户手动执行的 `merge`/`subscription build`、默认 CRUD 与独立 `restore` 之间）。
 
 依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 11 节。
+
+## 共用事务引擎（`internal/transaction`）的安全前提（v0.10 起）
+
+`internal/transaction` 是 Reality 实例生命周期（install/reinstall/uninstall/purge/recover）和订阅中心发布共用的 journal、安全路径原语与正向步骤执行器。它复用 v0.7.1 为 `internal/backup` 建立的 openat 加固模式（可信根、逐级 `O_NOFOLLOW|O_DIRECTORY` 打开、变更前祖先链复核），但是一份独立实现，不导出或修改 `internal/backup` 的任何公共符号——两者的复验对象不同：`internal/backup` 复验的是同一次调用内已持有的文件描述符，`internal/transaction` 复验的是持久化在 journal `dir_ids` 里、可能跨越进程重启（recover）读取的记录。
+
+- **事务快照含敏感数据。** `snapshot` 步骤把修改前的文件原样复制进事务区 `snap/` 目录（mode 0600）；对 Reality 实例而言，这可能包括 `secrets.json` 中的私钥。事务区、其墓碑目录，以及任何导出的事务证据，都必须按含私钥文件对待：不得作为诊断信息附加到 issue、日志或截图，委托运维人员处理事务区或墓碑时同样适用私钥、订阅 token 等敏感信息的通用披露限制。
+- **临时文件名格式与作用范围。** 事务在受管路径所在目录中创建的一切临时文件，文件名固定为 `.proxyctl-txn-<txn_id>-<十进制序号>`（`TempName`）；journal 会拒绝任何不匹配这个格式、或与其他步骤重复的登记名字，防止把真实文件名误当作临时名登记。这个格式只在受管路径自身的目录内使用（例如 `/etc/proxyctl-reality/`、`/usr/local/lib/proxyctl-reality/versions/<v>/`、发布目录），不会出现在事务区内部（`journal.json(.tmp)`、`dl/`、`snap/` 使用各自固定或专属的名字，不匹配这个格式，也不参与“未登记临时名”扫描）。“未登记临时名”扫描只检查匹配这个格式、却不在当前 journal `steps[].temps`/`rollback_steps[].temps` 中登记的文件；扫描只看受管路径所在目录本身，不递归、不跟随符号链接，也不解读其他程序自己的临时文件（例如 `nodes.WriteFile` 的 `.nodes.*.tmp`）。
+- **叶子本身的符号链接替换是结构性防御，不是检测。** `write_file`、`remove_file`、`set_meta`、`snapshot` 的最后一步系统调用都相对父目录描述符对叶子名字操作，并且总是带 `O_NOFOLLOW`（或等价地：先以 `O_NOFOLLOW` 打开叶子取得文件描述符，再对该描述符执行 `fchmod`——`set_meta` 的 chmod 用这种方式，是因为经典 `fchmodat` 系统调用本身不支持 `AT_SYMLINK_NOFOLLOW`，`chown` 则用 `Fchownat` 自带的 `AT_SYMLINK_NOFOLLOW`）。打开叶子时还带 `O_NONBLOCK`，防止一个被替换成 FIFO 的叶子在没有写端时把持锁的进程无限期挂起；随后据打开后取得的 `fstat` 结果核实类型，只接受普通文件（或 `set_meta` 场景下的目录），FIFO、设备等一律拒绝。因此叶子在两次系统调用之间被替换成符号链接或其他类型时，后一次调用会直接失败，不会跟随链接改到根外的文件，也不会挂起——这一条不依赖时序运气，是结构性保证，与下面“祖先链复验”的检测性质不同。
+- **每次修改前都会核对现场与计划记录（Pre）是否一致。** 每个原语在真正执行 `rename`、`unlink`、`rmdir`、`mkdir`、`chown` 之前，都会重新读取目标当前的状态（存在性、类型、大小、内容哈希、权限、属主），并要求它与该步骤登记的 Pre 完全一致，不一致就拒绝执行、不做任何修改。这防止了目标已被外部篡改、或计划记录的前提本身就有误时，原语仍然盲目覆盖或删除现场内容。
+- **祖先链复验与修改之间仍是尽力检测，不是保证。** 与 `internal/backup` 相同的结构性限制在这里同样成立：每次修改受管路径之前，本包都会从可信根重新逐级打开并与 journal 当前记录的 `{dev, ino}` 比对，但复验完成之后、实际修改系统调用发生之前仍有一个无法消除的窗口——没有可移植的操作系统原语能在执行变更的同一时刻确认“这个目录描述符仍然对应复验时的那个对象”。本包对这一固有限制的应对方式是把复验点尽量贴近实际修改（每一次创建临时文件、`rename`、`unlink`、`mkdir`、`rmdir`、`fchmod`、`fchown` 之前都重新执行，而不是复用调用早前打开的描述符），但不消除这个窗口，只依赖与 v0.7.1 相同的安全前提：从可信根到每个目标路径之间的所有目录不得被不可信主体重命名、移动、替换或写入目录项。生产部署（`/etc`、`/var/lib`、`/usr/local/lib`、`/etc/systemd/system`、`dirname(subscription_root)` 均为 root 属主、其他用户不可写）满足该前提；发布场景下唯一已知的例外是 `subscription_root` 及其下的 `<token>/` 目录（被安装器 `chown` 给 `caddy`，因此对 `caddy` 可写），这也是本包为它们保留逐级重新打开与比对、而不是长期持有描述符的原因。
+- **目录身份登记的顺序与窗口。** `mkdir` 的顺序是：创建目录、fsync 父目录、设置权限与属主、把新目录的身份写入 journal、最后才把步骤标记为完成；`rmdir` 的顺序是：删除目录、fsync 父目录、把该位置的身份更新为“不存在”、再标记完成。身份写入和步骤完成分别持久化，确保中途中断后，磁盘状态、journal 记录的身份、步骤状态三者的组合始终落在可识别的合法范围内。身份写入之前的窗口（目录已创建或已删除，但身份记录尚未更新）与之后一样：这段时间内如果可信根之下的目录项被不可信主体替换，本包只能在下一次复验时发现身份不匹配并拒绝继续（返回错误，不执行下一步修改），不能阻止替换本身发生。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.1、7.2、7.3、7.4 节；`docs/superpowers/specs/2026-09-12-v0.7.1-openat-path-hardening-design.md` 第 3.3、6.5 节。
