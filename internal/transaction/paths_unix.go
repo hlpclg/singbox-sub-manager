@@ -273,7 +273,34 @@ func (mp ManagedPath) validate() error {
 // never the directory being created itself (§7.1's parenthetical is this
 // same point, stated from the step-sequencing side rather than the
 // verification side — see steps.go's Mkdir).
+//
+// This is the exact original (Task 4) signature and behavior, unchanged:
+// every existing caller (production forward/rollback execution via
+// resolveVerifiedParentHooked, and this package's existing tests) keeps
+// calling it exactly as before. resolveVerifiedParentEx below is a
+// separate, additive entry point Task 5's recovery-only code uses instead;
+// it is never substituted in for this one.
 func resolveVerifiedParent(mp ManagedPath, dirIDs map[string]DirIdentity, afterOpen func(level int)) (parent *os.File, opened []*os.File, err error) {
+	return resolveVerifiedParentEx(mp, dirIDs, afterOpen, nil)
+}
+
+// resolveVerifiedParentEx is resolveVerifiedParent's extended form, adding
+// except: consulted instead of failing outright on the two specific
+// mismatches §7.1's "崩溃恢复" paragraph carves out as legitimate rather
+// than tampering — a directory physically present at a level dir_ids still
+// records as absent (ancestorPresentButRecordedMissing — a mkdir step
+// crashed after Mkdirat but before its own dir_ids update), and a level
+// dir_ids records as existing but which is physically missing
+// (ancestorMissingButRecordedExists — a remove_dir step crashed after its
+// rmdir but before its own dir_ids update). Every other mismatch (a level
+// whose live identity actively disagrees with a recorded one, or an
+// unrelated I/O error) is never offered to except and always fails.
+// Production forward/rollback execution never calls this — only
+// recovery's own read-only state inspection (LiveFileState/LiveDirState,
+// and the journal-derived scan-directory resolution in recovery.go)
+// supplies a real except; a step that is executing must never proceed
+// through an ancestor mismatch it did not itself independently verify.
+func resolveVerifiedParentEx(mp ManagedPath, dirIDs map[string]DirIdentity, afterOpen func(level int), except ancestorExceptionFunc) (parent *os.File, opened []*os.File, err error) {
 	if err := mp.validate(); err != nil {
 		return nil, nil, err
 	}
@@ -290,6 +317,17 @@ func resolveVerifiedParent(mp ManagedPath, dirIDs map[string]DirIdentity, afterO
 		if openErr != nil {
 			if errors.Is(openErr, os.ErrNotExist) {
 				if ok && recorded.Exists {
+					if except != nil {
+						accept, exErr := except(mp.Keys[i], ancestorMissingButRecordedExists, nil)
+						if exErr != nil {
+							closeAll(opened)
+							return nil, nil, exErr
+						}
+						if accept {
+							closeAll(opened)
+							return nil, nil, errAncestorAbsentAccepted
+						}
+					}
 					closeAll(opened)
 					return nil, nil, fmt.Errorf("%w: %s is recorded as existing but is missing", ErrAncestorMismatch, mp.Keys[i])
 				}
@@ -306,6 +344,19 @@ func resolveVerifiedParent(mp ManagedPath, dirIDs map[string]DirIdentity, afterO
 			return nil, nil, idErr
 		}
 		if !ok || !recorded.Exists {
+			if except != nil {
+				accept, exErr := except(mp.Keys[i], ancestorPresentButRecordedMissing, child)
+				if exErr != nil {
+					child.Close()
+					closeAll(opened)
+					return nil, nil, exErr
+				}
+				if accept {
+					opened = append(opened, child)
+					parent = child
+					continue
+				}
+			}
 			child.Close()
 			closeAll(opened)
 			return nil, nil, fmt.Errorf("%w: %s is recorded as not existing but a directory is present", ErrAncestorMismatch, mp.Keys[i])
@@ -320,6 +371,35 @@ func resolveVerifiedParent(mp ManagedPath, dirIDs map[string]DirIdentity, afterO
 	}
 	return parent, opened, nil
 }
+
+// ancestorSituation names which of resolveVerifiedParent's two tolerated
+// mismatches an ancestorExceptionFunc is being asked about.
+type ancestorSituation int
+
+const (
+	// ancestorPresentButRecordedMissing: the live directory exists but
+	// dir_ids records this level as absent — liveChild is the already-
+	// open (not yet closed) live directory, for the callback to inspect
+	// (emptiness, ownership) before deciding.
+	ancestorPresentButRecordedMissing ancestorSituation = iota
+	// ancestorMissingButRecordedExists: dir_ids records this level as
+	// existing, but it is physically missing. liveChild is always nil
+	// (there is nothing to open).
+	ancestorMissingButRecordedExists
+)
+
+// ancestorExceptionFunc decides whether one ancestor-chain mismatch
+// (identified by key, the same dir_ids/AncestorKey string) is a legitimate
+// in-progress mkdir/remove_dir rather than tampering. Returning an error
+// aborts resolveVerifiedParent immediately with that error.
+type ancestorExceptionFunc func(key string, situation ancestorSituation, liveChild *os.File) (accept bool, err error)
+
+// errAncestorAbsentAccepted is resolveVerifiedParent's signal that an
+// ancestorMissingButRecordedExists mismatch was accepted: the requested
+// path (and everything under the missing ancestor) is legitimately absent,
+// not tampered with. LiveFileState/LiveDirState translate this into
+// PathState{Exists: false} exactly like a plain confirmed-absent ancestor.
+var errAncestorAbsentAccepted = errors.New("transaction: ancestor confirmed absent by an in-progress remove_dir")
 
 func closeAll(files []*os.File) {
 	for i := len(files) - 1; i >= 0; i-- {
@@ -497,7 +577,12 @@ func mkdirManaged(root *TrustedRoot, dirName string, mode fs.FileMode) (*os.File
 func scanUnregisteredTemps(dir *os.File, registered map[string]bool) ([]string, error) {
 	// os.File.ReadDir seeks from the file's current position; a dedicated
 	// fd is used so a caller's own use of dir's position (if any) is never
-	// disturbed.
+	// disturbed. dir itself is required to be a directory that genuinely,
+	// currently exists — a caller (recovery.go's forEachManagedScanDir)
+	// resolves and opens it fresh, ancestor-verified, immediately before
+	// this call, rather than handing in a long-held fd that could have
+	// gone stale; this function does not itself tolerate dir having been
+	// removed out from under it.
 	fd, err := unix.Openat(int(dir.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("transaction: reopen directory for scan: %w", err)
@@ -519,6 +604,42 @@ func scanUnregisteredTemps(dir *os.File, registered map[string]bool) ([]string, 
 		out = append(out, name)
 	}
 	return out, nil
+}
+
+// isEmptyDirFd reports whether the already-open directory f has zero
+// entries, via its own fresh reopened fd (same reasoning as isEmptyDir,
+// for a caller — recoveryAncestorException — that already holds the
+// directory open rather than a parent+name pair).
+func isEmptyDirFd(f *os.File) (bool, error) {
+	fd, err := unix.Openat(int(f.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, fmt.Errorf("transaction: reopen %s to check emptiness: %w", f.Name(), err)
+	}
+	nf := os.NewFile(uintptr(fd), f.Name())
+	defer nf.Close()
+	names, err := nf.Readdirnames(1)
+	if err != nil && err != io.EOF {
+		return false, fmt.Errorf("transaction: list %s: %w", f.Name(), err)
+	}
+	return len(names) == 0, nil
+}
+
+// isEmptyDir reports whether the directory named name directly under
+// parent has zero entries, without following a symbolic link and without
+// disturbing any other open fd's directory-stream position (it opens its
+// own fresh fd, the same reasoning scanUnregisteredTemps documents).
+func isEmptyDir(parent *os.File, name string) (bool, error) {
+	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, fmt.Errorf("transaction: reopen %s to check emptiness: %w", name, err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err != nil && err != io.EOF {
+		return false, fmt.Errorf("transaction: list %s: %w", name, err)
+	}
+	return len(names) == 0, nil
 }
 
 // TempName returns the fixed format §7.3 requires for every temp name a

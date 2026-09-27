@@ -140,26 +140,46 @@ func containsStr(list []string, want string) bool {
 	return false
 }
 
-// requireStep locates step id in the engine's forward Steps (rollback step
-// execution is Task 5's scope), and requires it to have kind and status
-// exactly as given, and to name the exact same path as mp: mp is validated
-// (ManagedPath.validate — malformed components, Keys that do not match
-// RootKey/Comps) and its computed TargetKey must equal the step's Target.
-// This is what stops "the path a caller safety-checked" and "the path a
-// caller's step record claims to be about" from silently diverging — every Engine primitive routes through this before touching
-// anything.
-func (e *Engine) requireStep(id string, kind StepKind, status StepStatus, mp ManagedPath) (Step, error) {
+// requireStep locates step id in the engine's forward Steps (rollback=false)
+// or rollback Steps (rollback=true; Task 5 — §7.4's rollback continuation
+// executes the file/directory primitives against RollbackSteps using the
+// exact same syscall sequences and hook points as the forward primitives),
+// and requires it to have kind and status exactly as given, and to name the
+// exact same path as mp: mp is validated (ManagedPath.validate — malformed
+// components, Keys that do not match RootKey/Comps) and its computed
+// TargetKey must equal the step's Target. This is what stops "the path a
+// caller safety-checked" and "the path a caller's step record claims to be
+// about" from silently diverging — every Engine primitive routes through
+// this before touching anything.
+func (e *Engine) requireStep(rollback bool, id string, kind StepKind, status StepStatus, mp ManagedPath) (Step, error) {
 	if err := mp.validate(); err != nil {
 		return Step{}, err
 	}
-	for _, s := range e.Journal().Steps {
+	steps := e.Journal().Steps
+	if rollback {
+		steps = e.Journal().RollbackSteps
+	}
+	for _, s := range steps {
 		if s.ID != id {
 			continue
 		}
 		if s.Kind != kind {
 			return Step{}, fmt.Errorf("transaction: step %s has kind %s, want %s", id, s.Kind, kind)
 		}
-		if s.Status != status {
+		// A caller asking for StatusPending (every primitive's own entry
+		// point — this package has no other caller of requireStep) also
+		// accepts a step already Started: that is exactly recover resuming
+		// a step a previous crash left mid-primitive (§7.4 step 4: "started
+		// 步骤按§7.2允许的状态幂等续做"; §7.5's committed-phase forward
+		// cleanup steps need the identical resumption). Each primitive
+		// below is written so re-running it against a Started step is safe
+		// (idempotent): Mkdir/RemoveFile/RemoveDir tolerate their syscall
+		// already having happened, WriteFile reuses (O_TRUNC, not O_EXCL)
+		// rather than requiring a fresh temp name, and SetMeta's chown/chmod
+		// are naturally idempotent. A step already Done is never accepted
+		// here regardless — recover must never replay a completed
+		// primitive.
+		if s.Status != status && !(status == StatusPending && s.Status == StatusStarted) {
 			return Step{}, fmt.Errorf("transaction: step %s is %s, want %s", id, s.Status, status)
 		}
 		if want := mp.TargetKey(); s.Target != want {
@@ -171,18 +191,47 @@ func (e *Engine) requireStep(id string, kind StepKind, status StepStatus, mp Man
 }
 
 // transition moves step id from `from` to `to` and persists the journal —
-// §7.1's "步骤执行前在journal标记started并持久化,完成后标记done并持久化".
-func (e *Engine) transition(id string, from, to StepStatus) error {
+// §7.1's "步骤执行前在journal标记started并持久化,完成后标记done并持久化" —
+// against the forward Steps (rollback=false) or RollbackSteps
+// (rollback=true).
+func (e *Engine) transition(rollback bool, id string, from, to StepStatus) error {
 	j := e.Journal().Clone()
-	for i := range j.Steps {
-		if j.Steps[i].ID != id {
+	steps := j.Steps
+	if rollback {
+		steps = j.RollbackSteps
+	}
+	for i := range steps {
+		if steps[i].ID != id {
 			continue
 		}
-		if j.Steps[i].Status != from {
-			return fmt.Errorf("transaction: step %s is %s, not %s", id, j.Steps[i].Status, from)
+		if steps[i].Status != from {
+			return fmt.Errorf("transaction: step %s is %s, not %s", id, steps[i].Status, from)
 		}
-		j.Steps[i].Status = to
+		steps[i].Status = to
 		return e.store.Update(j)
+	}
+	return fmt.Errorf("transaction: unknown step id %s", id)
+}
+
+// ensureStarted transitions step id from Pending to Started, or does
+// nothing if it is already Started (the resume case: a previous crash left
+// it there) — the idempotent replacement for every primitive's old
+// unconditional transition(Pending, Started) call, letting requireStep's
+// "Pending or Started" acceptance and this be the sole two places recovery
+// resumption logic lives, rather than each primitive re-deriving it.
+func (e *Engine) ensureStarted(rollback bool, id string) error {
+	steps := e.Journal().Steps
+	if rollback {
+		steps = e.Journal().RollbackSteps
+	}
+	for _, s := range steps {
+		if s.ID != id {
+			continue
+		}
+		if s.Status == StatusStarted {
+			return nil
+		}
+		return e.transition(rollback, id, StatusPending, StatusStarted)
 	}
 	return fmt.Errorf("transaction: unknown step id %s", id)
 }
@@ -284,16 +333,61 @@ func (e *Engine) verifyPreState(parent *os.File, name, target string, want PathS
 // ancestor-only re-verifications around its chmod/chown, are not
 // instantaneous.
 func (e *Engine) WriteFile(ctx context.Context, id string, mp ManagedPath, tmpName string, data []byte) error {
-	st, err := e.requireStep(id, KindWriteFile, StatusPending, mp)
+	return e.writeFile(ctx, false, id, mp, tmpName, data)
+}
+
+// RollbackWriteFile executes a write_file rollback step (§7.4 step 2: file
+// content restored from a completed snapshot) against RollbackSteps,
+// otherwise identical to WriteFile — same syscall order, same hook points,
+// same pre-state re-verification.
+func (e *Engine) RollbackWriteFile(ctx context.Context, id string, mp ManagedPath, tmpName string, data []byte) error {
+	return e.writeFile(ctx, true, id, mp, tmpName, data)
+}
+
+func (e *Engine) writeFile(ctx context.Context, rollback bool, id string, mp ManagedPath, tmpName string, data []byte) error {
+	st, err := e.requireStep(rollback, id, KindWriteFile, StatusPending, mp)
 	if err != nil {
 		return err
 	}
 	if !containsStr(st.Temps, tmpName) {
 		return fmt.Errorf("transaction: step %s: temp name %s is not registered in Temps", id, tmpName)
 	}
-	if err := e.transition(id, StatusPending, StatusStarted); err != nil {
+	// resuming is true only when this step was already Started *before*
+	// this call (captured from requireStep's return, ahead of
+	// ensureStarted's own possible transition) — i.e. a genuine resume of
+	// a step a previous crash left mid-primitive, never a fresh Pending
+	// call. Every "the target already looks advanced" shortcut below is
+	// gated on this: a fresh call must always find the target exactly at
+	// st.Pre, exactly as Task 4 originally required (TestPreStateEnforcement),
+	// or fail with ErrPreStateMismatch — it must never silently treat an
+	// unexpected pre-existing Post-equal (or, for set_meta, "mid"-equal)
+	// state as "someone already did this for me".
+	resuming := st.Status == StatusStarted
+	if err := e.ensureStarted(rollback, id); err != nil {
 		return err
 	}
+
+	if resuming {
+		// §7.2's allowed-started set for write_file is exactly {target ∈
+		// pre, post} — a previous attempt may have already completed the
+		// rename (crashed between "write_file:after_dir_fsync" and this
+		// step's own done transition). Detect it before touching the temp
+		// name at all, so a resumed run never re-creates or re-writes a
+		// temp file it does not need.
+		wantHash := st.Pre.SHA256 != "" || st.Post.SHA256 != ""
+		wantSchema := st.Pre.Schema != "" || st.Post.Schema != ""
+		liveNow, lerr := e.LiveFileState(mp, wantHash, wantSchema)
+		if lerr != nil {
+			return lerr
+		}
+		if liveNow == st.Post {
+			return e.transition(rollback, id, StatusStarted, StatusDone)
+		}
+		if liveNow != st.Pre {
+			return fmt.Errorf("%w: live state %+v, want %+v or %+v", ErrPreStateMismatch, liveNow, st.Pre, st.Post)
+		}
+	}
+
 	mode := fs.FileMode(st.Post.Mode)
 	uid, gid := st.Post.UID, st.Post.GID
 
@@ -310,6 +404,18 @@ func (e *Engine) WriteFile(ctx context.Context, id string, mp ManagedPath, tmpNa
 		return err
 	}
 	fd, err := unix.Openat(int(parent.Fd()), tmpName, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil && errors.Is(err, unix.EEXIST) && st.Status == StatusStarted {
+		// Genuinely resuming (st.Status was already Started when
+		// requireStep read it, before ensureStarted's own possible
+		// transition) after a crash between this temp file's creation and
+		// the rename that consumes it: §7.2 permits the registered temp
+		// name to already exist "with any content or metadata" while
+		// started, so truncate and rewrite it rather than treating a name
+		// only this transaction could ever have created as an unexplained
+		// collision. A fresh (Pending-at-entry) call never takes this
+		// branch — it keeps the original O_EXCL collision detection.
+		fd, err = unix.Openat(int(parent.Fd()), tmpName, unix.O_CREAT|unix.O_TRUNC|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	}
 	closeAll(opened)
 	if err != nil {
 		return fmt.Errorf("transaction: create %s: %w", tmpName, err)
@@ -389,7 +495,7 @@ func (e *Engine) WriteFile(ctx context.Context, id string, mp ManagedPath, tmpNa
 	if err := hook(stepHook, "write_file:after_dir_fsync"); err != nil {
 		return err
 	}
-	return e.transition(id, StatusStarted, StatusDone)
+	return e.transition(rollback, id, StatusStarted, StatusDone)
 }
 
 // Mkdir executes a mkdir step: Mkdirat -> fsync the parent directory ->
@@ -404,11 +510,28 @@ func (e *Engine) WriteFile(ctx context.Context, id string, mp ManagedPath, tmpNa
 // open new-directory fd rather than by name. It returns the newly created
 // directory's open fd.
 func (e *Engine) Mkdir(ctx context.Context, id string, mp ManagedPath) (*os.File, error) {
-	st, err := e.requireStep(id, KindMkdir, StatusPending, mp)
+	return e.mkdir(ctx, false, id, mp)
+}
+
+// RollbackMkdir executes a mkdir rollback step (§7.4 step 2: recreating a
+// directory the forward transaction removed) against RollbackSteps,
+// otherwise identical to Mkdir.
+func (e *Engine) RollbackMkdir(ctx context.Context, id string, mp ManagedPath) (*os.File, error) {
+	return e.mkdir(ctx, true, id, mp)
+}
+
+func (e *Engine) mkdir(ctx context.Context, rollback bool, id string, mp ManagedPath) (*os.File, error) {
+	st, err := e.requireStep(rollback, id, KindMkdir, StatusPending, mp)
 	if err != nil {
 		return nil, err
 	}
-	if err := e.transition(id, StatusPending, StatusStarted); err != nil {
+	// See writeFile's identical comment: resuming gates every "the target
+	// already looks advanced" shortcut below, so a fresh Pending call keeps
+	// Task 4's original guarantee of failing on an unexpected pre-existing
+	// directory (TestPreStateEnforcement) instead of mistaking it for its
+	// own prior partial attempt.
+	resuming := st.Status == StatusStarted
+	if err := e.ensureStarted(rollback, id); err != nil {
 		return nil, err
 	}
 	mode := fs.FileMode(st.Post.Mode)
@@ -417,23 +540,73 @@ func (e *Engine) Mkdir(ctx context.Context, id string, mp ManagedPath) (*os.File
 	if err := checkCancel(ctx); err != nil {
 		return nil, err
 	}
+
+	alreadyCreated := false
+	if resuming {
+		// Resume support (mirrors writeFile's three-way check): a previous
+		// crash may have left the directory already fully finished (chmod,
+		// chown and dir_ids all done — only this step's own done
+		// transition is missing) or already created but not yet
+		// chmod/chown'd (§7.2's allowed-started set: "空目录且owner为
+		// root:root、mode任意"). Detect both before touching Mkdirat, so a
+		// resumed run never re-attempts a syscall that already succeeded.
+		liveDir, liveEmpty, derr := e.LiveDirState(mp)
+		if derr != nil {
+			return nil, derr
+		}
+		if liveDir == st.Post {
+			dirFd, oerr := e.openManagedChildDir(mp)
+			if oerr != nil {
+				return nil, oerr
+			}
+			// R5 fix: the pre-transaction dir_ids entry for a brand-new
+			// directory is already present as {Exists: false} (registered
+			// at transaction start, §7.1) — checking only "is a key
+			// present" (the old `!ok` condition) therefore never fires for
+			// the single most common case (a genuinely new directory) and
+			// dir_ids is left stale forever. Compare the *value*: only
+			// skip re-registering when the recorded identity already
+			// equals the live one.
+			newID, idErr := CurrentIdentity(dirFd)
+			if idErr != nil {
+				return dirFd, idErr
+			}
+			if recorded, ok := e.Journal().DirIDs[mp.TargetKey()]; !ok || recorded != newID {
+				if err := e.RecordDirIdentity(mp.TargetKey(), newID); err != nil {
+					return dirFd, err
+				}
+			}
+			if err := e.transition(rollback, id, StatusStarted, StatusDone); err != nil {
+				return dirFd, err
+			}
+			return dirFd, nil
+		}
+		alreadyCreated = liveDir.Exists && liveDir.Type == PathTypeDir && liveEmpty &&
+			int(liveDir.UID) == os.Getuid() && int(liveDir.GID) == os.Getgid()
+		if liveDir.Exists && !alreadyCreated {
+			return nil, fmt.Errorf("%w: live directory state %+v is not a legal mkdir resume point", ErrPreStateMismatch, liveDir)
+		}
+	}
+
 	parent, opened, err := resolveVerifiedParentHooked(mp, e.Journal().DirIDs)
 	if err != nil {
 		closeAll(opened)
 		return nil, err
 	}
-	if err := e.verifyPreState(parent, mp.Leaf, mp.TargetKey(), st.Pre, true); err != nil {
-		closeAll(opened)
-		return nil, err
-	}
-	mkErr := unix.Mkdirat(int(parent.Fd()), mp.Leaf, uint32(mode.Perm()))
-	if mkErr != nil {
-		closeAll(opened)
-		return nil, fmt.Errorf("transaction: mkdir %s: %w", mp.Leaf, mkErr)
-	}
-	if err := hook(stepHook, "mkdir:after_mkdirat"); err != nil {
-		closeAll(opened)
-		return nil, err
+	if !alreadyCreated {
+		if err := e.verifyPreState(parent, mp.Leaf, mp.TargetKey(), st.Pre, true); err != nil {
+			closeAll(opened)
+			return nil, err
+		}
+		mkErr := unix.Mkdirat(int(parent.Fd()), mp.Leaf, uint32(mode.Perm()))
+		if mkErr != nil {
+			closeAll(opened)
+			return nil, fmt.Errorf("transaction: mkdir %s: %w", mp.Leaf, mkErr)
+		}
+		if err := hook(stepHook, "mkdir:after_mkdirat"); err != nil {
+			closeAll(opened)
+			return nil, err
+		}
 	}
 	dirFd, openErr := openChildDir(parent, mp.Leaf)
 	if openErr != nil {
@@ -486,7 +659,7 @@ func (e *Engine) Mkdir(ctx context.Context, id string, mp ManagedPath) (*os.File
 	if err := hook(stepHook, "mkdir:after_identity"); err != nil {
 		return dirFd, err
 	}
-	if err := e.transition(id, StatusStarted, StatusDone); err != nil {
+	if err := e.transition(rollback, id, StatusStarted, StatusDone); err != nil {
 		return dirFd, err
 	}
 	return dirFd, nil
@@ -503,36 +676,88 @@ func (e *Engine) Mkdir(ctx context.Context, id string, mp ManagedPath) (*os.File
 // type (file or directory) is taken from st.Pre.Type. The ancestor chain
 // is re-verified again, independently, immediately before the chmod.
 func (e *Engine) SetMeta(ctx context.Context, id string, mp ManagedPath) error {
-	st, err := e.requireStep(id, KindSetMeta, StatusPending, mp)
+	return e.setMeta(ctx, false, id, mp)
+}
+
+// RollbackSetMeta executes a set_meta rollback step against RollbackSteps,
+// otherwise identical to SetMeta.
+func (e *Engine) RollbackSetMeta(ctx context.Context, id string, mp ManagedPath) error {
+	return e.setMeta(ctx, true, id, mp)
+}
+
+func (e *Engine) setMeta(ctx context.Context, rollback bool, id string, mp ManagedPath) error {
+	st, err := e.requireStep(rollback, id, KindSetMeta, StatusPending, mp)
 	if err != nil {
 		return err
 	}
-	if err := e.transition(id, StatusPending, StatusStarted); err != nil {
+	// See writeFile's identical comment.
+	resuming := st.Status == StatusStarted
+	if err := e.ensureStarted(rollback, id); err != nil {
 		return err
 	}
 	mode := fs.FileMode(st.Post.Mode)
 	uid, gid := st.Post.UID, st.Post.GID
 	asDir := st.Pre.Type == PathTypeDir
 
+	skipChown := false
+	if resuming {
+		// Resume support (mirrors the other primitives): §7.2's
+		// allowed-started set for set_meta is {pre, post, and a "mid"
+		// state with post's owner but pre's mode} — a previous crash may
+		// have completed the chown already (mid) or both the chown and
+		// chmod already (post). Pre is checked first: when pre and mid
+		// coincide (this step never actually changes ownership), a live
+		// state exactly at pre must still be treated as "nothing done
+		// yet", not as "chown already happened to be a no-op".
+		mid := st.Pre
+		mid.UID, mid.GID = st.Post.UID, st.Post.GID
+		var (
+			liveNow    PathState
+			lerr       error
+			wantHash   = st.Pre.SHA256 != "" || st.Post.SHA256 != ""
+			wantSchema = st.Pre.Schema != "" || st.Post.Schema != ""
+		)
+		if asDir {
+			liveNow, _, lerr = e.LiveDirState(mp)
+		} else {
+			liveNow, lerr = e.LiveFileState(mp, wantHash, wantSchema)
+		}
+		if lerr != nil {
+			return lerr
+		}
+		switch {
+		case liveNow == st.Pre:
+			// normal path below
+		case liveNow == st.Post:
+			return e.transition(rollback, id, StatusStarted, StatusDone)
+		case liveNow == mid:
+			skipChown = true
+		default:
+			return fmt.Errorf("%w: live state %+v, want %+v, %+v or %+v", ErrPreStateMismatch, liveNow, st.Pre, mid, st.Post)
+		}
+	}
+
 	if err := checkCancel(ctx); err != nil {
 		return err
 	}
-	parent, opened, err := resolveVerifiedParentHooked(mp, e.Journal().DirIDs)
-	if err != nil {
+	if !skipChown {
+		parent, opened, err := resolveVerifiedParentHooked(mp, e.Journal().DirIDs)
+		if err != nil {
+			closeAll(opened)
+			return err
+		}
+		if err := e.verifyPreState(parent, mp.Leaf, mp.TargetKey(), st.Pre, asDir); err != nil {
+			closeAll(opened)
+			return err
+		}
+		chownErr := unix.Fchownat(int(parent.Fd()), mp.Leaf, int(uid), int(gid), unix.AT_SYMLINK_NOFOLLOW)
 		closeAll(opened)
-		return err
-	}
-	if err := e.verifyPreState(parent, mp.Leaf, mp.TargetKey(), st.Pre, asDir); err != nil {
-		closeAll(opened)
-		return err
-	}
-	chownErr := unix.Fchownat(int(parent.Fd()), mp.Leaf, int(uid), int(gid), unix.AT_SYMLINK_NOFOLLOW)
-	closeAll(opened)
-	if chownErr != nil {
-		return fmt.Errorf("transaction: chown %s: %w", mp.Leaf, chownErr)
-	}
-	if err := hook(stepHook, "set_meta:after_chown"); err != nil {
-		return err
+		if chownErr != nil {
+			return fmt.Errorf("transaction: chown %s: %w", mp.Leaf, chownErr)
+		}
+		if err := hook(stepHook, "set_meta:after_chown"); err != nil {
+			return err
+		}
 	}
 
 	if err := checkCancel(ctx); err != nil {
@@ -551,19 +776,52 @@ func (e *Engine) SetMeta(ctx context.Context, id string, mp ManagedPath) error {
 	if err := hook(stepHook, "set_meta:after_chmod"); err != nil {
 		return err
 	}
-	return e.transition(id, StatusStarted, StatusDone)
+	return e.transition(rollback, id, StatusStarted, StatusDone)
 }
 
 // RemoveFile executes a remove_file step: unlink then fsync the parent
 // directory, per §7.2. The target's live state is required to equal
 // st.Pre exactly immediately before the unlink.
 func (e *Engine) RemoveFile(ctx context.Context, id string, mp ManagedPath) error {
-	st, err := e.requireStep(id, KindRemoveFile, StatusPending, mp)
+	return e.removeFile(ctx, false, id, mp)
+}
+
+// RollbackRemoveFile executes a remove_file rollback step (§7.4 step 2: the
+// target did not exist before the transaction) against RollbackSteps,
+// otherwise identical to RemoveFile.
+func (e *Engine) RollbackRemoveFile(ctx context.Context, id string, mp ManagedPath) error {
+	return e.removeFile(ctx, true, id, mp)
+}
+
+func (e *Engine) removeFile(ctx context.Context, rollback bool, id string, mp ManagedPath) error {
+	st, err := e.requireStep(rollback, id, KindRemoveFile, StatusPending, mp)
 	if err != nil {
 		return err
 	}
-	if err := e.transition(id, StatusPending, StatusStarted); err != nil {
+	// See writeFile's identical comment.
+	resuming := st.Status == StatusStarted
+	if err := e.ensureStarted(rollback, id); err != nil {
 		return err
+	}
+
+	if resuming {
+		// §7.2's allowed-started set for remove_file is {pre,
+		// does-not-exist} — a previous crash may have already completed
+		// the unlink. Detect that before attempting it again, so a
+		// resumed run never re-unlinks (ENOENT) a file that is already
+		// gone.
+		wantHash := st.Pre.SHA256 != ""
+		wantSchema := st.Pre.Schema != ""
+		liveNow, lerr := e.LiveFileState(mp, wantHash, wantSchema)
+		if lerr != nil {
+			return lerr
+		}
+		if liveNow == st.Post {
+			return e.transition(rollback, id, StatusStarted, StatusDone)
+		}
+		if liveNow != st.Pre {
+			return fmt.Errorf("%w: live state %+v, want %+v or %+v", ErrPreStateMismatch, liveNow, st.Pre, st.Post)
+		}
 	}
 
 	if err := checkCancel(ctx); err != nil {
@@ -595,7 +853,7 @@ func (e *Engine) RemoveFile(ctx context.Context, id string, mp ManagedPath) erro
 	if err := hook(stepHook, "remove_file:after_fsync"); err != nil {
 		return err
 	}
-	return e.transition(id, StatusStarted, StatusDone)
+	return e.transition(rollback, id, StatusStarted, StatusDone)
 }
 
 // RemoveDir executes a remove_dir step: rmdir -> fsync the parent
@@ -606,12 +864,43 @@ func (e *Engine) RemoveFile(ctx context.Context, id string, mp ManagedPath) erro
 // target's live state is required to equal st.Pre exactly immediately
 // before the rmdir.
 func (e *Engine) RemoveDir(ctx context.Context, id string, mp ManagedPath) error {
-	st, err := e.requireStep(id, KindRemoveDir, StatusPending, mp)
+	return e.removeDir(ctx, false, id, mp)
+}
+
+// RollbackRemoveDir executes a remove_dir rollback step (§7.4 step 2: the
+// target directory did not exist before the transaction) against
+// RollbackSteps, otherwise identical to RemoveDir.
+func (e *Engine) RollbackRemoveDir(ctx context.Context, id string, mp ManagedPath) error {
+	return e.removeDir(ctx, true, id, mp)
+}
+
+func (e *Engine) removeDir(ctx context.Context, rollback bool, id string, mp ManagedPath) error {
+	st, err := e.requireStep(rollback, id, KindRemoveDir, StatusPending, mp)
 	if err != nil {
 		return err
 	}
-	if err := e.transition(id, StatusPending, StatusStarted); err != nil {
+	// See writeFile's identical comment.
+	resuming := st.Status == StatusStarted
+	if err := e.ensureStarted(rollback, id); err != nil {
 		return err
+	}
+
+	if resuming {
+		// §7.2's allowed-started set for remove_dir is {empty dir matching
+		// pre's metadata, does-not-exist} — a previous crash may have
+		// already completed the rmdir.
+		liveDir, _, derr := e.LiveDirState(mp)
+		if derr != nil {
+			return derr
+		}
+		if liveDir == st.Post {
+			if recorded, ok := e.Journal().DirIDs[mp.TargetKey()]; !ok || recorded.Exists {
+				if err := e.RecordDirIdentity(mp.TargetKey(), DirIdentity{Exists: false}); err != nil {
+					return err
+				}
+			}
+			return e.transition(rollback, id, StatusStarted, StatusDone)
+		}
 	}
 
 	if err := checkCancel(ctx); err != nil {
@@ -649,7 +938,7 @@ func (e *Engine) RemoveDir(ctx context.Context, id string, mp ManagedPath) error
 	if err := hook(stepHook, "remove_dir:after_identity"); err != nil {
 		return err
 	}
-	return e.transition(id, StatusStarted, StatusDone)
+	return e.transition(rollback, id, StatusStarted, StatusDone)
 }
 
 // Snapshot executes a snapshot step: verify the source's live state
@@ -666,14 +955,14 @@ func (e *Engine) RemoveDir(ctx context.Context, id string, mp ManagedPath) error
 // dir_ids/ancestor re-verification, see journal.go's writeTempAndRename
 // doc comment for the same point about journal.json itself).
 func (e *Engine) Snapshot(ctx context.Context, id string, mp ManagedPath, snapDir *os.File, tmpName string) error {
-	st, err := e.requireStep(id, KindSnapshot, StatusPending, mp)
+	st, err := e.requireStep(false, id, KindSnapshot, StatusPending, mp)
 	if err != nil {
 		return err
 	}
 	if !containsStr(st.Temps, tmpName) {
 		return fmt.Errorf("transaction: step %s: temp name %s is not registered in Temps", id, tmpName)
 	}
-	if err := e.transition(id, StatusPending, StatusStarted); err != nil {
+	if err := e.transition(false, id, StatusPending, StatusStarted); err != nil {
 		return err
 	}
 
@@ -733,7 +1022,7 @@ func (e *Engine) Snapshot(ctx context.Context, id string, mp ManagedPath, snapDi
 	if err := hook(stepHook, "snapshot:after_dir_fsync"); err != nil {
 		return err
 	}
-	return e.transition(id, StatusStarted, StatusDone)
+	return e.transition(false, id, StatusStarted, StatusDone)
 }
 
 func hook(h func(string) error, point string) error { return h(point) }
@@ -851,6 +1140,28 @@ func DetermineRunningState(chain []Step, live PathState, liveEmpty bool) error {
 	}
 }
 
+// DetermineRollingBackState implements §7.3's phase=rolling_back rule for a
+// single path: rollbackChain is that path's rollback-step chain (PathChain
+// applied to Journal.RollbackSteps); forwardChain is the same path's
+// forward chain, needed only to read its first step's Pre (the
+// pre-transaction state) for a path with no rollback steps at all — §7.3:
+// "没有回滚步骤的路径必须保持事务前状态". When rollbackChain is non-empty,
+// this is exactly DetermineRunningState applied to the rollback chain
+// instead of the forward one (§7.3: "按该路径的回滚步骤链使用上面的running
+// 判定规则，pre/post和中间状态都取自回滚原语").
+func DetermineRollingBackState(rollbackChain, forwardChain []Step, live PathState, liveEmpty bool) error {
+	if len(rollbackChain) == 0 {
+		if len(forwardChain) == 0 {
+			return fmt.Errorf("%w: empty forward and rollback chains", ErrInvalidJournal)
+		}
+		if live != forwardChain[0].Pre {
+			return fmt.Errorf("%w: path %s: no rollback step for this path, but live state does not match its pre-transaction state", ErrIllegalProgress, forwardChain[0].Target)
+		}
+		return nil
+	}
+	return DetermineRunningState(rollbackChain, live, liveEmpty)
+}
+
 // allowedStarted reports whether live is one of §7.2's table's allowed
 // intermediate states for a step of kind, currently started, with the
 // given pre/post. The owner a mkdir's still-empty intermediate directory
@@ -867,7 +1178,23 @@ func allowedStarted(kind StepKind, pre, post PathState, live PathState, liveEmpt
 		if !live.Exists {
 			return true
 		}
-		if live.Type == PathTypeDir && liveEmpty && int(live.UID) == os.Getuid() && int(live.GID) == os.Getgid() {
+		// §7.2's allowed-started set for mkdir is {不存在; 空目录且owner为
+		// root:root、mode任意; post} — every one of these three states is
+		// empty. A legitimate run can never have this step's own step
+		// still `started` while anything has been placed *inside* the
+		// directory it creates: the journal-wide status-prefix invariant
+		// (validateStatusPrefix, applied across the whole steps[] array,
+		// not per-target) means a later step targeting a child path can
+		// only have progressed once this mkdir step itself is `done`, not
+		// merely `started`. So a live directory that is not empty — even
+		// if its mode/owner already coincidentally equal post (chmod and
+		// chown both already ran, just the done transition itself has
+		// not) — was populated by something outside this transaction and
+		// must be rejected, not accepted as "already at post".
+		if !liveEmpty {
+			return false
+		}
+		if live.Type == PathTypeDir && int(live.UID) == os.Getuid() && int(live.GID) == os.Getgid() {
 			return true
 		}
 		return live == post
@@ -906,6 +1233,168 @@ func allowedStarted(kind StepKind, pre, post PathState, live PathState, liveEmpt
 	default:
 		return false
 	}
+}
+
+// chainContentKind reports whether any step in chain (forward or rollback)
+// identifies its target's content by SHA256, by a dynamic-state Schema
+// name, or neither (a directory target, or a file target this chain never
+// compares by content) — recovery.go's validation pass uses this to know
+// which of PathState's two mutually exclusive content fields a fresh live
+// read of that target must fill in, since a given target's whole chain
+// consistently uses at most one of them (Validate's contentFieldsValid
+// already rejects any single step using both at once).
+func chainContentKind(chain []Step) (wantHash, wantSchema bool) {
+	for _, s := range chain {
+		if s.Pre.SHA256 != "" || s.Post.SHA256 != "" {
+			wantHash = true
+		}
+		if s.Pre.Schema != "" || s.Post.Schema != "" {
+			wantSchema = true
+		}
+	}
+	return
+}
+
+// isAncestorLegitimatelyAbsent reports whether err is resolveVerifiedParent's
+// "this ancestor level is confirmed absent, and that is legitimate" outcome
+// — either a plain wrapped os.ErrNotExist (dir_ids itself already recorded
+// the level as absent) or errAncestorAbsentAccepted (dir_ids still says
+// existing, but an in-progress remove_dir step accounts for the gap) — as
+// opposed to ErrAncestorMismatch (a level disagreeing with dir_ids with no
+// accepted explanation — a real tamper signal) or any other error.
+func isAncestorLegitimatelyAbsent(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, errAncestorAbsentAccepted)
+}
+
+// recoveryAncestorException is the ancestorExceptionFunc LiveFileState/
+// LiveDirState supply to resolveVerifiedParent: it is the only place this
+// package tolerates §7.1's two "崩溃恢复" carve-outs, and only for
+// recovery's own read-only state inspection, never for a primitive that is
+// about to mutate anything.
+func (e *Engine) recoveryAncestorException(key string, situation ancestorSituation, liveChild *os.File) (bool, error) {
+	switch situation {
+	case ancestorPresentButRecordedMissing:
+		// §7.1: "只有当对应的mkdir...处于started状态,并且该目录为空、属主为
+		// root:root时,才把它视为本事务创建的". uid/gid: see
+		// allowedStarted's identical reasoning — the *current process's*
+		// uid/gid, not a hard-coded 0, so this is correct both under real
+		// root and under a non-root test run.
+		if !hasStartedStep(e.Journal(), key, KindMkdir) {
+			return false, nil
+		}
+		empty, err := isEmptyDirFd(liveChild)
+		if err != nil {
+			return false, err
+		}
+		if !empty {
+			return false, nil
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(int(liveChild.Fd()), &st); err != nil {
+			return false, err
+		}
+		return int(st.Uid) == os.Getuid() && int(st.Gid) == os.Getgid(), nil
+	case ancestorMissingButRecordedExists:
+		// §7.1: "rmdir之后、journal更新之前崩溃...对应remove_dir处于
+		// started...视为合法".
+		return hasStartedStep(e.Journal(), key, KindRemoveDir), nil
+	default:
+		return false, nil
+	}
+}
+
+// hasStartedStep reports whether j's forward Steps or RollbackSteps
+// contain a step targeting target, of kind, currently Started.
+func hasStartedStep(j *Journal, target string, kind StepKind) bool {
+	check := func(steps []Step) bool {
+		for _, s := range steps {
+			if s.Target == target && s.Kind == kind && s.Status == StatusStarted {
+				return true
+			}
+		}
+		return false
+	}
+	return check(j.Steps) || check(j.RollbackSteps)
+}
+
+// LiveFileState reads the current on-disk state of a file target, for
+// recovery's §7.3 per-path judgement (DetermineRunningState /
+// DetermineRollingBackState): it re-verifies mp's ancestor chain fresh
+// (exactly like every modifying primitive does immediately before its own
+// syscall), opens the leaf, and — via the same computeContentField helper
+// verifyPreState/openVerifiedSource use — fills whichever of SHA256/Schema
+// wantHash/wantSchema (normally chainContentKind's result for this
+// target's chain) selects. Neither set means the caller only cares about
+// existence/type/mode/ownership, not content.
+func (e *Engine) LiveFileState(mp ManagedPath, wantHash, wantSchema bool) (PathState, error) {
+	parent, opened, err := resolveVerifiedParentEx(mp, e.Journal().DirIDs, nil, e.recoveryAncestorException)
+	if err != nil {
+		closeAll(opened)
+		if isAncestorLegitimatelyAbsent(err) {
+			// An ancestor directory is recorded (and confirmed) as not
+			// existing — e.g. its own remove_dir rollback/cleanup step
+			// already ran. Anything nested under it, this leaf included,
+			// is then vacuously "does not exist" too; this is not a
+			// mismatch to report, since the ancestor's own absence was
+			// itself already verified against dir_ids.
+			return PathState{Exists: false}, nil
+		}
+		return PathState{}, err
+	}
+	defer closeAll(opened)
+	f, base, err := openLeafFile(parent, mp.Leaf)
+	if err != nil {
+		return PathState{}, err
+	}
+	if f == nil {
+		return base, nil
+	}
+	defer f.Close()
+	want := PathState{}
+	switch {
+	case wantHash:
+		want.SHA256 = "x"
+	case wantSchema:
+		want.Schema = "x"
+	}
+	return e.computeContentField(f, mp.TargetKey(), want, base)
+}
+
+// LiveDirState reads the current on-disk state of a directory target, plus
+// whether it is empty (mkdir/remove_dir's allowedStarted set depends on
+// emptiness), for recovery's §7.3 per-path judgement.
+func (e *Engine) LiveDirState(mp ManagedPath) (ps PathState, empty bool, err error) {
+	parent, opened, err := resolveVerifiedParentEx(mp, e.Journal().DirIDs, nil, e.recoveryAncestorException)
+	if err != nil {
+		closeAll(opened)
+		if isAncestorLegitimatelyAbsent(err) {
+			return PathState{Exists: false}, false, nil
+		}
+		return PathState{}, false, err
+	}
+	defer closeAll(opened)
+	ps, err = statLeafDir(parent, mp.Leaf)
+	if err != nil || !ps.Exists {
+		return ps, false, err
+	}
+	empty, err = isEmptyDir(parent, mp.Leaf)
+	return ps, empty, err
+}
+
+// openManagedChildDir resolves mp's ancestor chain fresh (ancestor-verified
+// against the journal's current dir_ids) and opens mp.Leaf as a directory
+// under the verified parent, closing every ancestor fd it opened along the
+// way before returning — used where only the leaf directory's own fd is
+// needed afterward (Engine.mkdir's already-fully-done resume fast path).
+func (e *Engine) openManagedChildDir(mp ManagedPath) (*os.File, error) {
+	parent, opened, err := resolveVerifiedParentEx(mp, e.Journal().DirIDs, nil, e.recoveryAncestorException)
+	if err != nil {
+		closeAll(opened)
+		return nil, err
+	}
+	child, err := openChildDir(parent, mp.Leaf)
+	closeAll(opened)
+	return child, err
 }
 
 // ScanUnregisteredTemps lists every ".proxyctl-txn-*"-formatted entry

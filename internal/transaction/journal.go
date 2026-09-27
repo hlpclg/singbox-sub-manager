@@ -197,6 +197,19 @@ type Step struct {
 	Post   PathState  `json:"post"`
 	Status StepStatus `json:"status"`
 	Temps  []string   `json:"temps,omitempty"`
+	// Provisional marks a forward step whose completion does not count
+	// toward §7.4's "第一个受管路径被修改" boundary — the only current use
+	// is publish's own staging directory (§10.3 step 4-5: "staging 不计入
+	// 修改边界"), which lives entirely inside the transaction's own control
+	// and is deleted regardless of whether recovery decides "nothing was
+	// modified yet" (exit 1) or performs a real rollback. Task 5's
+	// recovery.go (noneModified) is the only reader of this field; it is
+	// never set on a RollbackSteps entry (rollback continuation always
+	// means something real was modified). Absent (false) for every step a
+	// pre-Task-5 journal (schema=1's original Task 4 shape) ever wrote, so
+	// this addition is backward compatible with the frozen
+	// testdata/schema1/journal.json fixture.
+	Provisional bool `json:"provisional,omitempty"`
 }
 
 // Journal is the full §7.1 persisted schema=1 journal.
@@ -445,6 +458,9 @@ func validateSteps(steps []Step, allowSystemd bool) error {
 		}
 		if !allowSystemd && s.Kind.isSystemdKind() {
 			return fmt.Errorf("%w: rollback step %s uses systemd kind %q (§7.1: rollback_steps only uses file/directory primitives)", ErrInvalidJournal, s.ID, s.Kind)
+		}
+		if !allowSystemd && s.Provisional {
+			return fmt.Errorf("%w: rollback step %s is marked provisional, which only applies to forward steps", ErrInvalidJournal, s.ID)
 		}
 		if !s.Status.valid() {
 			return fmt.Errorf("%w: unknown step status %q", ErrInvalidJournal, s.Status)
