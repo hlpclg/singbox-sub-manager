@@ -39,6 +39,20 @@ LOG_FILE="$LOG_DIR/installer.log"
 SUB_ROOT="/var/www/proxy-sub"
 LOCK_FILE="/run/lock/singbox-sub-manager.lock"
 
+# v0.10 reverse-guard paths (spec §11.5, §11.2): a Reality node instance and
+# this subscription-center installer must never coexist on the same host,
+# and install/update/rollback must not run over a leftover publish
+# transaction. Injectable via env vars so tests never touch real system
+# paths.
+REALITY_UNIT_FILE="${REALITY_UNIT_FILE:-/etc/systemd/system/proxyctl-reality.service}"
+REALITY_CONFIG_DIR="${REALITY_CONFIG_DIR:-/etc/proxyctl-reality}"
+REALITY_STATE_DIR="${REALITY_STATE_DIR:-/var/lib/proxyctl-reality}"
+REALITY_BIN_DIR="${REALITY_BIN_DIR:-/usr/local/lib/proxyctl-reality}"
+REALITY_TXN_DIR="${REALITY_TXN_DIR:-/var/lib/proxyctl-reality-txn}"
+REALITY_TOMB_GLOB="${REALITY_TOMB_GLOB:-/var/lib/.proxyctl-reality-txn.tomb-*}"
+PUBLISH_TXN_DIR="${PUBLISH_TXN_DIR:-/var/lib/singbox-sub-manager/publish}"
+PUBLISH_TOMB_GLOB="${PUBLISH_TOMB_GLOB:-/var/lib/singbox-sub-manager/.publish.tomb-*}"
+
 # Not fully used in v0.2.0, pre-created for v0.3.0
 TEMPLATE_DIR="/usr/share/singbox-sub-manager/templates"
 EXAMPLES_DIR="/usr/share/singbox-sub-manager/examples"
@@ -112,11 +126,48 @@ acquire_installer_lock() {
   fi
 }
 
+# reject_if_incompatible_host implements spec §11.5's reverse check: after
+# the installer lock is held, refuse install/update/rollback if this host
+# shows any trace of a Reality node instance (any asset from spec §5.1's
+# table, not the lock file), or a leftover publish transaction/tombstone.
+# Neither role may be established on a host the other has already claimed.
+reject_if_incompatible_host() {
+  local path
+  for path in "$REALITY_UNIT_FILE" "$REALITY_CONFIG_DIR" "$REALITY_STATE_DIR" "$REALITY_BIN_DIR" "$REALITY_TXN_DIR"; do
+    if [[ -e "$path" ]]; then
+      echo "ERROR: this host has Reality node instance traces ($path); refusing to install/update/rollback the subscription center here" >&2
+      exit 1
+    fi
+  done
+
+  local tomb
+  shopt -s nullglob
+  for tomb in $REALITY_TOMB_GLOB; do
+    shopt -u nullglob
+    echo "ERROR: a Reality node transaction tombstone exists ($tomb); refusing to install/update/rollback the subscription center here" >&2
+    exit 1
+  done
+  shopt -u nullglob
+
+  if [[ -e "$PUBLISH_TXN_DIR" ]]; then
+    echo "ERROR: a leftover publish transaction exists ($PUBLISH_TXN_DIR); run 'proxyctl node publish --recover' first" >&2
+    exit 1
+  fi
+  shopt -s nullglob
+  for tomb in $PUBLISH_TOMB_GLOB; do
+    shopt -u nullglob
+    echo "ERROR: a leftover publish transaction tombstone exists ($tomb); run 'proxyctl node publish --recover' first" >&2
+    exit 1
+  done
+  shopt -u nullglob
+}
+
 installer_preflight() {
   require_root
   require_supported_os
   prepare_runtime_dirs
   acquire_installer_lock
+  reject_if_incompatible_host
 }
 
 log() {

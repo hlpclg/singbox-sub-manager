@@ -11,6 +11,15 @@ PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
 PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.9.0}"
 PROXYCTL_VALIDATED_BIN=""
 
+# v0.10 shared lock ordering (spec §11.1, §11.3): the whole run holds L1
+# then L2, in that order, so it serializes with publish, install, update,
+# rollback, backup, restore and monitor. Paths are injectable so tests
+# never touch real system paths; production defaults match install-proxy.sh.
+LOCK_FILE="${LOCK_FILE:-/run/lock/singbox-sub-manager.lock}"
+LOCK2_FILE="${LOCK2_FILE:-/run/lock/singbox-sub-manager-monitor.lock}"
+PUBLISH_TXN_DIR="${PUBLISH_TXN_DIR:-$STATE_DIR/publish}"
+PUBLISH_TOMB_GLOB="${PUBLISH_TOMB_GLOB:-$STATE_DIR/.publish.tomb-*}"
+
 die() {
   echo "$1" >&2
   exit 1
@@ -78,6 +87,26 @@ install_proxyctl_binary() {
 }
 
 [[ $(id -u) -eq 0 ]] || die "请用 sudo 运行：sudo bash merge-nodes.sh [nodes.conf]"
+
+# v0.10 §11.3: take L1 then L2 for the whole run, so this serializes with
+# publish, install, update, rollback, backup, restore and monitor.
+exec 9>"$LOCK_FILE"
+flock -w 30 9 || die "另一个操作正在进行，请稍候重试"
+exec 8>"$LOCK2_FILE"
+flock -w 30 8 || die "另一个操作正在进行，请稍候重试"
+
+# §11.2: after both locks are held, refuse to run over a leftover publish
+# transaction or tombstone.
+if [[ -e "$PUBLISH_TXN_DIR" ]]; then
+  die "存在遗留的发布事务（$PUBLISH_TXN_DIR），请先运行 proxyctl node publish --recover"
+fi
+shopt -s nullglob
+for tomb in $PUBLISH_TOMB_GLOB; do
+  shopt -u nullglob
+  die "存在遗留的发布事务墓碑（$tomb），请先运行 proxyctl node publish --recover"
+done
+shopt -u nullglob
+
 [[ -f "$NODES_FILE" ]] || die "找不到节点文件：$NODES_FILE"
 [[ -f "$TOKEN_FILE" ]] || die "找不到 $TOKEN_FILE；请在订阅中心服务器运行。"
 

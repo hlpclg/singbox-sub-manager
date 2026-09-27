@@ -6,18 +6,151 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"context"
 	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
+	"github.com/hlpclg/singbox-sub-manager/internal/hostlock"
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"github.com/hlpclg/singbox-sub-manager/internal/realitynode"
 	"golang.org/x/term"
 	"time"
 )
 
-const defaultNodesPath = "/etc/singbox-sub-manager/nodes.conf"
+// defaultNodesPath is a var, not a const, so tests can redirect the
+// "default nodes.conf" identity check (spec §11.2) into a temp directory
+// without touching /etc.
+var defaultNodesPath = "/etc/singbox-sub-manager/nodes.conf"
+
+// Fixed production paths for the legacy-journal guard (spec §10.3's publish
+// transaction area). internal/publish does not exist yet (v0.10 Task 9), so
+// these paths currently never exist in production; the guard is wired in
+// now so Task 9 only has to start creating them, not also wire the check.
+const (
+	publishTxnDir   = "/var/lib/singbox-sub-manager/publish"
+	publishTombGlob = "/var/lib/singbox-sub-manager/.publish.tomb-*"
+)
+
+// nodeLockEnv is the injectable seam for the default-nodes.conf lock and
+// legacy-instance/publish guard (spec §11.2, §11.5). Production wires real
+// hostlock and internal/realitynode; tests replace it wholesale so they
+// never touch /run/lock, /etc, /var/lib, or /usr/local.
+type nodeLockEnv struct {
+	lockPaths       hostlock.Paths
+	acquire         func(ctx context.Context, paths hostlock.Paths, opts hostlock.AcquireOptions, levels ...hostlock.Level) (*hostlock.Lease, error)
+	realityRoots    realitynode.Roots
+	realityFS       realitynode.StateFS
+	publishTxnDir   string
+	publishTombGlob string
+}
+
+var newNodeLockEnv = productionNodeLockEnv
+
+func productionNodeLockEnv() nodeLockEnv {
+	return nodeLockEnv{
+		lockPaths:       hostlock.ProdPaths(),
+		acquire:         hostlock.Acquire,
+		realityRoots:    realitynode.ProdRoots(),
+		realityFS:       realitynode.OSStateFS(),
+		publishTxnDir:   publishTxnDir,
+		publishTombGlob: publishTombGlob,
+	}
+}
+
+// isDefaultNodesPath implements spec §11.2's "默认" identity check: compare
+// by os.SameFile when both paths exist, otherwise compare Abs(path) with
+// the parent directory symlink-resolved, matching the same equivalence
+// rule for a not-yet-created default file, a relative path, or a symlink.
+func isDefaultNodesPath(path string) (bool, error) {
+	if path == defaultNodesPath {
+		return true, nil
+	}
+	pInfo, pErr := os.Stat(path)
+	dInfo, dErr := os.Stat(defaultNodesPath)
+	if pErr == nil && dErr == nil {
+		return os.SameFile(pInfo, dInfo), nil
+	}
+	pResolved, err := resolveForPathIdentity(path)
+	if err != nil {
+		return false, err
+	}
+	dResolved, err := resolveForPathIdentity(defaultNodesPath)
+	if err != nil {
+		return false, err
+	}
+	return pResolved == dResolved, nil
+}
+
+func resolveForPathIdentity(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	dir, file := filepath.Split(abs)
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		// The parent directory does not exist (or is unreadable): there is
+		// no symlink to resolve, so the absolute path itself is the best
+		// available identity. Two paths in this state compare equal only
+		// when their absolute forms already matched exactly.
+		return abs, nil
+	}
+	return filepath.Join(realDir, file), nil
+}
+
+// legacyGuardReason implements spec §11.2/§11.5's reverse check, shared by
+// the default-nodes.conf write path (node.go) and independent restore
+// (backup.go): after the relevant lock is held, refuse to proceed if this
+// host shows any trace of a Reality node instance, or a leftover publish
+// transaction/tombstone. Returns "" when clear to proceed.
+func legacyGuardReason(roots realitynode.Roots, fsys realitynode.StateFS, publishTxnDir, publishTombGlob string) string {
+	state := realitynode.DetectInstanceState(fsys, roots)
+	if state.Status != realitynode.StatusNotInstalled {
+		return "this host has Reality node instance traces; refusing to write here"
+	}
+	if _, err := os.Stat(publishTxnDir); err == nil {
+		return "a leftover publish transaction exists; run `proxyctl node publish --recover` first"
+	}
+	if matches, _ := filepath.Glob(publishTombGlob); len(matches) > 0 {
+		return "a leftover publish transaction tombstone exists; run `proxyctl node publish --recover` first"
+	}
+	return ""
+}
+
+// withDefaultNodesLock runs fn immediately, unlocked, for any --nodes path
+// other than the default nodes.conf (unchanged pre-v0.10 behavior). For the
+// default path, it takes L1 (spec §11.2) and rejects with exit 1 if the
+// legacy guard finds a reason to, before ever calling fn — so a rejection
+// never touches the file. Interactive prompting for missing fields (node
+// add) must happen before this is called: spec §4.4 requires prompting to
+// finish, unlocked, before L1 is taken.
+func withDefaultNodesLock(path string, stderr io.Writer, fn func() int) int {
+	isDefault, err := isDefaultNodesPath(path)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if !isDefault {
+		return fn()
+	}
+
+	env := newNodeLockEnv()
+	lease, err := env.acquire(context.Background(), env.lockPaths, hostlock.AcquireOptions{}, hostlock.L1)
+	if err != nil {
+		fmt.Fprintln(stderr, "error: another operation is in progress:", err)
+		return 1
+	}
+	defer lease.Release()
+
+	if reason := legacyGuardReason(env.realityRoots, env.realityFS, env.publishTxnDir, env.publishTombGlob); reason != "" {
+		fmt.Fprintln(stderr, "error:", reason)
+		return 1
+	}
+	return fn()
+}
 
 func nodeUsage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "usage: proxyctl node <list|add|edit|remove|enable|disable|migrate> [args]")
@@ -132,21 +265,23 @@ func cmdNodeSetEnabled(args []string, stdout, stderr io.Writer, enabled bool) in
 		return 2
 	}
 	name := rest[0]
-	ns, ok := loadForMutation(path, stderr)
-	if !ok {
-		return 1
-	}
-	updated, err := nodes.SetEnabled(ns, name, enabled)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	if err := nodes.WriteFile(path, updated); err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "node %q enabled=%t\n", name, enabled)
-	return 0
+	return withDefaultNodesLock(path, stderr, func() int {
+		ns, ok := loadForMutation(path, stderr)
+		if !ok {
+			return 1
+		}
+		updated, err := nodes.SetEnabled(ns, name, enabled)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if err := nodes.WriteFile(path, updated); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "node %q enabled=%t\n", name, enabled)
+		return 0
+	})
 }
 
 func cmdNodeRemove(args []string, stdout, stderr io.Writer) int {
@@ -159,21 +294,23 @@ func cmdNodeRemove(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	name := rest[0]
-	ns, ok := loadForMutation(path, stderr)
-	if !ok {
-		return 1
-	}
-	updated, err := nodes.Remove(ns, name)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	if err := nodes.WriteFile(path, updated); err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "removed node %q\n", name)
-	return 0
+	return withDefaultNodesLock(path, stderr, func() int {
+		ns, ok := loadForMutation(path, stderr)
+		if !ok {
+			return 1
+		}
+		updated, err := nodes.Remove(ns, name)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if err := nodes.WriteFile(path, updated); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "removed node %q\n", name)
+		return 0
+	})
 }
 
 func isTTY(f *os.File) bool {
@@ -289,26 +426,28 @@ func cmdNodeAdd(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	ns, ok := loadForMutation(*path, stderr)
-	if !ok {
-		return 1
-	}
-	updated, err := nodes.Add(ns, nodes.Node{
-		Name: nName, Type: typ, Server: nServer, Port: nPort,
-		Password: nPassword, ObfsPassword: nObfs,
-		UUID: nUUID, PublicKey: nPublicKey, ShortID: nShortID,
-		SNI: nSNI, Enabled: *enabled,
+	return withDefaultNodesLock(*path, stderr, func() int {
+		ns, ok := loadForMutation(*path, stderr)
+		if !ok {
+			return 1
+		}
+		updated, err := nodes.Add(ns, nodes.Node{
+			Name: nName, Type: typ, Server: nServer, Port: nPort,
+			Password: nPassword, ObfsPassword: nObfs,
+			UUID: nUUID, PublicKey: nPublicKey, ShortID: nShortID,
+			SNI: nSNI, Enabled: *enabled,
+		})
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if err := nodes.WriteFile(*path, updated); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "added node %q\n", nName)
+		return 0
 	})
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	if err := nodes.WriteFile(*path, updated); err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "added node %q\n", nName)
-	return 0
 }
 
 // cmdNodeEdit expects the node name as a leading positional argument, e.g.
@@ -346,72 +485,74 @@ func cmdNodeEdit(args []string, stdout, stderr io.Writer) int {
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
-	ns, ok := loadForMutation(*path, stderr)
-	if !ok {
-		return 1
-	}
-	idx, found := nodes.Find(ns, target)
-	if !found {
-		fmt.Fprintf(stderr, "error: node %q not found\n", target)
-		return 1
-	}
-	n := ns[idx]
-
-	switch n.Type {
-	case nodes.TypeVlessReality:
-		if set["password"] || set["obfs-password"] {
-			fmt.Fprintln(stderr, "error: --password/--obfs-password are not allowed on a vless-reality node")
-			return 2
+	return withDefaultNodesLock(*path, stderr, func() int {
+		ns, ok := loadForMutation(*path, stderr)
+		if !ok {
+			return 1
 		}
-	default:
-		if set["uuid"] || set["public-key"] || set["short-id"] {
-			fmt.Fprintln(stderr, "error: --uuid/--public-key/--short-id are not allowed on a hysteria2 node")
-			return 2
+		idx, found := nodes.Find(ns, target)
+		if !found {
+			fmt.Fprintf(stderr, "error: node %q not found\n", target)
+			return 1
 		}
-	}
+		n := ns[idx]
 
-	if set["name"] {
-		n.Name = *newName
-	}
-	if set["server"] {
-		n.Server = *server
-	}
-	if set["port"] {
-		n.Port = *port
-	}
-	if set["password"] {
-		n.Password = *password
-	}
-	if set["obfs-password"] {
-		n.ObfsPassword = *obfs
-	}
-	if set["sni"] {
-		n.SNI = *sni
-	}
-	if set["uuid"] {
-		n.UUID = *uuid
-	}
-	if set["public-key"] {
-		n.PublicKey = *publicKey
-	}
-	if set["short-id"] {
-		n.ShortID = *shortID
-	}
-	if set["enabled"] {
-		n.Enabled = enabled
-	}
+		switch n.Type {
+		case nodes.TypeVlessReality:
+			if set["password"] || set["obfs-password"] {
+				fmt.Fprintln(stderr, "error: --password/--obfs-password are not allowed on a vless-reality node")
+				return 2
+			}
+		default:
+			if set["uuid"] || set["public-key"] || set["short-id"] {
+				fmt.Fprintln(stderr, "error: --uuid/--public-key/--short-id are not allowed on a hysteria2 node")
+				return 2
+			}
+		}
 
-	updated, err := nodes.Replace(ns, target, n)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	if err := nodes.WriteFile(*path, updated); err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "updated node %q\n", n.Name)
-	return 0
+		if set["name"] {
+			n.Name = *newName
+		}
+		if set["server"] {
+			n.Server = *server
+		}
+		if set["port"] {
+			n.Port = *port
+		}
+		if set["password"] {
+			n.Password = *password
+		}
+		if set["obfs-password"] {
+			n.ObfsPassword = *obfs
+		}
+		if set["sni"] {
+			n.SNI = *sni
+		}
+		if set["uuid"] {
+			n.UUID = *uuid
+		}
+		if set["public-key"] {
+			n.PublicKey = *publicKey
+		}
+		if set["short-id"] {
+			n.ShortID = *shortID
+		}
+		if set["enabled"] {
+			n.Enabled = enabled
+		}
+
+		updated, err := nodes.Replace(ns, target, n)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		if err := nodes.WriteFile(*path, updated); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "updated node %q\n", n.Name)
+		return 0
+	})
 }
 
 func cmdNodeMigrate(args []string, stdout, stderr io.Writer) int {
@@ -421,25 +562,27 @@ func cmdNodeMigrate(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	ns, format, err := nodes.Load(*path)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	switch format {
-	case nodes.FormatSectioned:
-		fmt.Fprintln(stdout, "already in sectioned format; nothing to do")
+	return withDefaultNodesLock(*path, stderr, func() int {
+		ns, format, err := nodes.Load(*path)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		switch format {
+		case nodes.FormatSectioned:
+			fmt.Fprintln(stdout, "already in sectioned format; nothing to do")
+			return 0
+		case nodes.FormatEmpty:
+			fmt.Fprintln(stderr, "error: no nodes to migrate")
+			return 1
+		}
+		if err := nodes.WriteFile(*path, ns); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "migrated %d node(s); backup at %s.bak\n", len(ns), *path)
 		return 0
-	case nodes.FormatEmpty:
-		fmt.Fprintln(stderr, "error: no nodes to migrate")
-		return 1
-	}
-	if err := nodes.WriteFile(*path, ns); err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "migrated %d node(s); backup at %s.bak\n", len(ns), *path)
-	return 0
+	})
 }
 
 func cmdNodeTest(args []string, stdout, stderr io.Writer) int {
