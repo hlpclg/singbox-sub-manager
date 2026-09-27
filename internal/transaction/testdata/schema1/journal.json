@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "txn_id": "fixture-txn-0001",
+  "op": "install",
+  "proxyctl_version": "v0.10.0",
+  "created_at": "2026-09-25T00:00:00Z",
+  "phase": "running",
+  "rollback_files_done": false,
+  "singbox_version_before": "",
+  "singbox_version_after": "1.14.1",
+  "unit_state_before": {
+    "load_state": "not-found",
+    "unit_file_state": "",
+    "active_state": "inactive"
+  },
+  "dir_ids": {
+    "etc/proxyctl-reality": { "exists": true, "dev": 64768, "ino": 123456 },
+    "var/lib/proxyctl-reality": { "exists": false }
+  },
+  "rollback_systemd": "none",
+  "steps": [
+    {
+      "id": "s1",
+      "kind": "mkdir",
+      "target": "etc/proxyctl-reality",
+      "pre": { "exists": false },
+      "post": { "exists": true, "type": "dir", "mode": 448, "uid": 0, "gid": 0 },
+      "status": "done"
+    },
+    {
+      "id": "s4",
+      "kind": "systemd_enable",
+      "target": "systemd/proxyctl-reality.service",
+      "pre": { "exists": false, "unit_file_state": "disabled" },
+      "post": { "exists": false, "unit_file_state": "enabled" },
+      "status": "done"
+    },
+    {
+      "id": "s2",
+      "kind": "write_file",
+      "target": "etc/proxyctl-reality/config.json",
+      "pre": { "exists": false },
+      "post": {
+        "exists": true,
+        "type": "file",
+        "size": 2,
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "mode": 384,
+        "uid": 0,
+        "gid": 0
+      },
+      "status": "started",
+      "temps": [".proxyctl-txn-fixture-txn-0001-1"]
+    },
+    {
+      "id": "s3",
+      "kind": "write_file",
+      "target": "var/lib/proxyctl-reality/manifest.json",
+      "pre": { "exists": false },
+      "post": { "exists": true, "type": "file", "size": 10, "schema": "manifest-v1", "mode": 384, "uid": 0, "gid": 0 },
+      "status": "pending",
+      "temps": [".proxyctl-txn-fixture-txn-0001-2"]
+    },
+    {
+      "id": "s5",
+      "kind": "write_file",
+      "target": "var/lib/proxyctl-reality/instance.json",
+      "pre": { "exists": true, "type": "file", "size": 40, "schema": "instance-v1", "mode": 384, "uid": 0, "gid": 0 },
+      "post": { "exists": true, "type": "file", "size": 44, "schema": "instance-v1", "mode": 384, "uid": 0, "gid": 0 },
+      "status": "pending",
+      "temps": [".proxyctl-txn-fixture-txn-0001-3"]
+    }
+  ]
+}
