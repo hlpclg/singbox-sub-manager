@@ -255,6 +255,8 @@ sudo ./merge-nodes.sh
 - `install-proxy.sh` 若无法安装带 `monitor` 支持且通过校验的 `proxyctl` 会失败退出，不会启用监控 timer；
 - `merge-nodes.sh` 无内置渲染器回退，若无法获取校验通过的 `proxyctl` 会明确报错退出。
 
+自 v0.10.0 起，`merge-nodes.sh` 整个运行期间会依次获取安装锁和恢复锁（各最长等待 30 秒），从而与 `install-proxy.sh`、`backup`、`restore`、`monitor` 串行；取到两把锁后如果发现遗留的订阅发布事务，会拒绝执行并提示先运行 `proxyctl node publish --recover`。
+
 两个命令都会覆盖生成：
 
 ```text
@@ -295,6 +297,8 @@ proxyctl subscription build --nodes /etc/singbox-sub-manager/nodes.conf --output
 ```
 
 节点文件权限为 `0600`，每次修改前自动备份为 `nodes.conf.bak`。
+
+自 v0.10.0 起，写入**默认** `nodes.conf`（即不带 `--nodes` 或 `--nodes` 指向同一文件）的 `add/edit/enable/disable/remove/migrate` 会先获取一把主机级锁，避免与 `install-proxy.sh`、`bootstrap-node.sh --upgrade`、订阅发布等操作交叉写入；取锁后如果发现本机存在 Reality 节点实例的痕迹，或存在遗留的订阅发布事务，命令会拒绝执行并返回失败，不做任何修改（这类主机应改用 `proxyctl node service ...` 管理，而不是本节的订阅中心 CRUD）。用 `--nodes PATH` 指向其他文件的调用不受影响，行为与之前完全一致。
 
 ### 从旧格式迁移
 
@@ -392,9 +396,13 @@ proxyctl monitor status
 
 状态文件位于 `/var/lib/singbox-sub-manager/monitor-state.json`，暂停标记位于 `/var/lib/singbox-sub-manager/monitor-paused`。`monitor` 输出机器可读 JSON；退出码 0 表示最终健康，1 表示恢复失败，2 表示降级但未发生失败恢复，3 表示无法可靠决策。
 
+`monitor` 与 `backup`、`restore` 共用同一把恢复锁：如果某一轮 `monitor` 恰好与 `proxyctl backup`（自 v0.10.0 起）或 `restore` 同时运行，那一轮会因为拿不到锁直接返回退出码 3，不会重试或等待；下一个 5 分钟周期会照常恢复正常。这不代表监控失效，只代表那一轮跳过了。
+
 ## 备份与恢复（proxyctl backup / restore）
 
 `proxyctl backup` 把单机全部持久化状态打包成一个可校验的 `.tar.gz` 归档：`/etc/singbox-sub-manager/` 整棵配置树、`/etc/sing-box/config.json`、`/etc/caddy/Caddyfile`、订阅 token、monitor 状态与暂停标记。不存在的路径记入归档清单的“跳过”而不是报错。
+
+自 v0.10.0 起，`backup` 创建归档前会先获取与 `restore`、`monitor` 相同的恢复锁（v0.9 及更早版本不加锁）；这样打包时读到的状态与 `restore`/`monitor` 不会互相踩踏，但也意味着 `monitor` 一轮运行超过 30 秒时，`backup` 会等到锁释放或报错退出，不会静默用不一致的状态打包。
 
 ```bash
 # 创建备份（默认写入 /var/lib/singbox-sub-manager/backups/，保留最近 10 份）
@@ -433,6 +441,8 @@ sudo proxyctl restore /path/backup.tar.gz --no-restart
 
 monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明确报错，提示稍后重试或先执行 `proxyctl monitor pause`，不会无限等待，也不会绕过锁。
 
+自 v0.10.0 起，`restore` 在恢复锁之后还会额外获取 Reality 节点锁（同样有界等待），并在持锁期间复查：若本机存在任何 Reality 节点实例的痕迹（`proxyctl node service ...` 安装的资产、未完成事务或墓碑），或存在遗留的订阅发布事务，`restore` 会拒绝执行并返回失败，不做任何修改。这是为了避免恢复流程覆盖一台本应是 Reality 节点、而不是订阅中心的主机；同样地，`install-proxy.sh` 的 `install`/`update`/`rollback` 也会做同样的检查。
+
 ### 恢复对 monitor 的影响
 
 `monitor-state.json` 和 `monitor-paused` 属于备份范围，恢复时按归档中的存在性精确还原：
@@ -442,6 +452,16 @@ monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明�
 - 状态文件按归档还原，失败计数会一并回退到备份时刻。
 
 `restore` 不会自行启动或恢复 monitor，命令输出会明确说明本次恢复对 monitor 的影响。
+
+### 锁的适用范围（已知限制）
+
+`backup`、`restore`、`monitor` 与合并多个节点用的 `merge-nodes.sh` 共用同一套锁，彼此互斥；但这**不是**全局串行保证，以下几种旧路径仍可能与它们并发写入，本版本不解决：
+
+- `install-proxy.sh` 在只持有安装锁、还未持有恢复锁的窗口内调用 `proxyctl merge` 写订阅文件，可能与 `monitor`、`backup`、`restore` 并发。
+- 用户手动执行的 `proxyctl merge` / `subscription build` 不加锁。
+- 写默认 `nodes.conf` 的兼容模式 CRUD（`node add/edit/...`，见上文）只取安装锁，独立执行的 `restore` 只取恢复锁和 Reality 节点锁；两者理论上可能同时写 `nodes.conf`，这是已知的旧竞争，本版本未收紧。
+
+因此“发布相关操作与 backup/restore/monitor 串行”只对 `merge-nodes.sh` 和上文列出的默认 CRUD 成立，不能理解为整个工具链的全局互斥。
 
 ### 退出码
 
@@ -482,6 +502,8 @@ sudo ./install-proxy.sh rollback --to backup-20260909T100000Z.tar.gz
 健康检查失败时自动回滚：先用仍在位的新二进制把配置恢复到升级前快照（这样即使旧版本没有 `restore` 也能完成配置回滚），再校验暂存副本的 SHA-256 并原子恢复旧二进制和旧校验文件。暂存副本校验不通过时拒绝回滚并要求人工介入，不会把损坏的文件写上去。
 
 升级会话保存在 `/var/lib/singbox-sub-manager/updates/<时间戳>/`，目录权限 `0700`，内部文件 `0600`。成功升级后保留最近一个成功会话，供之后手动 `rollback`；只有下一次成功升级才会清理更旧的成功会话。失败的会话一律保留，不自动删除。
+
+自 v0.10.0 起，第 2 步创建配置快照时调用的 `proxyctl backup` 会先取恢复锁（有界等待 30 秒）。如果 `monitor` 恰好在那一轮运行超过 30 秒并一直持有这把锁，快照创建会因为锁超时失败；`update` 按上面第 2 步的既有规则中止，提示「未能创建升级前配置快照，线上二进制未被触碰」，可以直接重试，不会留下半成品会话。
 
 收到 `SIGINT`/`SIGTERM` 时的行为分三种：会话元数据尚未落盘（还在建快照或暂存旧二进制）时，删除这个不完整的会话并清理下载临时文件，线上文件未被触碰；元数据已落盘后中断，保留整个会话并清理临时文件，之后可以用 `rollback` 回到升级前状态；如果中断发生在健康检查期间，新二进制已经在位、会话状态停在 `in_progress`，不会自动回滚，需要你自己执行 `sudo ./install-proxy.sh rollback`。三种情况都以退出码 130 结束并打印说明。
 

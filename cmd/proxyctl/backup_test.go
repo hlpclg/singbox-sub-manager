@@ -16,6 +16,7 @@ import (
 	"github.com/hlpclg/singbox-sub-manager/internal/backup"
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
 	"github.com/hlpclg/singbox-sub-manager/internal/monitor"
+	"github.com/hlpclg/singbox-sub-manager/internal/realitynode"
 )
 
 var testClock = time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
@@ -46,8 +47,9 @@ func (l *countingLocker) Unlock() error {
 
 // harness wires a backupEnv of stubs and records what the command did.
 type harness struct {
-	env  backupEnv
-	lock *countingLocker
+	env    backupEnv
+	lock   *countingLocker
+	l3lock *countingLocker
 
 	restoreOpts   []backup.RestoreOptions
 	restoreResult backup.Result
@@ -73,7 +75,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{lock: &countingLocker{}}
+	h := &harness{lock: &countingLocker{}, l3lock: &countingLocker{}}
 	h.preimage = &backup.RollbackSnapshot{TransactionID: "tx", Dir: filepath.Join(t.TempDir(), "tx")}
 	h.restoreResult = backup.Result{
 		Restored:       []string{"etc/caddy/Caddyfile"},
@@ -109,7 +111,8 @@ func newHarness(t *testing.T) *harness {
 			h.cleanupCalls++
 			return h.cleanupErr
 		},
-		newLock: func() backup.Locker { return h.lock },
+		newLock:   func() backup.Locker { return h.lock },
+		newL3Lock: func() backup.Locker { return h.l3lock },
 		restart: func(ctx context.Context, svc string) error {
 			h.restarted = append(h.restarted, svc)
 			return h.restartErr
@@ -133,8 +136,23 @@ func newHarness(t *testing.T) *harness {
 
 		lockRetryInterval: time.Millisecond,
 		lockMaxWait:       10 * time.Millisecond,
+		l3MaxWait:         10 * time.Millisecond,
 		restartTimeout:    time.Second,
 		recheckTimeout:    time.Second,
+
+		// Always-clear reverse-guard defaults: no Reality asset roots and
+		// no publish transaction paths exist in any test's temp dirs
+		// unless a specific test overrides them.
+		realityRoots: realitynode.Roots{
+			SystemdUnit: filepath.Join(t.TempDir(), "nonexistent-unit"),
+			ConfigDir:   filepath.Join(t.TempDir(), "nonexistent-cfgdir"),
+			StateDir:    filepath.Join(t.TempDir(), "nonexistent-state"),
+			BinDir:      filepath.Join(t.TempDir(), "nonexistent-bin"),
+			TxnDir:      filepath.Join(t.TempDir(), "nonexistent-txn"),
+		},
+		realityFS:       realitynode.OSStateFS(),
+		publishTxnDir:   filepath.Join(t.TempDir(), "nonexistent-publish-txn"),
+		publishTombGlob: filepath.Join(t.TempDir(), "nonexistent-tomb-*"),
 	}
 	return h
 }

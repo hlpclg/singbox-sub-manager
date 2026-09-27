@@ -21,6 +21,7 @@ jobs:
           bash -n install-proxy.sh
           bash -n merge-nodes.sh
           bash -n tests/test_reality_probe.sh
+          bash -n tests/test_shared_guards.sh
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
@@ -32,6 +33,7 @@ jobs:
           shellcheck tests/test_install_monitor.sh
           shellcheck tests/test_install_update.sh
           shellcheck tests/test_reality_probe.sh
+          shellcheck tests/test_shared_guards.sh
       - name: Go fmt
         run: if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then echo "Go code is not formatted"; exit 1; fi
       - name: Shell tests
@@ -40,6 +42,7 @@ jobs:
           bash tests/test_install_json.sh
           bash tests/test_install_monitor.sh
           bash tests/test_install_update.sh
+          bash tests/test_shared_guards.sh
           # --verify-assets only: downloads and SHA256-verifies the pinned
           # sing-box release. It needs network but not root or a real
           # systemd host, so normal CI can run it without pretending to

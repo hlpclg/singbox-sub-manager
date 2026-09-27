@@ -15,7 +15,9 @@ import (
 
 	"github.com/hlpclg/singbox-sub-manager/internal/backup"
 	"github.com/hlpclg/singbox-sub-manager/internal/health"
+	"github.com/hlpclg/singbox-sub-manager/internal/hostlock"
 	"github.com/hlpclg/singbox-sub-manager/internal/monitor"
+	"github.com/hlpclg/singbox-sub-manager/internal/realitynode"
 )
 
 const (
@@ -68,13 +70,24 @@ type backupEnv struct {
 	rollback     func(context.Context, *backup.RollbackSnapshot, backup.RollbackOptions) (backup.RollbackResult, error)
 	cleanup      func(context.Context, *backup.RollbackSnapshot) error
 	newLock      func() backup.Locker
+	newL3Lock    func() backup.Locker
 	restart      func(context.Context, string) error
 	recheck      func(context.Context, ...string) []health.Result
 
 	lockRetryInterval time.Duration
 	lockMaxWait       time.Duration
+	l3MaxWait         time.Duration
 	restartTimeout    time.Duration
 	recheckTimeout    time.Duration
+
+	// Reverse-guard inputs shared with node.go's default-nodes.conf lock
+	// (spec §11.5): independent restore takes L2 then L3 and, while
+	// holding L3, must refuse when this host shows any trace of a Reality
+	// node instance or a leftover publish transaction.
+	realityRoots    realitynode.Roots
+	realityFS       realitynode.StateFS
+	publishTxnDir   string
+	publishTombGlob string
 }
 
 var newBackupEnv = productionBackupEnv
@@ -94,13 +107,20 @@ func productionBackupEnv() backupEnv {
 		rollback:     backup.Rollback,
 		cleanup:      backup.CleanupSnapshot,
 		newLock:      func() backup.Locker { return monitor.NewFileLock(recoveryLockPath) },
+		newL3Lock:    func() backup.Locker { return monitor.NewFileLock(hostlock.ProdPaths().L3) },
 		restart:      monitor.RestartService,
 		recheck:      runServiceChecks,
 
 		lockRetryInterval: backup.DefaultLockRetryInterval,
 		lockMaxWait:       backup.DefaultLockMaxWait,
+		l3MaxWait:         hostlock.DefaultMaxWait(hostlock.L3),
 		restartTimeout:    30 * time.Second,
 		recheckTimeout:    30 * time.Second,
+
+		realityRoots:    realitynode.ProdRoots(),
+		realityFS:       realitynode.OSStateFS(),
+		publishTxnDir:   publishTxnDir,
+		publishTombGlob: publishTombGlob,
 	}
 }
 
@@ -148,6 +168,24 @@ func cmdBackup(args []string, stdout, stderr io.Writer) int {
 	}
 
 	env := newBackupEnv()
+
+	// spec §11.1/§11.2: backup create takes L2, same as restore, so the two
+	// never run concurrently against the same live filesystem state.
+	lease, err := backup.AcquireWithRetry(context.Background(), env.newLock(), env.lockRetryInterval, env.lockMaxWait)
+	if err != nil {
+		if errors.Is(err, backup.ErrLockBusy) {
+			fmt.Fprintln(stderr, "error: the monitor is holding the recovery lock; retry shortly or run `proxyctl monitor pause` first")
+			return exitFailure
+		}
+		fmt.Fprintln(stderr, "error:", err)
+		return exitFailure
+	}
+	defer func() {
+		if unlockErr := lease.Unlock(); unlockErr != nil {
+			fmt.Fprintln(stderr, "warning: releasing the recovery lock failed:", unlockErr)
+		}
+	}()
+
 	m, err := env.create(context.Background(), backup.CreateOptions{
 		SourceRoot:      env.sourceRoot,
 		BackupDir:       env.backupDir,
@@ -386,6 +424,29 @@ func runRestoreTransaction(ctx context.Context, env backupEnv, archivePath strin
 			fmt.Fprintln(stderr, "warning: releasing the recovery lock failed:", unlockErr)
 		}
 	}()
+
+	// spec §11.5: independent restore takes L2 then L3 (this defer, being
+	// registered after the L2 unlock defer above, runs first: L3 releases
+	// before L2, matching spec §11.1's reverse release order). While L3 is
+	// held, the same reverse check as the default-nodes.conf write path
+	// (spec §11.2) applies: refuse if this host shows any trace of a
+	// Reality node instance or a leftover publish transaction, since
+	// restore can write install.json, the token, and nodes.conf.
+	l3Lease, err := backup.AcquireWithRetry(ctx, env.newL3Lock(), env.lockRetryInterval, env.l3MaxWait)
+	if err != nil {
+		fmt.Fprintln(stderr, "error: another operation is in progress:", err)
+		return exitFailure
+	}
+	defer func() {
+		if unlockErr := l3Lease.Unlock(); unlockErr != nil {
+			fmt.Fprintln(stderr, "warning: releasing the reality lock failed:", unlockErr)
+		}
+	}()
+
+	if reason := legacyGuardReason(env.realityRoots, env.realityFS, env.publishTxnDir, env.publishTombGlob); reason != "" {
+		fmt.Fprintln(stderr, "error:", reason)
+		return exitFailure
+	}
 
 	res, err := env.restore(ctx, archivePath, backup.RestoreOptions{
 		DestRoot:        env.destRoot,
