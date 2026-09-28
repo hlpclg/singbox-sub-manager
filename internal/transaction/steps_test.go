@@ -165,6 +165,7 @@ func TestPrimitiveCrashStates(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(base, "config"), []byte("hello"), 0644); err != nil {
 					t.Fatal(err)
 				}
+				mustChmod(t, filepath.Join(base, "config"), 0644)
 				pre := fileStateFor(0644, uid, gid, []byte("hello"))
 				post := pre
 				post.Mode = 0600
@@ -202,10 +203,12 @@ func TestPrimitiveCrashStates(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(base, "config"), []byte("hello"), 0644); err != nil {
 			t.Fatal(err)
 		}
+		mustChmod(t, filepath.Join(base, "config"), 0644)
 		outside := filepath.Join(t.TempDir(), "victim")
 		if err := os.WriteFile(outside, []byte("victim"), 0644); err != nil {
 			t.Fatal(err)
 		}
+		mustChmod(t, outside, 0644)
 		pre := fileStateFor(0644, uid, gid, []byte("hello"))
 		post := pre
 		post.Mode = 0600
@@ -856,6 +859,7 @@ func TestPreStateEnforcement(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(base, "instance"), 0755); err != nil {
 			t.Fatal(err)
 		}
+		mustChmod(t, filepath.Join(base, "instance"), 0755)
 		pre := PathState{Exists: false}
 		post := PathState{Exists: true, Type: PathTypeDir, Mode: 0700, UID: uid, GID: gid}
 		j := baseJournal("t1")

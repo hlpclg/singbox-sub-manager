@@ -18,6 +18,16 @@ func withUmask(t *testing.T, mask int) {
 	t.Cleanup(func() { syscall.Umask(old) })
 }
 
+// mustChmod pins a fixture's mode after creation, so the process umask
+// (spec §14.2 runs transaction tests under umask 077) cannot alter the
+// pre-state a test records.
+func mustChmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
+}
+
 func mustMkdirAll(t *testing.T, path string, mode os.FileMode) {
 	t.Helper()
 	if err := os.MkdirAll(path, mode); err != nil {
