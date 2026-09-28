@@ -236,31 +236,69 @@ func validateInstalledManifest(fsys StateFS, roots Roots, m Manifest) []string {
 
 // validateUninstalledManifest checks only secrets.json and instance.json
 // (spec §4.3 row 4: "state=uninstalled；secrets.json、instance.json通过
-// schema、mode、owner校验"), independent of whatever the manifest's own
-// Entries list happens to contain.
+// schema、mode、owner校验"). Per spec §5.2, mode/uid/gid for these two
+// dynamic-state files are anchored in the manifest's own Entries list, so
+// each of the two paths must have its own dynamic-state manifest entry
+// (schema set, no sha256); that entry is validated by validateEntry, the
+// exact same function validateInstalledManifest uses for every installed
+// asset, plus each file's own typed parse (SecretsFile / InstanceFile),
+// since validateEntry's generic dynamic-file check only re-parses the
+// top-level {"schema": int} and would accept a structurally invalid file
+// whose schema field still happens to be valid. This is independent of
+// whatever else the manifest's Entries list happens to contain.
 func validateUninstalledManifest(fsys StateFS, roots Roots, m Manifest) []string {
 	var reasons []string
-	reasons = append(reasons, validateDynamicFile(fsys, roots.Secrets, func(data []byte) error {
-		var s SecretsFile
-		if err := json.Unmarshal(data, &s); err != nil {
-			return err
-		}
-		if s.Schema != dynamicFileSchema {
-			return errUnknownManifestSchema
-		}
-		return nil
-	})...)
-	reasons = append(reasons, validateDynamicFile(fsys, roots.Instance, func(data []byte) error {
-		var i InstanceFile
-		if err := json.Unmarshal(data, &i); err != nil {
-			return err
-		}
-		if i.Schema != dynamicFileSchema {
-			return errUnknownManifestSchema
-		}
-		return nil
-	})...)
+	reasons = append(reasons, validateUninstalledEntryFor(fsys, m, roots.Secrets, parseSecretsFile)...)
+	reasons = append(reasons, validateUninstalledEntryFor(fsys, m, roots.Instance, parseInstanceFile)...)
 	return reasons
+}
+
+// validateUninstalledEntryFor finds path's entry in m.Entries, requires it
+// to be a dynamic-state entry (spec §5.2's shape for secrets.json /
+// instance.json: schema set, sha256 unset), and validates it two ways:
+// validateEntry (mode/uid/gid, entry schema, and the file's embedded
+// top-level schema field) plus a typed re-parse via parse, which catches a
+// file whose "schema" field is valid but whose other fields do not match
+// SecretsFile/InstanceFile's shape. A path with no matching manifest entry,
+// or one that is not dynamic-state shaped, is itself a failure: spec §4.3
+// row 4 requires secrets.json and instance.json to be covered by their own
+// dynamic-state manifest entries, not merely present and schema-parseable
+// on disk.
+func validateUninstalledEntryFor(fsys StateFS, m Manifest, path string, parse func([]byte) error) []string {
+	for _, e := range m.Entries {
+		if e.Path != path {
+			continue
+		}
+		if !e.isDynamicFile() {
+			return []string{path + " manifest entry is not a dynamic-state entry"}
+		}
+		reasons := validateEntry(fsys, e)
+		reasons = append(reasons, validateDynamicFile(fsys, path, parse)...)
+		return reasons
+	}
+	return []string{path + " has no manifest entry"}
+}
+
+func parseSecretsFile(data []byte) error {
+	var s SecretsFile
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	if s.Schema != dynamicFileSchema {
+		return errUnknownManifestSchema
+	}
+	return nil
+}
+
+func parseInstanceFile(data []byte) error {
+	var i InstanceFile
+	if err := json.Unmarshal(data, &i); err != nil {
+		return err
+	}
+	if i.Schema != dynamicFileSchema {
+		return errUnknownManifestSchema
+	}
+	return nil
 }
 
 func validateDynamicFile(fsys StateFS, path string, parse func([]byte) error) []string {

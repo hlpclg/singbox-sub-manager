@@ -569,3 +569,120 @@ func assertFixtureUnchanged(t *testing.T, root string, before map[string][]byte)
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// TestUninstalledIdentityModeOwnerManifestValidation
+//
+// Spec §4.3 row 4 requires secrets.json and instance.json to each pass
+// "schema、mode、owner 校验" before state=uninstalled is classified as
+// StatusUninstalledKeepIdentity, and §5.2 says the dynamic-state manifest
+// entries are how that mode/uid/gid check is anchored. A build that only
+// re-parses the two files' own embedded schema field (ignoring their real
+// on-disk mode/owner, or the manifest's entries for them) must not pass
+// these cases.
+// ---------------------------------------------------------------------------
+
+func TestUninstalledIdentityModeOwnerManifestValidation(t *testing.T) {
+	roots := testRoots()
+
+	assertInconsistentWithReasonFor := func(t *testing.T, entries map[string]memEntry, path string) {
+		t.Helper()
+		m := memState{entries: entries}
+		got := DetectInstanceState(m.fs(), roots)
+		if got.Status != StatusInconsistent {
+			t.Fatalf("status = %v, want Inconsistent (reasons: %v)", got.Status, got.Reasons)
+		}
+		var found bool
+		for _, r := range got.Reasons {
+			if strings.Contains(r, path) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected a reason mentioning %s, got %v", path, got.Reasons)
+		}
+	}
+
+	t.Run("secrets.json mode 0644 is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Secrets]
+		e.mode = 0o644 // manifest entry still says 0600
+		entries[roots.Secrets] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Secrets)
+	})
+
+	t.Run("instance.json mode 0644 is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Instance]
+		e.mode = 0o644 // manifest entry still says 0600
+		entries[roots.Instance] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Instance)
+	})
+
+	t.Run("owner mismatched with manifest is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Secrets]
+		e.uid = 1000 // manifest entry expects uid 0
+		entries[roots.Secrets] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Secrets)
+	})
+
+	t.Run("manifest missing the secrets.json entry is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Manifest]
+		e.data = manifestJSON(roots, ManifestStateUninstalled, []ManifestEntry{
+			{Path: roots.StateDir, Mode: 0o700},
+			{Path: roots.Instance, Mode: 0o600, Schema: 1},
+		})
+		entries[roots.Manifest] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Secrets)
+	})
+
+	t.Run("manifest missing the instance.json entry is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Manifest]
+		e.data = manifestJSON(roots, ManifestStateUninstalled, []ManifestEntry{
+			{Path: roots.StateDir, Mode: 0o700},
+			{Path: roots.Secrets, Mode: 0o600, Schema: 1},
+		})
+		entries[roots.Manifest] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Instance)
+	})
+
+	t.Run("instance.json with a wrong field type is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Instance]
+		// listen_port must be a number per InstanceFile; a string value
+		// still carries a valid top-level "schema": 1, so a check that only
+		// re-parses {"schema": int} would wrongly accept this.
+		e.data = []byte(`{"schema":1,"name":"reality","server":"s","listen_port":"x","sni":"n","selfcheck_port":1}`)
+		entries[roots.Instance] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Instance)
+	})
+
+	t.Run("secrets.json with a wrong field type is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		e := entries[roots.Secrets]
+		// uuid must be a string per SecretsFile; a numeric value still
+		// carries a valid top-level "schema": 1.
+		e.data = []byte(`{"schema":1,"uuid":123,"private_key":"y","short_id":"z"}`)
+		entries[roots.Secrets] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Secrets)
+	})
+
+	t.Run("secrets.json manifest entry shaped as an immutable file (sha256, no schema) is Inconsistent", func(t *testing.T) {
+		entries := fullyUninstalledEntries(roots)
+		secretsData := entries[roots.Secrets].data
+		e := entries[roots.Manifest]
+		e.data = manifestJSON(roots, ManifestStateUninstalled, []ManifestEntry{
+			{Path: roots.StateDir, Mode: 0o700},
+			// Content hash matches exactly, but this is the immutable-file
+			// shape (sha256 set, schema unset), not the dynamic-state shape
+			// spec §5.2 requires for secrets.json.
+			{Path: roots.Secrets, Mode: 0o600, SHA256: sha256Hex(secretsData)},
+			{Path: roots.Instance, Mode: 0o600, Schema: 1},
+		})
+		entries[roots.Manifest] = e
+		assertInconsistentWithReasonFor(t, entries, roots.Secrets)
+	})
+}

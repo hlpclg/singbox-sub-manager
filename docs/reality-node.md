@@ -23,7 +23,7 @@
 1. **未完成事务**：事务区或墓碑目录存在（优先于其他一切判断）。
 2. **未安装**：`/etc/systemd/system/proxyctl-reality.service`、`/etc/proxyctl-reality/`、`/var/lib/proxyctl-reality/`、`/usr/local/lib/proxyctl-reality/` 全部不存在。
 3. **已安装**：manifest 的 `state=installed`，且 manifest 记录的每项资产（unit、config、私有二进制按内容哈希；`secrets.json`、`instance.json` 按 mode/owner 和内部 schema 字段）都通过校验。
-4. **已卸载但保留身份**：manifest 的 `state=uninstalled`；`secrets.json`、`instance.json` 通过校验；unit、config、私有二进制目录都不存在。
+4. **已卸载但保留身份**：manifest 的 `state=uninstalled`；`secrets.json`、`instance.json` 各有一条 manifest 动态状态条目，且按该条目通过 mode/owner 和内部 schema 字段校验；unit、config、私有二进制目录都不存在。
 5. **不一致**：以上都不满足，逐项列出不一致之处，不提供自动修复。
 
 同样完全只读；`锁文件 /run/lock/proxyctl-reality.lock` 不属于实例资产，不参与判定。
