@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -463,6 +464,9 @@ func copyFixture(t *testing.T, name string) string {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
+		if logicalPath == "/var/lib/proxyctl-reality/manifest.json" {
+			data = pinManifestOwners(t, data)
+		}
 		if err := os.WriteFile(target, data, 0o644); err != nil {
 			return err
 		}
@@ -489,6 +493,21 @@ func copyFixture(t *testing.T, name string) string {
 		}
 	}
 	return dst
+}
+
+// pinManifestOwners rewrites the frozen fixture manifest's root owners
+// (uid/gid 0) to the test process's own euid/egid in the temporary copy
+// only, so owner checks pass for whichever user runs the tests (CI runs as
+// a non-root user). Running as root leaves the bytes unchanged.
+func pinManifestOwners(t *testing.T, data []byte) []byte {
+	t.Helper()
+	s := string(data)
+	if !strings.Contains(s, `"uid": 0`) || !strings.Contains(s, `"gid": 0`) {
+		t.Fatalf("fixture manifest no longer records root owners as \"uid\": 0 / \"gid\": 0")
+	}
+	s = strings.ReplaceAll(s, `"uid": 0`, fmt.Sprintf(`"uid": %d`, os.Geteuid()))
+	s = strings.ReplaceAll(s, `"gid": 0`, fmt.Sprintf(`"gid": %d`, os.Getegid()))
+	return []byte(s)
 }
 
 func TestInstalledFixtureCompat(t *testing.T) {
