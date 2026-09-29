@@ -3,8 +3,9 @@
 // entirely on internal/transaction's already-reviewed journal, safe-path
 // primitives and recovery engine (Task 4/5), this package's own download/
 // config/systemd/selfcheck building blocks (Task 6), and its read-only
-// state/identity helpers (Task 2). uninstall/purge/export/recover (§8.4-
-// §8.6) are Task 8's scope and are not implemented here.
+// state/identity helpers (Task 2). Task 8 adds uninstall, uninstall --purge
+// (with export.go's --export-backup) and recover [--abandon] (§8.4-§8.6) at
+// the end of this file, on the very same planner/Recoverer machinery.
 //
 // Every forward step this file executes is first appended to the
 // transaction's journal in "pending" status and persisted (via the shared
@@ -120,6 +121,12 @@ type Env struct {
 	GatePollBudget   time.Duration
 	GatePollInterval time.Duration
 
+	// RollbackBudget overrides the independent 120 s rollback budget (spec
+	// §13.2) of every Recoverer this Env builds (forward failure paths and
+	// recover alike); zero means the spec's 120 s. Tests inject a short one so
+	// a hung systemctl ends in exit 5 without a real two-minute wait.
+	RollbackBudget time.Duration
+
 	// ProxyctlVersion is the compiled-in proxyctl Version, used by Show
 	// (spec §8.3) only for its own diagnostics; the actual mismatch hint
 	// compares manifest.SingboxCurrent against PinnedVersion.
@@ -212,6 +219,16 @@ type Result struct {
 	// security-group reminder, version-mismatch reinstall hint) that never
 	// change the exit code.
 	Warnings []string
+	// Notices are informational stderr lines printed on success (unlike
+	// Warnings, without a "warning:" prefix): what uninstall left alone, what
+	// recover did.
+	Notices []string
+	// Recovered/RecoveredOutcome describe a successful `recover`: it always
+	// exits 0 whichever way the leftover transaction was resolved, so the
+	// engine's Outcome is reported here rather than in Outcome/HasOutcome
+	// (whose RolledBack means exit 4).
+	Recovered        bool
+	RecoveredOutcome transaction.Outcome
 }
 
 func preTxnFail(err error) Result { return Result{PreTransaction: true, Err: err} }
@@ -1038,6 +1055,7 @@ func newInstanceRecoverer(env *Env, roots *openRoots, engine *transaction.Engine
 	return &transaction.Recoverer{
 		Engine: engine, Root: roots.varLib, TombstoneName: tombstoneName(env.Roots, txnID),
 		Resolve: pathResolver{roots: roots}, SnapDir: snapDir, Systemd: env.Systemd, Gate: gate,
+		RollbackBudget: env.RollbackBudget,
 	}
 }
 
@@ -2098,4 +2116,629 @@ func RunReinstall(ctx context.Context, env *Env, plan ReinstallPlan) Result {
 		}
 	}
 	return result
+}
+
+// --- Uninstall / purge (spec §8.4, §8.5) ---
+
+// UninstallParams is uninstall's input. ExportPath is --export-backup and is
+// only meaningful with Purge (the CLI rejects the combination otherwise with
+// exit 2; PrecheckUninstall re-enforces it).
+type UninstallParams struct {
+	Purge      bool
+	ExportPath string
+}
+
+// UninstallPlan is PrecheckUninstall's outcome.
+type UninstallPlan struct {
+	Params        UninstallParams
+	FromInstalled bool
+}
+
+// minTeardownSlack is this Task's own implementation choice on top of the sum
+// of the file sizes that are snapshotted (spec §8.5 only says "检查磁盘空
+// 间"): room for the journal, the snapshot directories and the archive-free
+// bookkeeping.
+const minTeardownSlack = 1 << 20
+
+// teardownSet is everything uninstall/purge needs to know about the instance
+// before the transaction begins, derived from the manifest and the live tree.
+type teardownSet struct {
+	fromInstalled bool
+	purge         bool
+	manifest      Manifest
+	inst          InstanceFile
+	versions      []string // every registered private sing-box version (installed source only)
+	snapBytes     uint64   // sum of the sizes of every file that will be snapshotted
+}
+
+func eligibleForTeardown(env *Env, purge bool) (fromInstalled bool, err error) {
+	state := DetectInstanceState(env.FS, env.Roots)
+	switch {
+	case state.Status == StatusInstalled:
+		return true, nil
+	case state.Status == StatusUninstalledKeepIdentity && purge:
+		return false, nil
+	case state.Status == StatusUninstalledKeepIdentity:
+		return false, errors.New("realitynode: the instance is already uninstalled (identity retained); use 'uninstall --purge' to remove it completely or 'reinstall' to bring it back")
+	default:
+		return false, fmt.Errorf("realitynode: instance is not eligible for uninstall (status=%v, reasons=%v)", state.Status, state.Reasons)
+	}
+}
+
+// dirNames lists the names directly inside dir, sorted.
+func dirNames(dir string) ([]string, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// requireExactly fails when dir holds anything other than the expected
+// names: an unregistered file would make the final rmdir fail after
+// modifications had begun, so it is refused up front (exit 1) instead.
+func requireExactly(dir string, want []string) error {
+	got, err := dirNames(dir)
+	if err != nil {
+		return fmt.Errorf("realitynode: list %s: %w", dir, err)
+	}
+	want = sortedCopy(want)
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		return fmt.Errorf("realitynode: %s holds %v, but only %v is registered in the manifest; refusing to remove a directory with unregistered content", dir, got, want)
+	}
+	return nil
+}
+
+func fileSizeOf(path string) (uint64, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(fi.Size()), nil
+}
+
+// inspectTeardown reads the manifest and instance parameters, works out the
+// registered versions, verifies the instance directories hold exactly what
+// the manifest registers, and totals the snapshot size. It modifies nothing.
+func inspectTeardown(env *Env, purge, fromInstalled bool) (teardownSet, error) {
+	set := teardownSet{fromInstalled: fromInstalled, purge: purge}
+	m, err := readManifestFile(env)
+	if err != nil {
+		return set, fmt.Errorf("realitynode: read manifest: %w", err)
+	}
+	set.manifest = m
+	_, inst, err := readSecretsAndInstance(env)
+	if err != nil {
+		return set, fmt.Errorf("realitynode: read identity: %w", err)
+	}
+	set.inst = inst
+
+	r := env.Roots
+	add := func(path string) error {
+		n, err := fileSizeOf(path)
+		if err != nil {
+			return fmt.Errorf("realitynode: stat %s: %w", path, err)
+		}
+		set.snapBytes += n
+		return nil
+	}
+	if fromInstalled {
+		versionsDir := filepath.Join(r.BinDir, "versions")
+		seen := map[string]bool{}
+		for _, e := range m.Entries {
+			if e.SHA256 != "" && filepath.Base(e.Path) == "sing-box" && filepath.Dir(filepath.Dir(e.Path)) == versionsDir {
+				v := filepath.Base(filepath.Dir(e.Path))
+				if !seen[v] {
+					seen[v] = true
+					set.versions = append(set.versions, v)
+				}
+			}
+		}
+		sort.Strings(set.versions)
+		if len(set.versions) == 0 {
+			return set, errors.New("realitynode: the manifest registers no private sing-box binary")
+		}
+		if err := requireExactly(r.ConfigDir, []string{filepath.Base(r.Config)}); err != nil {
+			return set, err
+		}
+		if err := requireExactly(r.BinDir, []string{"versions"}); err != nil {
+			return set, err
+		}
+		if err := requireExactly(versionsDir, set.versions); err != nil {
+			return set, err
+		}
+		for _, v := range set.versions {
+			if err := requireExactly(filepath.Join(versionsDir, v), []string{"sing-box"}); err != nil {
+				return set, err
+			}
+			if err := add(versionBinaryPath(r, v)); err != nil {
+				return set, err
+			}
+		}
+		for _, p := range []string{r.SystemdUnit, r.Config} {
+			if err := add(p); err != nil {
+				return set, err
+			}
+		}
+	}
+	if purge {
+		if err := requireExactly(r.StateDir, []string{filepath.Base(r.Secrets), filepath.Base(r.Instance), filepath.Base(r.Manifest)}); err != nil {
+			return set, err
+		}
+		for _, p := range []string{r.Secrets, r.Instance, r.Manifest} {
+			if err := add(p); err != nil {
+				return set, err
+			}
+		}
+	} else if err := add(r.Manifest); err != nil {
+		return set, err
+	}
+	return set, nil
+}
+
+func checkTeardownDisk(env *Env, set teardownSet) error {
+	checkDisk := env.CheckDiskSpace
+	if checkDisk == nil {
+		checkDisk = defaultCheckDiskSpace
+	}
+	return checkDisk(filepath.Dir(env.Roots.StateDir), set.snapBytes+minTeardownSlack)
+}
+
+func checkTeardownPlatform(env *Env) error {
+	if env.GOOS != "" && env.GOOS != "linux" {
+		return fmt.Errorf("realitynode: unsupported OS %q (only linux is supported)", env.GOOS)
+	}
+	return nil
+}
+
+// PrecheckUninstall is spec §8's step 3 for uninstall and uninstall --purge,
+// before any lock: state eligibility (§4.3), the instance directories hold
+// only registered content, disk space, and (with --export-backup) a usable
+// target. It modifies nothing and never runs a role check: §8's recheck table
+// lists only the instance state for these commands.
+func PrecheckUninstall(ctx context.Context, env *Env, params UninstallParams) (UninstallPlan, error) {
+	if params.ExportPath != "" && !params.Purge {
+		return UninstallPlan{}, errors.New("realitynode: --export-backup is only valid with --purge")
+	}
+	if err := checkTeardownPlatform(env); err != nil {
+		return UninstallPlan{}, err
+	}
+	fromInstalled, err := eligibleForTeardown(env, params.Purge)
+	if err != nil {
+		return UninstallPlan{}, err
+	}
+	set, err := inspectTeardown(env, params.Purge, fromInstalled)
+	if err != nil {
+		return UninstallPlan{}, err
+	}
+	if err := checkTeardownDisk(env, set); err != nil {
+		return UninstallPlan{}, err
+	}
+	if params.ExportPath != "" {
+		if err := ValidateExportTarget(env, params.ExportPath); err != nil {
+			return UninstallPlan{}, err
+		}
+	}
+	return UninstallPlan{Params: params, FromInstalled: fromInstalled}, nil
+}
+
+// Uninstall runs PrecheckUninstall then RunUninstall back to back, for callers
+// (tests) that do not interpose their own locking.
+func Uninstall(ctx context.Context, env *Env, params UninstallParams) Result {
+	plan, err := PrecheckUninstall(ctx, env, params)
+	if err != nil {
+		return preTxnFail(err)
+	}
+	return RunUninstall(ctx, env, plan)
+}
+
+// RunUninstall is everything after the locks are held: the §8 recheck (the
+// instance state, plus the same directory/disk safety checks against the now
+// stable tree), then — for purge with --export-backup, strictly after the
+// recheck and before the transaction — the archive, then the transaction
+// (§8.4 / §8.5).
+func RunUninstall(ctx context.Context, env *Env, plan UninstallPlan) Result {
+	params := plan.Params
+	if params.ExportPath != "" && !params.Purge {
+		return preTxnFail(errors.New("realitynode: --export-backup is only valid with --purge"))
+	}
+	fromInstalled, err := eligibleForTeardown(env, params.Purge)
+	if err != nil {
+		return preTxnFail(fmt.Errorf("realitynode: instance is no longer eligible: %w", err))
+	}
+	set, err := inspectTeardown(env, params.Purge, fromInstalled)
+	if err != nil {
+		return preTxnFail(err)
+	}
+	if err := checkTeardownDisk(env, set); err != nil {
+		return preTxnFail(err)
+	}
+
+	var warnings, notices []string
+	if params.ExportPath != "" {
+		if err := ExportBackup(ctx, env, params.ExportPath); err != nil {
+			return preTxnFail(fmt.Errorf("export backup: %w", err))
+		}
+		warnings = append(warnings, fmt.Sprintf("the archive %s contains the instance's private key (config.json and secrets.json); store it securely", params.ExportPath))
+		notices = append(notices, "the archive only preserves keys and instance parameters for manual reference; there is no import command, and extracting it back in place is not a supported restore")
+	}
+	res := runTeardown(ctx, env, set)
+	res.Warnings = append(warnings, res.Warnings...)
+	if res.HasOutcome && res.Outcome == transaction.OutcomeCommitted && res.Err == nil {
+		res.Notices = append(append(res.Notices, notices...), SharedAssetsKeptNotice)
+		if set.purge {
+			res.Stdout = PurgeOutput(set.inst.Name)
+		} else {
+			res.Stdout = UninstallOutput(set.inst.Name)
+		}
+	}
+	return res
+}
+
+// doSnapshot registers and executes a snapshot step for an existing managed
+// file and returns the live state it recorded (the Pre of the removal that
+// follows). dynamic files (secrets.json, instance.json) are identified by
+// schema name, everything else by content hash.
+func (p *planner) doSnapshot(ctx context.Context, id, rootKey, relPath string, dynamic bool) (transaction.PathState, error) {
+	mp := mpFor(p.roots, rootKey, relPath)
+	live, err := p.engine.LiveFileState(mp, !dynamic, dynamic)
+	if err != nil {
+		return live, fmt.Errorf("realitynode: read live state of %s: %w", mp.TargetKey(), err)
+	}
+	snapTmp := p.seq.next()
+	sid := id + "-snap"
+	if err := p.appendStep(transaction.Step{ID: sid, Kind: transaction.KindSnapshot, Target: mp.TargetKey(), Pre: live, Post: live, Status: transaction.StatusPending, Temps: []string{snapTmp}}); err != nil {
+		return live, err
+	}
+	if err := lifecycleHook("reg:" + sid); err != nil {
+		return live, err
+	}
+	if err := p.engine.Snapshot(ctx, sid, mp, p.snapDir, snapTmp); err != nil {
+		return live, err
+	}
+	return live, lifecycleHook("done:" + sid)
+}
+
+// doRemoveFile registers and executes a remove_file step whose Pre is the
+// state its snapshot recorded.
+func (p *planner) doRemoveFile(ctx context.Context, id, rootKey, relPath string, pre transaction.PathState) error {
+	mp := mpFor(p.roots, rootKey, relPath)
+	if err := p.appendStep(transaction.Step{ID: id, Kind: transaction.KindRemoveFile, Target: mp.TargetKey(), Pre: pre, Post: notExist(), Status: transaction.StatusPending}); err != nil {
+		return err
+	}
+	if err := lifecycleHook("reg:" + id); err != nil {
+		return err
+	}
+	if err := p.engine.RemoveFile(ctx, id, mp); err != nil {
+		return err
+	}
+	return lifecycleHook("done:" + id)
+}
+
+// doRemoveDir registers and executes a remove_dir step. Its Pre is the
+// directory's live mode/owner, which is also exactly what a rollback re-creates.
+func (p *planner) doRemoveDir(ctx context.Context, id, rootKey, relPath string) error {
+	mp := mpFor(p.roots, rootKey, relPath)
+	live, _, err := p.engine.LiveDirState(mp)
+	if err != nil {
+		return fmt.Errorf("realitynode: read live state of %s: %w", mp.TargetKey(), err)
+	}
+	if !live.Exists {
+		return fmt.Errorf("realitynode: %s does not exist", mp.TargetKey())
+	}
+	if err := p.appendStep(transaction.Step{ID: id, Kind: transaction.KindRemoveDir, Target: mp.TargetKey(), Pre: live, Post: notExist(), Status: transaction.StatusPending}); err != nil {
+		return err
+	}
+	if err := lifecycleHook("reg:" + id); err != nil {
+		return err
+	}
+	if err := p.engine.RemoveDir(ctx, id, mp); err != nil {
+		return err
+	}
+	return lifecycleHook("done:" + id)
+}
+
+// buildUninstalledManifest is spec §5.2's uninstalled manifest: only the
+// state directory and the two dynamic-state files stay registered.
+func buildUninstalledManifest(env *Env, uid, gid uint32, current string) ([]byte, error) {
+	r := env.Roots
+	m := Manifest{
+		Schema: manifestSchema, State: ManifestStateUninstalled, SingboxCurrent: current,
+		Entries: []ManifestEntry{
+			dirEntry(r.StateDir, 0700, uid, gid),
+			dynamicEntry(r.Secrets, 0600, uid, gid),
+			dynamicEntry(r.Instance, 0600, uid, gid),
+		},
+	}
+	return json.MarshalIndent(m, "", "  ")
+}
+
+// runTeardown is the transaction shared by uninstall (§8.4) and purge (§8.5):
+//
+//	snapshot -> [stop, disable, remove unit, daemon-reload] -> remove config,
+//	private binaries -> (purge) remove identity, manifest, state dir |
+//	(uninstall) write the uninstalled manifest -> commit
+//
+// Every step is journalled before it runs (planner.*), so any failure or
+// crash converges through the one shared Recoverer (rollback from the
+// snapshots, including systemd) — there is no teardown-specific recovery.
+func runTeardown(ctx context.Context, env *Env, set teardownSet) Result {
+	oldCur := set.manifest.SingboxCurrent
+	if oldCur == "" {
+		oldCur = "0.0.0"
+	}
+	versions := []string{oldCur}
+	for _, v := range set.versions {
+		if v != oldCur {
+			versions = append(versions, v)
+		}
+	}
+	op := "uninstall"
+	if set.purge {
+		op = "uninstall-purge"
+	}
+	layout := newInstanceLayout(env.Roots, oldCur)
+
+	rollbackBin := ""
+	if set.fromInstalled {
+		rollbackBin = versionBinaryPath(env.Roots, set.manifest.SingboxCurrent)
+	}
+	// The rollback re-runs the §9.2 gate against the pre-transaction binary
+	// (spec §7.4 step 5); it is consulted only when the unit was active.
+	rollbackGate := gateFor(env, set.inst.ListenPort, env.Roots.Config, func() string { return rollbackBin })
+
+	beforeVersion := ""
+	if set.fromInstalled {
+		beforeVersion = set.manifest.SingboxCurrent
+	}
+	t, err := beginTxn(ctx, env, beginOpts{op: op, versions: versions, versionBefore: beforeVersion, recoveryGate: rollbackGate})
+	if err != nil {
+		return preTxnFail(err)
+	}
+	defer t.close()
+	p := t.p
+	uid32, gid32 := t.uid, t.gid
+
+	if err := lifecycleHook("began"); err != nil {
+		return t.wrapUp(ctx, err)
+	}
+	if err := t.openSnapDir(); err != nil {
+		return t.wrapUp(ctx, err)
+	}
+
+	// --- snapshots of everything that will be modified or removed (before
+	// the first modification, so a failure here is still exit 1) ---
+	type snap struct{ pre transaction.PathState }
+	snaps := map[string]snap{}
+	take := func(id, rootKey, rel string, dynamic bool) error {
+		pre, err := p.doSnapshot(ctx, id, rootKey, rel, dynamic)
+		snaps[id] = snap{pre}
+		return err
+	}
+	if set.fromInstalled {
+		if err := take("unit", rootKeySystemd, layout.unitRel, false); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := take("config", rootKeyEtc, layout.configRel, false); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		for _, v := range set.versions {
+			vl := newInstanceLayout(env.Roots, v)
+			if err := take("binary-"+v, rootKeyUsrLib, vl.binaryRel, false); err != nil {
+				return t.wrapUp(ctx, err)
+			}
+		}
+	}
+	if set.purge {
+		if err := take("secrets", rootKeyVarLib, layout.secretsRel, true); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := take("instance", rootKeyVarLib, layout.instanceRel, true); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := take("manifest", rootKeyVarLib, layout.manifestRel, false); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+	}
+	if err := lifecycleHook("snapshots-done"); err != nil {
+		return t.wrapUp(ctx, err)
+	}
+
+	if set.fromInstalled {
+		// --- stop, disable, remove the unit, daemon-reload (§8.4 steps 2-3).
+		// The systemd chain: stop (state unchanged), disable (-> disabled),
+		// daemon-reload once the unit file is gone (-> the unit no longer
+		// exists, UnitFileState ""), so the journal's chain matches what
+		// systemd reports at every crash point. ---
+		uKey := unitStateTargetKey(env.Roots)
+		before := transaction.PathState{UnitFileState: t.unitBefore.UnitFileState}
+		disabled := transaction.PathState{UnitFileState: "disabled"}
+		gone := transaction.PathState{}
+		if err := p.runSystemdStep(ctx, "systemd-stop", transaction.KindSystemdStop, uKey, before, before, func(c context.Context) error { return env.Systemd.Stop(c, unitName) }); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.runSystemdStep(ctx, "systemd-disable", transaction.KindSystemdDisable, uKey, before, disabled,
+			func(c context.Context) error { return env.Systemd.SetUnitFileState(c, unitName, "disabled") }); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doRemoveFile(ctx, "remove-unit", rootKeySystemd, layout.unitRel, snaps["unit"].pre); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.runSystemdStep(ctx, "systemd-daemon-reload", transaction.KindSystemdDaemonReload, uKey, disabled, gone, env.Systemd.DaemonReload); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+
+		// --- config file and directory (§8.4 step 4) ---
+		if err := p.doRemoveFile(ctx, "remove-config", rootKeyEtc, layout.configRel, snaps["config"].pre); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doRemoveDir(ctx, "remove-configdir", rootKeyEtc, layout.configDirRel); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+
+		// --- private binaries: files, version directories, then the two
+		// shared directories (§8.4 step 5) ---
+		for _, v := range set.versions {
+			vl := newInstanceLayout(env.Roots, v)
+			if err := p.doRemoveFile(ctx, "remove-binary-"+v, rootKeyUsrLib, vl.binaryRel, snaps["binary-"+v].pre); err != nil {
+				return t.wrapUp(ctx, err)
+			}
+			if err := p.doRemoveDir(ctx, "remove-versiondir-"+v, rootKeyUsrLib, vl.versionDirRel); err != nil {
+				return t.wrapUp(ctx, err)
+			}
+		}
+		if err := p.doRemoveDir(ctx, "remove-versionsdir", rootKeyUsrLib, layout.versionsDirRel); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doRemoveDir(ctx, "remove-bindir", rootKeyUsrLib, layout.binDirRel); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+	}
+
+	if set.purge {
+		// --- identity, manifest, then the state directory itself (§8.5
+		// step 5); the purge commits only after all of it is gone ---
+		if err := p.doRemoveFile(ctx, "remove-secrets", rootKeyVarLib, layout.secretsRel, snaps["secrets"].pre); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doRemoveFile(ctx, "remove-instance", rootKeyVarLib, layout.instanceRel, snaps["instance"].pre); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doRemoveFile(ctx, "remove-manifest", rootKeyVarLib, layout.manifestRel, snaps["manifest"].pre); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doRemoveDir(ctx, "remove-statedir", rootKeyVarLib, layout.stateDirRel); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+	} else {
+		// --- the uninstalled manifest is the commit point (§7.5) ---
+		manifestBytes, err := buildUninstalledManifest(env, uid32, gid32, set.manifest.SingboxCurrent)
+		if err != nil {
+			return t.wrapUp(ctx, err)
+		}
+		if err := p.doOverwriteFile(ctx, "manifest", rootKeyVarLib, layout.manifestRel, manifestBytes, 0600, uid32, gid32, false); err != nil {
+			return t.wrapUp(ctx, err)
+		}
+	}
+	return t.commit(ctx)
+}
+
+// --- Recover (spec §8.6, §7.4-§7.6) ---
+
+// RecoverParams is recover's input: Abandon is --abandon (spec §7.4's manual
+// escape hatch).
+type RecoverParams struct {
+	Abandon bool
+}
+
+// PrecheckRecover is recover's quick precheck and post-lock recheck alike
+// (spec §8: "recover: 实例状态必须是未完成事务").
+func PrecheckRecover(env *Env) error {
+	if state := DetectInstanceState(env.FS, env.Roots); state.Status != StatusUnfinishedTxn {
+		return fmt.Errorf("realitynode: there is no unfinished transaction to recover (status=%v, reasons=%v)", state.Status, state.Reasons)
+	}
+	return nil
+}
+
+func needsAttention(path string, err error) Result { return Result{Err: err, TxnDir: path} }
+
+func recovered(o transaction.Outcome, notices ...string) Result {
+	return Result{Recovered: true, RecoveredOutcome: o, Notices: notices}
+}
+
+// RunRecover recovers a leftover transaction (spec §8.6) with the caller
+// holding L1+L3. Everything is delegated to the one shared engine: a leftover
+// tombstone is deleted wholesale without being read (§7.6); an area with no
+// journal.json is discarded only when it holds nothing but journal.json.tmp
+// (§7.6); otherwise OpenRecoverer's Recoverer resumes the journal exactly as
+// the forward paths' own failure handling would — RecoverDetached for
+// running/rolling_back/committed, Abandon for --abandon. Success is always
+// exit 0; a refused --abandon is exit 1 with nothing changed; anything the
+// engine cannot confirm (tampering, unknown schema, a failed gate, a timeout)
+// is exit 5 naming the area, which is preserved.
+func RunRecover(ctx context.Context, env *Env, params RecoverParams) Result {
+	if err := PrecheckRecover(env); err != nil {
+		return preTxnFail(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return preTxnFail(fmt.Errorf("realitynode: recover cancelled before it started: %w", err))
+	}
+	roots, err := openAllRoots(env.Roots, env.TrustedOwnerUID)
+	if err != nil {
+		return preTxnFail(err)
+	}
+	defer roots.closeAll()
+
+	var notices []string
+	tombs, _ := env.FS.Glob(env.Roots.TombstoneGlob)
+	sort.Strings(tombs)
+	for _, tomb := range tombs {
+		if filepath.Dir(tomb) != filepath.Dir(env.Roots.StateDir) {
+			return needsAttention(tomb, fmt.Errorf("realitynode: unexpected tombstone location %s", tomb))
+		}
+		if err := transaction.DeleteTombstone(roots.varLib, filepath.Base(tomb)); err != nil {
+			return needsAttention(tomb, fmt.Errorf("realitynode: delete tombstone %s: %w", tomb, err))
+		}
+		notices = append(notices, "deleted the leftover tombstone "+tomb+" (a finished transaction's remains; its contents were not read)")
+	}
+
+	if _, err := os.Lstat(env.Roots.TxnDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return recovered(transaction.OutcomeCommitted, notices...) // only a tombstone was left
+		}
+		return needsAttention(env.Roots.TxnDir, err)
+	}
+	switch err := transaction.RecoverEmptyTransactionArea(roots.varLib, txnDirName(env.Roots)); {
+	case err == nil:
+		return recovered(transaction.OutcomeNoChange, append(notices, "removed a transaction area with no journal: the crash happened while the transaction was starting, so nothing was modified")...)
+	case errors.Is(err, transaction.ErrJournalPresent):
+		// a journal exists: resume it below
+	default:
+		return needsAttention(env.Roots.TxnDir, err)
+	}
+	_ = lifecycleHook("recover:opening")
+
+	rec, closeFn, err := OpenRecoverer(env)
+	if err != nil {
+		return needsAttention(env.Roots.TxnDir, fmt.Errorf("realitynode: cannot open the leftover transaction: %w", err))
+	}
+	defer closeFn()
+
+	if params.Abandon {
+		// Like every recovery, abandon must not be cut short by a signal
+		// halfway through deleting the area.
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transaction.DefaultRollbackBudget)
+		defer cancel()
+		outcome, err := rec.Abandon(actx)
+		switch {
+		case err == nil:
+			r := recovered(outcome, notices...)
+			r.Warnings = []string{"the transaction was abandoned without restarting the service or running the self-check: the service may not be running; check it with 'systemctl status proxyctl-reality' and 'sudo proxyctl node service show', and run 'reinstall' if needed"}
+			return r
+		case errors.Is(err, transaction.ErrAbandonNotEligible):
+			return preTxnFail(err)
+		default:
+			return needsAttention(env.Roots.TxnDir, err)
+		}
+	}
+
+	outcome, err := rec.RecoverDetached(ctx)
+	if err != nil {
+		return needsAttention(env.Roots.TxnDir, fmt.Errorf("realitynode: recover did not finish: %w", err))
+	}
+	switch outcome {
+	case transaction.OutcomeRolledBack:
+		notices = append(notices, "rolled the interrupted operation back to its pre-transaction state")
+	case transaction.OutcomeCommitted:
+		notices = append(notices, "the interrupted operation had already committed; finished its forward cleanup")
+	case transaction.OutcomeNoChange:
+		notices = append(notices, "the interrupted operation had modified nothing; its transaction area was removed")
+	}
+	notices = append(notices, "run 'sudo proxyctl node service show' to see the current state")
+	return recovered(outcome, notices...)
 }

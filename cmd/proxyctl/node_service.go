@@ -1,7 +1,8 @@
 package main
 
 // node_service.go implements design spec §8's `proxyctl node service
-// install|reinstall|show` (Task 7). All three commands are unconditionally
+// install|reinstall|show` (Task 7) and `uninstall [--purge [--export-backup
+// PATH]]` / `recover [--abandon]` (Task 8). All of them are unconditionally
 // strict mode (§4.5); parsing always completes, in full, before any root
 // check, lock, network call or write (§4.5's "执行任何修改、网络请求或加锁
 // 之前，先完整解析全部argv" and G2). Role detection (internal/role) and
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -31,10 +33,12 @@ import (
 const showLockWait = 10 * time.Second
 
 func nodeServiceUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: proxyctl node service <install|reinstall|show> [args]")
+	fmt.Fprintln(w, "usage: proxyctl node service <install|reinstall|show|uninstall|recover> [args]")
 	fmt.Fprintln(w, "  install   --name NAME --server ADDR [--port PORT] [--sni SNI]")
 	fmt.Fprintln(w, "  reinstall [--singbox-version V --singbox-sha256 H]")
 	fmt.Fprintln(w, "  show")
+	fmt.Fprintln(w, "  uninstall [--purge [--export-backup PATH]]")
+	fmt.Fprintln(w, "  recover   [--abandon]")
 }
 
 func cmdNodeService(args []string, stdout, stderr io.Writer) int {
@@ -53,6 +57,10 @@ func cmdNodeService(args []string, stdout, stderr io.Writer) int {
 		return cmdNodeServiceReinstall(args[1:], stdout, stderr)
 	case "show":
 		return cmdNodeServiceShow(args[1:], stdout, stderr)
+	case "uninstall":
+		return cmdNodeServiceUninstall(args[1:], stdout, stderr)
+	case "recover":
+		return cmdNodeServiceRecover(args[1:], stdout, stderr)
 	default:
 		nodeServiceUsage(stderr)
 		return 2
@@ -235,6 +243,9 @@ func reportServiceResult(r realitynode.Result, stdout, stderr io.Writer) int {
 		if r.Stdout != "" {
 			fmt.Fprint(stdout, r.Stdout)
 		}
+		for _, n := range r.Notices {
+			fmt.Fprintln(stderr, n)
+		}
 	}
 	return code
 }
@@ -252,8 +263,12 @@ func cmdNodeServiceInstall(args []string, stdout, stderr io.Writer) int {
 		{Name: "server", Kind: FlagString},
 		{Name: "port", Kind: FlagString},
 		{Name: "sni", Kind: FlagString},
+		{Name: "abandon", Kind: FlagBool}, // recognised only to reject it with CheckAbandonPlacement's message
 	}
 	parsed, err := StrictScan(args, specs, 0)
+	if err == nil {
+		err = CheckAbandonPlacement(parsed, false)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
@@ -335,12 +350,14 @@ func cmdNodeServiceReinstall(args []string, stdout, stderr io.Writer) int {
 	specs := []FlagSpec{
 		{Name: "singbox-version", Kind: FlagString},
 		{Name: "singbox-sha256", Kind: FlagString},
-		// name/server/port/sni are explicitly rejected (spec §8.2): listed
-		// here so a strict scan reports them the same way any other known-
-		// but-forbidden-here flag would, rather than a generic "unknown
-		// flag" — the exit code (2) is identical either way.
+		{Name: "abandon", Kind: FlagBool}, // recognised only to reject it with CheckAbandonPlacement's message
+		// name/server/port/sni are deliberately not listed: under strict
+		// mode they are unknown flags (spec §8.2), exit 2.
 	}
 	parsed, err := StrictScan(args, specs, 0)
+	if err == nil {
+		err = CheckAbandonPlacement(parsed, false)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
@@ -395,7 +412,11 @@ func cmdNodeServiceShow(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "usage: proxyctl node service show")
 		return 0
 	}
-	if _, err := StrictScan(args, nil, 0); err != nil {
+	showParsed, err := StrictScan(args, []FlagSpec{{Name: "abandon", Kind: FlagBool}}, 0)
+	if err == nil {
+		err = CheckAbandonPlacement(showParsed, false)
+	}
+	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
@@ -416,5 +437,117 @@ func cmdNodeServiceShow(args []string, stdout, stderr io.Writer) int {
 
 	env := rt.newEnv()
 	result := realitynode.Show(context.Background(), env)
+	return reportServiceResult(result, stdout, stderr)
+}
+
+// --- uninstall (spec §8.4, §8.5) ---
+
+func cmdNodeServiceUninstall(args []string, stdout, stderr io.Writer) int {
+	rt := newServiceRuntime()
+	if IsHelpOnly(args) {
+		fmt.Fprintln(stdout, "usage: proxyctl node service uninstall [--purge [--export-backup PATH]]")
+		return 0
+	}
+	specs := []FlagSpec{
+		{Name: "purge", Kind: FlagBool},
+		{Name: "export-backup", Kind: FlagString},
+		{Name: "abandon", Kind: FlagBool}, // recognised only to reject it with CheckAbandonPlacement's message
+	}
+	parsed, err := StrictScan(args, specs, 0)
+	if err == nil {
+		err = CheckAbandonPlacement(parsed, false)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	purge := parsed.Bool("purge")
+	exportPath := ""
+	if parsed.Set["export-backup"] {
+		exportPath = parsed.Values["export-backup"]
+		if !purge {
+			fmt.Fprintln(stderr, "error: --export-backup is only valid together with --purge")
+			return 2
+		}
+		if exportPath == "" {
+			fmt.Fprintln(stderr, "error: --export-backup needs a non-empty path")
+			return 2
+		}
+		// A relative path is resolved against the working directory here, at
+		// parse time; the value itself is only a string, nothing is touched.
+		abs, aerr := filepath.Abs(exportPath)
+		if aerr != nil {
+			fmt.Fprintln(stderr, "error: --export-backup:", aerr)
+			return 2
+		}
+		exportPath = abs
+	}
+	params := realitynode.UninstallParams{Purge: purge, ExportPath: exportPath}
+
+	// Spec §8 order: parse -> root -> quick precheck -> lock (L1 then L3) ->
+	// recheck -> transaction. uninstall/purge recheck only the instance state
+	// (§8's table), so — unlike install/reinstall — no role detection.
+	if !rt.requireRoot(stderr) {
+		return 1
+	}
+	ctx, cancel := rt.newContext()
+	defer cancel()
+
+	env := rt.newEnv()
+	plan, err := realitynode.PrecheckUninstall(ctx, env, params)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	lease, err := rt.acquire(ctx, hostlock.L1, hostlock.L3)
+	if err != nil {
+		fmt.Fprintln(stderr, "error: another operation is in progress:", err)
+		return 1
+	}
+	defer lease.Release()
+
+	result := realitynode.RunUninstall(ctx, env, plan)
+	return reportServiceResult(result, stdout, stderr)
+}
+
+// --- recover (spec §8.6) ---
+
+func cmdNodeServiceRecover(args []string, stdout, stderr io.Writer) int {
+	rt := newServiceRuntime()
+	if IsHelpOnly(args) {
+		fmt.Fprintln(stdout, "usage: proxyctl node service recover [--abandon]")
+		return 0
+	}
+	parsed, err := StrictScan(args, []FlagSpec{{Name: "abandon", Kind: FlagBool}}, 0)
+	if err == nil {
+		err = CheckAbandonPlacement(parsed, true)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	params := realitynode.RecoverParams{Abandon: parsed.Bool("abandon")}
+
+	if !rt.requireRoot(stderr) {
+		return 1
+	}
+	ctx, cancel := rt.newContext()
+	defer cancel()
+
+	env := rt.newEnv()
+	if err := realitynode.PrecheckRecover(env); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	lease, err := rt.acquire(ctx, hostlock.L1, hostlock.L3)
+	if err != nil {
+		fmt.Fprintln(stderr, "error: another operation is in progress:", err)
+		return 1
+	}
+	defer lease.Release()
+
+	// RunRecover re-checks that the state is still "unfinished transaction"
+	// under the locks (§8's table).
+	result := realitynode.RunRecover(ctx, env, params)
 	return reportServiceResult(result, stdout, stderr)
 }

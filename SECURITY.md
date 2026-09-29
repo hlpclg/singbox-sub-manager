@@ -78,3 +78,14 @@
 - **下载校验路径不接受未经哈希核实的内容进入受管资产。** `DownloadSingbox` 在写入最终二进制之前完成 SHA256 校验、单文件类型校验和大小上限检查，全部发生在事务区 `dl/` 目录内、经目录描述符操作（不经字符串路径），失败时清理临时文件、不产生任何受管路径变化;这与上文“事务快照/临时文件含敏感数据”遵循同一条“失败路径不留可被误用的残留”的原则,但这里保护的是二进制完整性而不是私钥。
 
 依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 6、8.1、9.3、16 节。
+
+## Reality 实例的卸载、purge、`--export-backup` 与 recover（`internal/realitynode`，v0.10 Task 8）
+
+- **`--export-backup` 归档含私钥，保管责任在用户。** `uninstall --purge --export-backup PATH` 写出的 tar.gz（mode 0600）包含 `/var/lib/proxyctl-reality/`（`secrets.json` 的私钥、UUID、short_id，`instance.json`，manifest）和 `/etc/proxyctl-reality/config.json`（同样含私钥）。这是 purge 之后本机上唯一可能残留私钥的文件，也是唯一一份永久备份；`proxyctl` 不加密、不管理、不轮换它，stderr 每次都会警告。本版本没有导入命令，归档不受支持地解压回原位会得到“manifest 为 installed 但 unit 和二进制都不存在”的不一致状态。不要把它上传到 issue、日志或共享位置；不再需要时安全删除。不带 `--export-backup` 的 purge 不会留下任何隐式私钥备份（事务区快照随事务区一起整体删除，见下）。
+- **归档不会覆盖用户文件，也不会留下临时文件（尽力而为的约束）。** 目标名在写入前检查不存在（`AT_SYMLINK_NOFOLLOW`，悬空符号链接也算已存在），临时文件用 `O_EXCL` 创建在同一目录、mode 0600（显式 `fchmod`，不受 umask 影响），fsync 后用 `link(2)` 放到目标名——`link` 不会替换已有名字，所以检查之后、link 之前被别人占用的目标名会使导出失败而不是被覆盖；随后才删除临时名。失败或取消时临时文件被删除，purge 不开始。这只覆盖 `proxyctl` 自己的失败路径：进程被 SIGKILL 或断电时，导出目录里可能留下 `.proxyctl-export-*.tmp`（同样含私钥、mode 0600），需要手工删除。link 成功之后才出现的失败（删除临时名、目录 fsync）会保留完整的归档并返回 1。归档目标不能位于会被 purge 删除的目录里。归档只按 `O_NOFOLLOW` 读取两个目录里的普通文件和目录，遇到符号链接、设备等其他类型拒绝导出。
+- **purge 的事务区和快照含私钥，完成后整体删除。** purge 把 `secrets.json`、`config.json` 等全部受管资产快照进事务区 `snap/`（mode 0600），成功后按 §7.6 先 rename 为墓碑再递归删除，因此成功的 purge 不留任何含私钥的文件；崩溃后残留的事务区或墓碑在被 `recover` 处理之前仍含私钥快照，必须按含私钥文件对待（见上文“事务快照含敏感数据”）。`recover` 发现墓碑时整体删除，不读取其中内容。
+- **`recover` 不是绕过校验的手段。** `recover` 与自动回滚共用同一个恢复引擎：先按 journal 校验全部受管路径和临时名，任何一项不属于该阶段允许的状态，就判定为外部篡改，不修改任何路径、不修改 journal，返回 5 并保留现场——它不会“强行恢复”被篡改的现场。未知 journal schema 同样只读返回 5。`--abandon` 只在全部受管路径已经处于事务前状态时才删除事务区，不重启服务、不跑门禁：它会让一个可能没有运行的服务保持现状，这是有意的人工放弃出口，stderr 会警告。无 journal 的事务区只有在内容仅为空或 `journal.json.tmp` 时才被丢弃，其他任何内容都返回 5 保留原样。
+- **uninstall/purge 只操作实例资产表里的路径。** 共享的 `/usr/local/bin/proxyctl`（及 `.sha256`）、`/usr/local/bin/sing-box`、`/etc/sing-box/`、`/etc/singbox-sub-manager/` 和 `/var/lib/proxyctl-bootstrap/` 从不被读写；实例目录里出现 manifest 没有登记的内容时，预检拒绝（返回 1），而不是在事务中途删除它们。
+- **不做角色检测。** `uninstall`、`uninstall --purge` 和 `recover` 不读取订阅中心的 token 文件，只以实例状态判定是否可执行（规格 §8 复查表），因此在角色检测“不确定”的主机上也能清理一个卡住的实例。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.4、7.6、8.4–8.6、16 节。

@@ -1,12 +1,12 @@
 # Reality 节点（施工中，v0.10）
 
-本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show` 已经可用（Task 7）；`uninstall`、`uninstall --purge`、`recover` 尚未交付（Task 8），交互菜单和 bootstrap 首装脚本尚未交付（Task 9–12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
+本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单和 bootstrap 首装脚本尚未交付（Task 10–12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
 
 完整设计见 [v0.10 定稿规格](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)；已完成 Task 的真实验证证据见 [reality-node-validation.md](reality-node-validation.md)。
 
-## 本机代理服务命令（`proxyctl node service`，Task 7）
+## 本机代理服务命令（`proxyctl node service`，Task 7–8）
 
-三个命令共同的顺序（规格 §8）：严格解析全部参数（含取值校验）→ 检查 root → 快速预检 → 取锁（`install`/`reinstall` 取 L1 再 L3，`show` 只取 L3，最长等待 10 秒）→ 取锁后复查 → 执行。命令必须以 root 运行；订阅中心角色必须是“否”，否则拒绝（`install`/`reinstall` 需要，快速预检与取锁后各查一次）。
+`install`、`reinstall`、`show` 三个命令共同的顺序（规格 §8）：严格解析全部参数（含取值校验）→ 检查 root → 快速预检 → 取锁（`install`/`reinstall` 取 L1 再 L3，`show` 只取 L3，最长等待 10 秒）→ 取锁后复查 → 执行。命令必须以 root 运行；订阅中心角色必须是“否”，否则拒绝（`install`/`reinstall` 需要，快速预检与取锁后各查一次）。
 
 - 快速预检发生在取锁**之前**：`install` 检查 OS/架构/systemd、实例状态（必须未安装）、磁盘空间、`listen_port` 可绑定、选定 `selfcheck_port`、ufw 告警、§9.1 dest 探测；`reinstall` 检查参数配对、OS/架构/systemd、实例状态是否是两个允许来源之一。预检不修改任何东西，失败返回 1，且不取锁。
 - 取锁后只按规格 §8 的复查表复查：`install` 复查实例状态、目标路径冲突、`listen_port` 与 `selfcheck_port` 仍可绑定（不重复 dest 探测）；`reinstall` 复查实例状态（来源可能变化）；来源为“已卸载但保留身份”时再复查 `listen_port`，任何来源下 `selfcheck_port` 不可绑定都按下文规则重选。复查失败同样返回 1。
@@ -39,6 +39,39 @@
 - manifest 记录的 sing-box 版本与本机 `proxyctl` 编译期固定值不同（例如执行过 `bootstrap-node.sh --upgrade` 之后）：stderr 提示执行 `reinstall`，stdout 不受影响。
 - 实例处于“未安装”“未完成事务”“不一致”时返回 1，不输出任何命令。
 
+### `sudo proxyctl node service uninstall`（Task 8，规格 §8.4）
+
+- 只适用于“已安装”状态；“已卸载但保留身份”再执行 `uninstall` 返回 1（提示用 `reinstall` 恢复，或 `uninstall --purge` 彻底清除）。
+- 顺序同其他变更命令：严格解析 → root → 快速预检（状态、实例目录里只有 manifest 登记过的内容、磁盘空间）→ 取 L1、L3 → 只复查实例状态 → 事务。**不检测订阅中心角色**：规格 §8 的复查表对 uninstall/purge/recover 只列实例状态，并且清理一个卡住的实例不应依赖 token 文件可读。
+- 事务步骤：快照 unit、config 和全部已登记版本的私有二进制 → `stop`、`disable` → 删除 unit → `daemon-reload` → 删除 config 和配置目录 → 删除私有二进制的文件和目录（含 `versions/`、`/usr/local/lib/proxyctl-reality/`）→ manifest 改写为 `uninstalled`，这一步完成后即提交。`secrets.json`、`instance.json`、`manifest.json` 保留，字节、mode、属主都不变；已卸载状态下不会生成新的身份，`install` 会被拒绝，`reinstall` 复用原身份。
+- 任一步失败（包括取消、崩溃）都从快照完整恢复：文件、目录（在 umask 077 下以记录的 0755/0700 重建，新 inode）以及 systemd 状态（重新 enable，原本 active 则 restart 并重跑门禁）。
+- stdout：一条可执行的 `disable` 命令，附一条整行注释的备选 `remove` 命令。stderr 提示 `/usr/local/bin/proxyctl` 及其 `.sha256`、`/var/lib/proxyctl-bootstrap/` 中 bootstrap 的旧副本不属于实例，已保留。
+
+### `sudo proxyctl node service uninstall --purge [--export-backup PATH]`（Task 8，规格 §8.5）
+
+- 可在“已安装”或“已卸载但保留身份”状态下执行。事务先把**全部**受管资产（unit、config、私有二进制、`secrets.json`、`instance.json`、`manifest.json`）快照进事务区；unit 存在时 `stop`、`disable`、删除、`daemon-reload`；再删除 config、私有二进制、身份、manifest 和 `/var/lib/proxyctl-reality/` 本身；全部删除完成后提交。任何一步失败都从快照完整恢复（含 systemd 状态），返回 4。
+- 成功后 `/var/lib/proxyctl-reality/`、`/etc/proxyctl-reality/`、unit、私有二进制目录、事务区和墓碑都不存在；本机不再有任何含私钥的文件（**没有隐式备份**）。L3 锁文件 `/run/lock/proxyctl-reality.lock` 不属于实例资产，可能保留。`/usr/local/bin/proxyctl` 和 `/var/lib/proxyctl-bootstrap/` 的旧副本保留（stderr 提示）。
+- 实例目录里出现 manifest 没有登记的文件或目录（会让最后的 rmdir 在修改途中失败）时，预检直接返回 1，不修改任何东西；处理掉多余内容后再执行。
+- stdout：一条可执行的 `remove` 命令，附一条整行注释的备选 `disable` 命令。
+- **`--export-backup PATH`** 是唯一会产生永久备份的途径，只能与 `--purge` 一起使用（否则返回 2），发生在取得 L3 并复查之后、事务开始之前：
+  - PATH 已存在（包括符号链接、目录）则返回 1；相对路径按当前工作目录解析；PATH 不能位于会被 purge 删除的目录里（状态目录、配置目录、私有二进制目录、事务区）。
+  - 在 PATH 所在目录用 `O_EXCL` 创建临时文件（mode 0600，名字形如 `.proxyctl-export-<随机>.tmp`），写入 tar.gz，内容仅为 `/var/lib/proxyctl-reality/` 和 `/etc/proxyctl-reality/`（存在的那些），成员名是去掉开头 `/` 的绝对路径；fsync 后用 `link` 放到 PATH（`link` 不会覆盖已有文件，目标名在检查之后被别人占用时会失败），再删除临时名。
+  - 写入失败、fsync 或 link 失败、收到取消信号：删除临时文件，返回 1，不开始事务，用户已有的文件不会被覆盖。极少见的例外：link 已成功、之后才失败（删除临时名或目录 fsync 失败）时，完整的归档保留在 PATH，返回 1，不开始事务。
+  - stderr 警告归档含私钥，请妥善保管。**本版本没有导入命令**：归档只用于留存密钥和实例参数（uuid、私钥、short_id、server、port、sni）供人工查阅或以后版本导入；把它直接解压回原位不是受支持的恢复方式——manifest 会是 `installed`，但 unit 和二进制都不存在，实例会被判为“不一致”。要重新部署请重新 `install`。
+
+### `sudo proxyctl node service recover [--abandon]`（Task 8，规格 §7.4–§7.6、§8.6）
+
+- 只在“未完成事务”状态可用（事务区或墓碑目录存在）；其他状态返回 1，不做任何修改。取锁顺序和其他变更命令相同（L1→L3，取锁后再确认状态），不检测订阅中心角色。它和自动回滚共用同一个恢复引擎，没有第二套恢复逻辑。
+- 按残留内容处理：
+  - **running / rolling_back**：先校验全部受管路径与临时名（任何一项不属于该阶段允许的状态即判定为外部篡改，见下），再回滚或续做回滚：先降级 systemd，再从快照恢复文件，最后恢复 systemd（原本 active 则 restart 并用事务前的 manifest 重跑本机门禁），删除事务区。修改任何受管路径之前的残留直接丢弃事务区。成功返回 0。
+  - **committed**：只向前完成清理（例如 reinstall 提交后要删的旧版本目录），不回滚，删除事务区，返回 0。
+  - **墓碑目录**（`.proxyctl-reality-txn.tomb-<txn_id>`）：整体删除，不读取其中内容，返回 0。
+  - **有事务区但没有 `journal.json`**：只含 `journal.json.tmp`，或者为空，说明崩溃发生在事务开始阶段，没有修改任何受管路径，整体删除，返回 0；其他任何内容都返回 5，不做修改。
+  - recover 自己被中断（进程被杀、系统断电）后再次执行会收敛到同一结果；收到 SIGINT/SIGTERM 时不会中断恢复本身（回滚使用独立的 120 秒预算），只有在恢复开始之前收到才返回 1。
+- **篡改与无法确认**：检测到外部篡改、journal 的 schema 未知（stderr 会给出写入它的 `proxyctl` 版本，请用该版本执行 recover）、门禁失败、回滚超时，返回 5：保留事务区和现场、不修改 journal，stderr 输出事务区路径，处理步骤见 [troubleshooting.md](troubleshooting.md)。
+- **`--abandon`**（人工放弃出口）：只有全部受管路径都已经处于事务前状态、且没有未登记的临时名时才可用——这种情况只会出现在“文件已全部恢复，但恢复后的门禁失败”之后。它**不**重启服务、**不**跑门禁，保持 systemd 当前状态，删除事务区，返回 0，并在 stderr 警告服务可能没有运行、需要人工排查（`systemctl status proxyctl-reality`，必要时 `reinstall`）。条件不满足（包括已提交的事务）返回 1，不做任何修改。`--abandon` 只能出现在 `node service recover` 上，出现在其他命令里返回 2。
+- 成功时 stdout 没有输出；stderr 说明做了什么，并提示用 `show` 查看当前状态。
+
 ### 粘贴输出格式（规格 §10.1）
 
 每个输出块恰好一行不以 `#` 开头的可执行命令；有备选命令时，备选命令连同说明整行以 `#` 开头。所有命令都带 `--publish --min-version v0.10.0`，flag 在节点名之前，参数值用单引号引用（空值 `''`）。四个模板：
@@ -50,14 +83,14 @@ sudo proxyctl node disable --publish --min-version v0.10.0 '<name>'
 sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 ```
 
-这四条命令目前还不能在订阅中心上真正执行——`--publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove` 由 Task 9 交付；在此之前粘贴这些命令会以退出码 2 报“未知 flag”。
+`uninstall` 输出 disable（备选 remove），`uninstall --purge` 输出 remove（备选 disable），格式同上，每块恰好一条可执行命令。这四条命令目前还不能在订阅中心上真正执行——`--publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove` 由 Task 9 交付；在此之前粘贴这些命令会以退出码 2 报“未知 flag”。
 
 ### 退出码（`node service` 全部子命令）
 
 | 退出码 | 含义 |
 |---|---|
-| 0 | 成功（可能伴随外网探测等告警） |
-| 1 | 用法之外的失败，且第一个受管资产被修改之前：预检失败、角色或状态不符、锁超时、dest 不可达、下载或 `check` 失败等（包括事务区已创建但尚未修改任何受管路径、已被自动删除的情况） |
+| 0 | 成功（可能伴随外网探测等告警）；`recover` 无论回滚、向前清理还是丢弃空事务区，成功都是 0 |
+| 1 | 用法之外的失败，且第一个受管资产被修改之前：预检失败、角色或状态不符、锁超时、dest 不可达、下载或 `check` 失败、`--export-backup` 失败、`recover --abandon` 条件不满足等（包括事务区已创建但尚未修改任何受管路径、已被自动删除的情况） |
 | 2 | 用法错误（严格解析失败、缺少必填参数、参数不成对等），不取锁、不发起网络请求、不修改任何文件 |
 | 4 | 已自动回滚到事务前状态 |
 | 5 | 需人工介入：事务已经开始，而本进程无法确认已经恢复——检测到外部篡改、回滚失败或超时、恢复后复查失败，或提交后的向前清理没有完成；stderr 输出保留的事务区路径，处理步骤见 `docs/troubleshooting.md` |
@@ -69,8 +102,9 @@ sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 ### 已知限制
 
 - 修改后的私网拒绝列表只在 `install`/`reinstall` 时生成；网卡地址或 `--server` 解析结果变化后须重新执行一次 `reinstall`。
-- `reinstall` 不接受修改 `name`/`server`/`port`/`sni`；需要这些变化时先 `uninstall --purge`（Task 8）再重新 `install`。
-- 本 Task 尚未交付 `uninstall`、`uninstall --purge`、`recover`；出现“未完成事务”状态时，暂时只能参考 `docs/troubleshooting.md` 的人工处理步骤，或等待 Task 8。
+- `reinstall` 不接受修改 `name`/`server`/`port`/`sni`；需要这些变化时先 `uninstall --purge` 再重新 `install`（公钥、UUID、short_id 会重新生成，订阅中心需要先 `remove` 旧节点再 `add`）。
+- `--export-backup` 归档没有受支持的导入或解压恢复方式，见上文。
+- 真实 systemd 上 uninstall/purge 的一个恢复窗口尚未验证，待 Task 13 真机验收：unit 文件已删除之后、`daemon-reload` 完成之前发生崩溃，或 `daemon-reload` 调用本身失败时，回滚的降级步骤会对已不存在的 unit 文件执行 `systemctl disable`，真实 systemd 可能拒绝，结果是返回 5（而不是 4 或 0），事务区和现场原样保留；处理方式见 [troubleshooting.md](troubleshooting.md) 中关于退出码 5 的通用做法。
 
 ## 已实现：只读检测
 
@@ -133,7 +167,6 @@ X25519 推导的正确性由 RFC 7748 §6.1 的标准测试向量验证（`inter
 
 ## 尚未实现
 
-- `proxyctl node service uninstall`、`uninstall --purge`、`recover`：Task 8。
 - 订阅中心发布事务（`node publish`、带 `--publish` 的 CRUD）：Task 9。上文粘贴命令目前还不能在订阅中心执行。
 - 交互菜单（`sudo proxyctl node`）：Task 10。
 - bootstrap 首装脚本（`bootstrap-node.sh`）及其 `--upgrade` 模式：Task 11–12。

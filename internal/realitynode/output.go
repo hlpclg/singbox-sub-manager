@@ -164,3 +164,32 @@ func ShowUninstalledOutput(name string) string {
 		AltCommand: RemoveCommand(name),
 	}.Render()
 }
+
+// UninstallOutput implements spec §8.4's stdout: the executable disable
+// command (the subscription center keeps the node listed but disabled, ready
+// for a later reinstall), plus a commented-out alternative remove command.
+func UninstallOutput(name string) string {
+	return Block{
+		Purpose:    "disable this node on the subscription center (the identity is kept, reinstall can bring it back)",
+		Command:    DisableCommand(name),
+		AltHint:    "if you want to remove this node from the subscription entirely, use this instead",
+		AltCommand: RemoveCommand(name),
+	}.Render()
+}
+
+// PurgeOutput implements spec §8.5's stdout: the executable remove command
+// (nothing of this node remains on this host), plus a commented-out
+// alternative disable command.
+func PurgeOutput(name string) string {
+	return Block{
+		Purpose:    "remove this node from the subscription center (this host keeps nothing of it)",
+		Command:    RemoveCommand(name),
+		AltHint:    "if you only want to keep the node listed but disabled, use this instead",
+		AltCommand: DisableCommand(name),
+	}.Render()
+}
+
+// SharedAssetsKeptNotice is spec §5.1's "卸载（包括--purge）时提示proxyctl
+// 及其旧副本已保留": the shared proxyctl binary and bootstrap-node.sh's
+// previous copy are not instance assets and are never touched.
+const SharedAssetsKeptNotice = "kept: /usr/local/bin/proxyctl (and its .sha256) and bootstrap's previous copy under /var/lib/proxyctl-bootstrap/ are not part of the instance and were not touched"
