@@ -153,7 +153,7 @@ func withDefaultNodesLock(path string, stderr io.Writer, fn func() int) int {
 }
 
 func nodeUsage(stderr io.Writer) int {
-	fmt.Fprintln(stderr, "usage: proxyctl node <list|add|edit|remove|enable|disable|migrate> [args]")
+	fmt.Fprintln(stderr, "usage: proxyctl node <list|add|edit|remove|enable|disable|migrate|service> [args]")
 	return 2
 }
 
@@ -178,6 +178,8 @@ func cmdNode(args []string, stdout, stderr io.Writer) int {
 		return cmdNodeTest(args[1:], stdout, stderr)
 	case "migrate":
 		return cmdNodeMigrate(args[1:], stdout, stderr)
+	case "service":
+		return cmdNodeService(args[1:], stdout, stderr)
 	default:
 		return nodeUsage(stderr)
 	}
