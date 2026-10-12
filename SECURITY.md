@@ -89,3 +89,16 @@
 - **不做角色检测。** `uninstall`、`uninstall --purge` 和 `recover` 不读取订阅中心的 token 文件，只以实例状态判定是否可执行（规格 §8 复查表），因此在角色检测“不确定”的主机上也能清理一个卡住的实例。
 
 依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.4、7.6、8.4–8.6、16 节。
+
+## 订阅中心发布事务（`internal/publish`，v0.10 Task 9）
+
+- **发布事务区、staging 和快照含节点凭据。** 事务区 `/var/lib/singbox-sub-manager/publish/`（root:root、0700）的 `snap/`（mode 0600）保存发布前的 `nodes.conf`（节点密码、UUID 等）和已存在的订阅文件；staging 目录 `<dirname(subscription_root)>/.proxyctl-publish-<txn_id>`（root:root、0700，位于 Web 根**之外**）里是渲染后的 `clash.yaml`、`sr.txt`（内含全部启用节点的凭据，mode 0600）。成功提交或回滚后它们随事务区一起删除（事务区先 rename 为墓碑 `.publish.tomb-<txn_id>` 再递归删除）；崩溃后残留的事务区、墓碑、staging 在被 `node publish --recover` 处理之前仍含这些凭据，必须按含密钥文件对待：不得贴到 issue、日志或截图，也不得为排障而整体拷贝。`recover` 遇到墓碑一律整体删除，不读取其中内容。发布路径不产生 `nodes.conf.bak`，所以事务结束后磁盘上不会留下旧版 `nodes.conf` 的第二份拷贝（不带 `--publish` 的 CRUD 仍有 `.bak`，含明文凭据）。
+- **`subscription_root` 与其下的 `<token>/` 对 `caddy` 可写，这是发布场景唯一已知的“可信根之下不可信主体可写”的位置。** 因此每次修改前都从可信根（`dirname(subscription_root)`，要求 root 属主且 group/other 不可写，否则发布前置检查返回 1）重新逐级 `O_NOFOLLOW|O_DIRECTORY` 打开，并与 journal `dir_ids` 记录的 `{dev, ino}` 比对；叶子文件（`clash.yaml`、`sr.txt`、`nodes.conf`）以 `O_NOFOLLOW` 打开且只接受普通文件。caddy 进程被攻破后把 `<token>/` 整个换成符号链接，或把订阅文件换成指向别处的符号链接：发布前置检查发现时返回 1，事务中途发现时下一步修改不执行，回滚按篡改处理返回 5，不读取也不写入链接目标。复验与实际修改系统调用之间的窗口与 v0.7.1 相同，只做尽力检测、不阻断（见上文“共用事务引擎”一节）；`subscription_root` 本身若被换成指向别处的真实目录同样会在下一次复验时被识别。
+- **最终文件的临时名建在目标文件自己的目录里**（`.proxyctl-txn-<txn_id>-<序号>`，写入、`fchmod`、`fchown`、fsync 后 `rename`），不从 staging 跨文件系统 rename；staging 只用于渲染和校验。`nodes.conf` 为 0600 root:root，订阅文件为 0644、属主沿用前状态（前状态不存在时为 `caddy:caddy`，需要能解析 `caddy` 用户，否则在修改任何发布文件之前返回 1）。发布在受管目录内遇到格式匹配 `.proxyctl-txn-*` 却未登记的文件，recover 按篡改处理返回 5；不匹配该格式的其他程序临时文件（例如 `nodes.WriteFile` 的 `.nodes.*.tmp`）不参与判定。
+- **HTTPS 验证证明的是“本机 Caddy 现在对该域名提供的正文”，不是对公网可达性的检查。** 验证连接固定拨 `127.0.0.1:443`，以订阅域名作 TLS SNI 和 Host，TLS 1.2 及以上、系统根证书校验、不跟随重定向，并逐字节比较响应正文的 SHA-256（连接策略与 `proxyctl health` 一致，但 health 只返回布尔结果，这里需要正文哈希，所以单独实现）；因此公网上同内容的响应、同一台机器上其他虚拟主机的响应都不能让验证通过。每个文件 10 秒超时；超时、取消或错误都按验证失败处理并回滚。这不是访问控制：持有 token 的人仍能下载订阅，token 的保密与轮换不由本机制提供。
+- **回滚成功只按本地状态判定。** 回滚完成条件是三个文件的内容、权限、属主和“原本不存在”都已核对恢复；回滚之后对恢复出的文件再做的 HTTPS 复验只产生告警，不改变退出码、不保留事务区——这样 Caddy 故障不会让一个遗留事务区把默认 `nodes.conf` 的管理整体锁死。提交（验证通过）之后只有 staging 与事务区的向前清理，不再回滚。
+- **取消与超时。** 收到 SIGINT/SIGTERM 时取消主 context：修改受管路径之前返回 1；之后使用独立的 120 秒预算完成回滚（不受主 context 影响），成功返回 4，失败或超时返回 5 并保留事务区；提交之后继续完成向前清理，不回滚。HTTPS 验证、锁等待都受 context 约束，连接和 goroutine 在每条退出路径上释放。
+- **并发保证有限。** 发布持有 L1+L2，只与同样持有这些锁的路径（`merge-nodes.sh`、`install-proxy.sh` 的 install/update/rollback、`backup`、`restore`、`monitor`、默认 CRUD）串行；`install-proxy.sh` 在只持有 L1 时调用的 `proxyctl merge`、用户手动执行的 `proxyctl merge` / `subscription build` 不加锁，仍可能与发布并发写订阅文件——本版本不解决，详见 `README.md`「锁的适用范围（已知限制）」。
+- **发布永不创建身份文件。** 发布只读取 `install.json` 的 `domain`/`subscription_root`/`token_file` 与固定默认 `nodes.conf`，不创建 `install.json`、token、发布目录或 `nodes.conf`；缺少时拒绝并提示重新运行安装器。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.1–7.6、10、11、13 节。

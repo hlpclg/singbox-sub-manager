@@ -300,6 +300,29 @@ proxyctl subscription build --nodes /etc/singbox-sub-manager/nodes.conf --output
 
 自 v0.10.0 起，写入**默认** `nodes.conf`（即不带 `--nodes` 或 `--nodes` 指向同一文件）的 `add/edit/enable/disable/remove/migrate` 会先获取一把主机级锁，避免与 `install-proxy.sh`、`bootstrap-node.sh --upgrade`、订阅发布等操作交叉写入；取锁后如果发现本机存在 Reality 节点实例的痕迹，或存在遗留的订阅发布事务，命令会拒绝执行并返回失败，不做任何修改（这类主机应改用 `proxyctl node service ...` 管理，而不是本节的订阅中心 CRUD）。用 `--nodes PATH` 指向其他文件的调用不受影响，行为与之前完全一致。
 
+### 发布订阅（proxyctl node publish，v0.10 起）
+
+标准发布入口是 `proxyctl node publish`；`proxyctl merge` 与 `proxyctl subscription build` 保留为兼容接口，不再作为日常流程。`node add/edit/enable/disable/remove` 加上 `--publish` 后，变更与发布在同一个可恢复事务里完成（Reality 节点机上 `proxyctl node service ...` 输出的注册命令就是这种形式）：
+
+```bash
+# 只重新渲染并发布，不改节点
+sudo proxyctl node publish
+
+# 变更并发布（自动化用；flag 在节点名之前，参数值用单引号引用）
+sudo proxyctl node add --publish --min-version v0.10.0 --type vless-reality --server '1.2.3.4' --port '443' \
+  --uuid '<uuid>' --public-key '<reality-public-key>' --short-id '' --sni 'www.microsoft.com' --name 'JP-Reality'
+sudo proxyctl node disable --publish --min-version v0.10.0 'JP-Reality'
+```
+
+- 作用于固定的默认 `/etc/singbox-sub-manager/nodes.conf`，发布目录、域名和 token 从 `install.json` 推导；`nodes.conf` 必须已是分节格式（旧格式先 `proxyctl node migrate`）。发布不创建 `install.json`、token 或发布目录——缺少时请重新运行安装器。
+- 取安装锁和恢复锁（各最长等待 30 秒）；渲染校验与 `proxyctl validate` 同一份实现；staging 目录建在 `dirname(subscription_root)` 下、Web 根之外；三个文件各自原子替换，随后通过本机 Caddy 以 HTTPS 验证两个订阅文件返回 200 且正文哈希与刚写入的一致（每个文件 10 秒）。
+- 重复执行安全：同名同字段且已启用的 `add`、已启用的 `enable`、已禁用的 `disable`、不存在节点的 `remove` 都不改动 `nodes.conf`，直接重新发布并返回 0；结果中没有任何启用节点会被拒绝（返回 1），不会发布空订阅。完整规则见 [docs/cli-reference.md](docs/cli-reference.md)。
+- 退出码：`0` 成功；`1` 修改前被拒绝（没有任何变化）；`2` 用法错误；`4` 失败（含 Caddy/HTTPS 验证失败）并已自动回滚；`5` 需人工介入。`--min-version` 与严格模式的规则见 cli-reference。
+- **不是对外整体原子的发布**：每个文件单独原子替换、整个事务可恢复，但 `clash.yaml` 与 `sr.txt` 之间存在短暂的新旧并存窗口，客户端可能在这个窗口内拿到一新一旧两个文件。
+- **与不带 `--publish` 的 CRUD 的差异**：发布路径不产生 `nodes.conf.bak`（回滚依据是事务快照，事务结束后随事务区删除）；不带 `--publish` 的命令仍照旧产生 `.bak`。
+- 发布持有恢复锁期间，`proxyctl monitor` 可能有一轮因取不到锁返回 3（对应 systemd unit 那一轮显示 failed，下一轮自动恢复）。
+- 被中断后留下事务区时，`node publish`、写默认 `nodes.conf` 的 CRUD、`restore`、`install-proxy.sh` 与 `merge-nodes.sh` 都会拒绝执行，先运行 `sudo proxyctl node publish --recover`；人工出口和已知并发限制见 [docs/troubleshooting.md](docs/troubleshooting.md)。
+
 ### 从旧格式迁移
 
 v0.2 的竖线格式（`名称|服务器|端口|密码|obfs|sni`）仍可被 `subscription build` 读取，但节点管理命令要求先迁移一次：
@@ -461,7 +484,7 @@ monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明�
 - 用户手动执行的 `proxyctl merge` / `subscription build` 不加锁。
 - 写默认 `nodes.conf` 的兼容模式 CRUD（`node add/edit/...`，见上文）只取安装锁，独立执行的 `restore` 只取恢复锁和 Reality 节点锁；两者理论上可能同时写 `nodes.conf`，这是已知的旧竞争，本版本未收紧。
 
-因此“发布相关操作与 backup/restore/monitor 串行”只对 `merge-nodes.sh` 和上文列出的默认 CRUD 成立，不能理解为整个工具链的全局互斥。
+因此“发布相关操作与 backup/restore/monitor 串行”只对 `proxyctl node publish`、带 `--publish` 的变更（都持有安装锁和恢复锁）和 `merge-nodes.sh` 成立；默认 CRUD 只取安装锁，只与它们互斥、不与 `monitor` 争用恢复锁。这些都不能理解为整个工具链的全局互斥，所以把 `proxyctl node publish` 作为标准发布入口。
 
 ### 退出码
 

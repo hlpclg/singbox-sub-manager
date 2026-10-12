@@ -15,6 +15,7 @@ import (
 	"github.com/hlpclg/singbox-sub-manager/internal/health/remote"
 	"github.com/hlpclg/singbox-sub-manager/internal/hostlock"
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
+	"github.com/hlpclg/singbox-sub-manager/internal/publish"
 	"github.com/hlpclg/singbox-sub-manager/internal/realitynode"
 	"golang.org/x/term"
 	"time"
@@ -26,12 +27,12 @@ import (
 var defaultNodesPath = "/etc/singbox-sub-manager/nodes.conf"
 
 // Fixed production paths for the legacy-journal guard (spec §10.3's publish
-// transaction area). internal/publish does not exist yet (v0.10 Task 9), so
-// these paths currently never exist in production; the guard is wired in
-// now so Task 9 only has to start creating them, not also wire the check.
+// transaction area, created by internal/publish since Task 9): the same
+// names internal/publish's TxnDirName and TombstonePrefix produce under the
+// state directory.
 const (
-	publishTxnDir   = "/var/lib/singbox-sub-manager/publish"
-	publishTombGlob = "/var/lib/singbox-sub-manager/.publish.tomb-*"
+	publishTxnDir   = "/var/lib/singbox-sub-manager/" + publish.TxnDirName
+	publishTombGlob = "/var/lib/singbox-sub-manager/" + publish.TombstonePrefix + "*"
 )
 
 // nodeLockEnv is the injectable seam for the default-nodes.conf lock and
@@ -153,13 +154,22 @@ func withDefaultNodesLock(path string, stderr io.Writer, fn func() int) int {
 }
 
 func nodeUsage(stderr io.Writer) int {
-	fmt.Fprintln(stderr, "usage: proxyctl node <list|add|edit|remove|enable|disable|migrate|service> [args]")
+	fmt.Fprintln(stderr, "usage: proxyctl node <list|add|edit|remove|enable|disable|migrate|publish|service> [args]")
 	return 2
 }
 
 func cmdNode(args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		return nodeUsage(stderr)
+	}
+	// add/edit/enable/disable/remove run in strict mode (publish after the
+	// change, spec §10) when a --publish token appears in flag position
+	// (§4.5); otherwise they are the unchanged compat-mode commands below.
+	switch args[0] {
+	case "add", "edit", "enable", "disable", "remove":
+		if isStrictCRUD(args[0], args[1:]) {
+			return cmdNodePublishCRUD(args[0], args[1:], stdout, stderr)
+		}
 	}
 	switch args[0] {
 	case "list":
@@ -174,6 +184,8 @@ func cmdNode(args []string, stdout, stderr io.Writer) int {
 		return cmdNodeAdd(args[1:], stdout, stderr)
 	case "edit":
 		return cmdNodeEdit(args[1:], stdout, stderr)
+	case "publish":
+		return cmdNodePublish(args[1:], stdout, stderr)
 	case "test":
 		return cmdNodeTest(args[1:], stdout, stderr)
 	case "migrate":

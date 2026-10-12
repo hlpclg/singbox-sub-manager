@@ -69,7 +69,7 @@
   - **有事务区但没有 `journal.json`**：只含 `journal.json.tmp`，或者为空，说明崩溃发生在事务开始阶段，没有修改任何受管路径，整体删除，返回 0；其他任何内容都返回 5，不做修改。
   - recover 自己被中断（进程被杀、系统断电）后再次执行会收敛到同一结果；收到 SIGINT/SIGTERM 时不会中断恢复本身（回滚使用独立的 120 秒预算），只有在恢复开始之前收到才返回 1。
 - **篡改与无法确认**：检测到外部篡改、journal 的 schema 未知（stderr 会给出写入它的 `proxyctl` 版本，请用该版本执行 recover）、门禁失败、回滚超时，返回 5：保留事务区和现场、不修改 journal，stderr 输出事务区路径，处理步骤见 [troubleshooting.md](troubleshooting.md)。
-- **`--abandon`**（人工放弃出口）：只有全部受管路径都已经处于事务前状态、且没有未登记的临时名时才可用——这种情况只会出现在“文件已全部恢复，但恢复后的门禁失败”之后。它**不**重启服务、**不**跑门禁，保持 systemd 当前状态，删除事务区，返回 0，并在 stderr 警告服务可能没有运行、需要人工排查（`systemctl status proxyctl-reality`，必要时 `reinstall`）。条件不满足（包括已提交的事务）返回 1，不做任何修改。`--abandon` 只能出现在 `node service recover` 上，出现在其他命令里返回 2。
+- **`--abandon`**（人工放弃出口）：只有全部受管路径都已经处于事务前状态、且没有未登记的临时名时才可用——这种情况只会出现在“文件已全部恢复，但恢复后的门禁失败”之后。它**不**重启服务、**不**跑门禁，保持 systemd 当前状态，删除事务区，返回 0，并在 stderr 警告服务可能没有运行、需要人工排查（`systemctl status proxyctl-reality`，必要时 `reinstall`）。条件不满足（包括已提交的事务）返回 1，不做任何修改。`--abandon` 只能出现在 `node service recover` 和 `node publish --recover`（订阅中心，见 [cli-reference.md](cli-reference.md)）上，出现在其他命令里返回 2。
 - 成功时 stdout 没有输出；stderr 说明做了什么，并提示用 `show` 查看当前状态。
 
 ### 粘贴输出格式（规格 §10.1）
@@ -83,7 +83,7 @@ sudo proxyctl node disable --publish --min-version v0.10.0 '<name>'
 sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 ```
 
-`uninstall` 输出 disable（备选 remove），`uninstall --purge` 输出 remove（备选 disable），格式同上，每块恰好一条可执行命令。这四条命令目前还不能在订阅中心上真正执行——`--publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove` 由 Task 9 交付；在此之前粘贴这些命令会以退出码 2 报“未知 flag”。
+`uninstall` 输出 disable（备选 remove），`uninstall --purge` 输出 remove（备选 disable），格式同上，每块恰好一条可执行命令。这四条命令在订阅中心上由 `proxyctl node add/enable/disable/remove --publish` 执行（v0.10 Task 9 起可用，参数、幂等规则和退出码见 [cli-reference.md](cli-reference.md) 的“`node publish` 与带 `--publish` 的 CRUD”；中断后的处理见 [troubleshooting.md](troubleshooting.md)）。订阅中心的 `proxyctl` 低于 `--min-version v0.10.0` 时命令会返回 1 并提示升级；更旧、不认识 `--publish` 的 `proxyctl` 会以退出码 2 报“未知 flag”，不修改任何东西。
 
 ### 退出码（`node service` 全部子命令）
 
@@ -167,7 +167,6 @@ X25519 推导的正确性由 RFC 7748 §6.1 的标准测试向量验证（`inter
 
 ## 尚未实现
 
-- 订阅中心发布事务（`node publish`、带 `--publish` 的 CRUD）：Task 9。上文粘贴命令目前还不能在订阅中心执行。
 - 交互菜单（`sudo proxyctl node`）：Task 10。
 - bootstrap 首装脚本（`bootstrap-node.sh`）及其 `--upgrade` 模式：Task 11–12。
 
