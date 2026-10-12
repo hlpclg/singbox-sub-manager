@@ -323,6 +323,27 @@ sudo proxyctl node disable --publish --min-version v0.10.0 'JP-Reality'
 - 发布持有恢复锁期间，`proxyctl monitor` 可能有一轮因取不到锁返回 3（对应 systemd unit 那一轮显示 failed，下一轮自动恢复）。
 - 被中断后留下事务区时，`node publish`、写默认 `nodes.conf` 的 CRUD、`restore`、`install-proxy.sh` 与 `merge-nodes.sh` 都会拒绝执行，先运行 `sudo proxyctl node publish --recover`；人工出口和已知并发限制见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
+### 交互菜单（sudo proxyctl node，v0.10 起）
+
+不带任何参数运行 `sudo proxyctl node`，并且 stdin 与 stdout **都是终端**时，进入同时覆盖“本机代理服务”和“本机订阅中心”的菜单；只要有一端不是终端（管道、脚本、cron），行为不变：输出用法并返回 2。菜单需要 root；非 root 时只提示用 `sudo` 重新运行并返回 1，此时不会读取角色信息。
+
+菜单第一行给出“主机角色”（订阅中心=是/否/不确定、Reality 代理服务的状态）。当前状态下不可用的项照样显示，并写明原因（例如“本机是订阅中心”“已安装，请使用幂等重装”）。存在未完成的事务时，角色行下方直接给出对应的恢复命令（`sudo proxyctl node service recover` 或 `sudo proxyctl node publish --recover`），菜单本身没有恢复项。
+
+| 编号 | 项 | 实际执行的命令 |
+|---|---|---|
+| 1 | 安装 VLESS Reality 服务 | `node service install` |
+| 2 | 显示注册命令 | `node service show` |
+| 3 | 幂等重装 | `node service reinstall` |
+| 4 | 卸载（保留身份 / 彻底清除，彻底清除时再问是否导出备份） | `node service uninstall [--purge [--export-backup PATH]]` |
+| 5 | 添加远程节点（VLESS Reality） | `node add --publish ...` |
+| 6 | 管理节点（列表后选择 edit / enable / disable / remove） | `node edit/enable/disable/remove --publish ...` |
+| 7 | 重新发布订阅 | `node publish` |
+
+- 菜单先收集全部输入，再打印**等价的完整命令**（flag 在节点名之前，参数值用单引号，空值写作 `''`），你确认后才执行；确认之前菜单不取任何锁、不写任何文件，所有确认默认“否”（`[y/N]`），只有只读的“显示注册命令”默认“是”（`[Y/n]`，直接回车即执行）；输入结束（Ctrl-D）、回答“否”或在默认“否”的确认处直接回车都是取消，没有任何改动。确认后执行的就是这条命令，退出码和报错与直接运行它完全相同；执行中按 Ctrl-C 的处理也由该命令负责。
+- 添加/管理节点一律走发布闭环（即 `--publish`），不需要你输入 `--nodes`、`--output` 或 token 路径。菜单的“添加远程节点”只支持 VLESS Reality（信息取自节点机 `node service show` 的输出）；hysteria2 节点仍用命令行 `node add` 添加。编辑 hysteria2 节点时菜单不收集密码，改密码请用命令行。
+- 安装时的公网 IPv4（`api.ipify.org`，10 秒超时）只是默认值，服务端地址和 `--sni`（默认 `www.microsoft.com`）都要你确认或修改；探测失败就手动输入。大量部署共用同一个 SNI，与云厂商的 IP 段组合在一起，可能成为可识别的特征。
+- **首次使用订阅中心的发布功能需要迁移**：安装器新装的订阅中心写出的是旧竖线格式的 `nodes.conf`，而发布要求分节格式。选择 5/6/7 时菜单检测到旧格式，会先显示备份位置（`/etc/singbox-sub-manager/nodes.conf.bak`，已有的同名备份会被覆盖），在你明确同意后才执行 `node migrate`（与手工执行相同，同样先取默认 `nodes.conf` 的锁）。你拒绝、输入结束或迁移失败时，原文件保持不变，菜单不会继续注册或发布，并返回 1。不带菜单的命令（`node publish`、`--publish` 的 CRUD）遇到旧格式仍然只拒绝，不会自动迁移。
+
 ### 从旧格式迁移
 
 v0.2 的竖线格式（`名称|服务器|端口|密码|obfs|sni`）仍可被 `subscription build` 读取，但节点管理命令要求先迁移一次：
@@ -331,7 +352,7 @@ v0.2 的竖线格式（`名称|服务器|端口|密码|obfs|sni`）仍可被 `su
 proxyctl node migrate
 ```
 
-迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。
+迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。也可以在上面的交互菜单里按提示完成：菜单会先显示备份位置，确认后才迁移。
 
 ### 添加 VLESS Reality 节点
 

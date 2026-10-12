@@ -160,7 +160,9 @@ func nodeUsage(stderr io.Writer) int {
 
 func cmdNode(args []string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
-		return nodeUsage(stderr)
+		// No arguments: the interactive menu on a terminal (spec §4.4),
+		// otherwise the usage text and exit 2, as before.
+		return cmdNodeMenu(stdout, stderr)
 	}
 	// add/edit/enable/disable/remove run in strict mode (publish after the
 	// change, spec §10) when a --publish token appears in flag position

@@ -39,6 +39,17 @@ v0.10 起，涉及 Reality 节点或发布的命令会先判定本机是否为�
 
 判定为“否”（不是订阅中心）本身不是错误，只表示本机既不是订阅中心也没有 Reality 节点相关的旧文件残留。
 
+## 交互菜单（`sudo proxyctl node`）里某些项显示“不可用”
+
+菜单的“不可用”后面写着原因，依据是订阅中心角色（[规格 §4.2](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)）与 Reality 实例状态（§4.3）：
+
+- “订阅中心角色不确定：…”：按上一节处理（删除节点机上误创建的 `nodes.conf`，或在 v0.4 之前安装的订阅中心上重新运行 `install-proxy.sh install` 补写 `install.json`）后重新打开菜单。
+- “本机是订阅中心”/“本机不是订阅中心”：安装、重装只能在节点机上做；添加节点、管理节点、重新发布只能在订阅中心上做。
+- “存在未完成的事务”/“存在未完成的发布事务”：按角色行下方给出的命令恢复（`sudo proxyctl node service recover` 或 `sudo proxyctl node publish --recover`），见下一节和再下一节。
+- “实例状态不一致：…”：菜单列出不一致的路径，需要人工处理，没有自动修复。
+
+选择添加/管理/重新发布时菜单提示“默认节点文件仍是旧格式”：安装器新装的订阅中心写出的是旧竖线格式，发布要求分节格式。菜单会显示备份位置 `/etc/singbox-sub-manager/nodes.conf.bak`（已有的同名备份会被覆盖），你确认后才执行 `node migrate`。如果你拒绝、输入结束或迁移失败（例如取锁超时），原 `nodes.conf` 保持不变，菜单返回 1，不会继续注册或发布；可以随后手工执行 `sudo proxyctl node migrate` 再重新打开菜单。`nodes.conf` 完全为空（没有任何节点）时菜单不会提示迁移，发布会按“非分节格式”被拒绝；先用不带 `--publish` 的 `sudo proxyctl node add ...` 添加一个节点（写出的就是分节格式），再回到菜单。
+
 ## 崩溃后残留的事务目录（`*-txn` / `.proxyctl-*.tomb-*`）
 
 v0.10 起，Reality 实例生命周期操作与订阅中心发布共用同一套持久化事务引擎：任何中途中断（进程被杀、系统断电、取消）都会在磁盘上留下事务区（例如 `/var/lib/proxyctl-reality-txn/`、`/var/lib/singbox-sub-manager/publish/`）或墓碑目录（`.proxyctl-reality-txn.tomb-<txn_id>`、`.publish.tomb-<txn_id>`），直到下一次自动回滚或 `recover` 把它清理干净。

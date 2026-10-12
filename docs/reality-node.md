@@ -1,6 +1,6 @@
 # Reality 节点（施工中，v0.10）
 
-本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单和 bootstrap 首装脚本尚未交付（Task 10–12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
+本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单（`sudo proxyctl node`，Task 10）也已可用；bootstrap 首装脚本尚未交付（Task 11–12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
 
 完整设计见 [v0.10 定稿规格](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)；已完成 Task 的真实验证证据见 [reality-node-validation.md](reality-node-validation.md)。
 
@@ -106,6 +106,19 @@ sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 - `--export-backup` 归档没有受支持的导入或解压恢复方式，见上文。
 - 真实 systemd 上 uninstall/purge 的一个恢复窗口尚未验证，待 Task 13 真机验收：unit 文件已删除之后、`daemon-reload` 完成之前发生崩溃，或 `daemon-reload` 调用本身失败时，回滚的降级步骤会对已不存在的 unit 文件执行 `systemctl disable`，真实 systemd 可能拒绝，结果是返回 5（而不是 4 或 0），事务区和现场原样保留；处理方式见 [troubleshooting.md](troubleshooting.md) 中关于退出码 5 的通用做法。
 
+## 交互菜单（`sudo proxyctl node`，Task 10，规格 §4.4）
+
+节点机上不带参数运行 `sudo proxyctl node`（stdin 与 stdout 都是终端）即可用菜单完成安装与日常管理，不必记住命令行参数；管道或脚本里仍只输出用法并返回 2。非 root 时只提示用 `sudo` 重新运行（返回 1），不读取角色。菜单首行显示“订阅中心=是/否/不确定”与 Reality 代理服务的状态；当前状态下不可用的项照样显示并注明原因。存在未完成的事务时，角色行下方给出 `sudo proxyctl node service recover`（发布事务则是 `sudo proxyctl node publish --recover`），菜单没有恢复项。
+
+节点机上可用的项：
+
+- **安装 VLESS Reality 服务**：依次问节点名称、服务端地址、监听端口、SNI。服务端地址的默认值来自对 `api.ipify.org` 的 IPv4 探测（10 秒超时，仅 IPv4），**只是默认值，须你确认或修改**；探测失败时手动输入。SNI 默认 `www.microsoft.com`，同样须确认。提示：大量部署共用同一个 SNI，与云厂商的 IP 段组合在一起，可能成为可识别的特征，建议按需选择不同的、本机所在网络可达的站点。
+- **显示注册命令**：等同 `node service show`，输出粘贴到订阅中心的那一条命令。
+- **幂等重装**：等同 `node service reinstall`。
+- **卸载**：先选“保留身份”或“彻底清除”（已卸载但保留身份的状态只能彻底清除）；彻底清除时再询问是否导出备份归档（归档含私钥，没有受支持的导入方式，见上文）。
+
+每一项都是：收集输入 → 打印等价的完整命令 → 询问确认 → 调用同一个 `node service ...` 命令。**确认之前不取锁、不写入任何文件**；所有确认默认“否”（`[y/N]`），只有只读的“显示注册命令”默认“是”（`[Y/n]`，直接回车即执行 `node service show`）。回答“否”（或任何不是 `y`/`yes` 的内容）、在默认“否”的确认处直接回车、或输入结束（Ctrl-D），都是无副作用的取消。确认之后菜单把控制权交给该命令，退出码、报错和 SIGINT/SIGTERM 行为与直接运行它完全一致（菜单不改写它们）。订阅中心一侧的菜单项见 README“交互菜单”一节和 [cli-reference.md](cli-reference.md)。
+
 ## 已实现：只读检测
 
 ### 订阅中心角色（`internal/role`）
@@ -167,7 +180,6 @@ X25519 推导的正确性由 RFC 7748 §6.1 的标准测试向量验证（`inter
 
 ## 尚未实现
 
-- 交互菜单（`sudo proxyctl node`）：Task 10。
 - bootstrap 首装脚本（`bootstrap-node.sh`）及其 `--upgrade` 模式：Task 11–12。
 
 “已实现：只读检测”与“已实现：实例配置、私有下载与自检”两节描述的 Task 2/6 库函数已被上文 `node service install/reinstall/show` 消费，不再是仅能通过 Go 测试触达的独立层。

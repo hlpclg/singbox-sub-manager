@@ -147,4 +147,33 @@ proxyctl node enable|disable|remove --publish [--min-version vX.Y.Z] NAME
 | 4 | 已自动回滚到事务前状态 |
 | 5 | 需人工介入：事务已经开始而无法确认已恢复（外部篡改、回滚失败或超时、恢复后复查失败、提交后清理未完成），保留事务区并在 stderr 输出其路径 |
 
+## `proxyctl node`（无参数）：交互菜单
+
+`proxyctl node` 不带任何参数时：
+
+| 条件 | 行为 |
+|---|---|
+| stdin 与 stdout 都是终端，且是 root | 打开菜单（见下） |
+| stdin 与 stdout 都是终端，但不是 root | stderr 提示用 `sudo proxyctl node` 重新运行，返回 1；不读取角色和实例状态，不读取输入 |
+| 任一端不是终端 | 输出 `usage: proxyctl node ...` 到 stderr，返回 2（与 v0.9 相同） |
+
+菜单展示 7 个操作和“退出”，每个操作最终都调用与命令行**同一个**入口（`proxyctl node <子命令> ...`），不存在独立的写入路径：
+
+| 项 | 等价命令 | 说明 |
+|---|---|---|
+| 1 安装 | `sudo proxyctl node service install --name 'N' --server 'S' --port 'P' --sni 'D'` | 公网 IPv4 探测结果只作 `--server` 的默认值，`--port`（默认 443）和 `--sni`（默认 `www.microsoft.com`）同样须确认；取值不合法在确认之前直接返回 2 |
+| 2 显示 | `... node service show` | 任何状态下都可选，由命令自己报告状态 |
+| 3 重装 | `... node service reinstall` | 状态为已安装或已卸载但保留身份，且订阅中心为“否” |
+| 4 卸载 | `... node service uninstall [--purge [--export-backup 'PATH']]` | 已安装可选“保留身份”或“彻底清除”；已卸载但保留身份只能彻底清除；彻底清除时再询问是否导出备份 |
+| 5 添加 | `... node add --publish --type vless-reality --server 'S' --port 'P' --uuid 'U' --public-key 'K' --short-id 'I' --sni 'D' --name 'N'` | 只支持 vless-reality；`--short-id` 留空时打印为 `''` |
+| 6 管理 | `... node edit --publish [--name ..] [--server ..] [--port ..] [--sni ..] [--uuid ..] [--public-key ..] [--short-id ..] 'NAME'`；`... node enable/disable/remove --publish 'NAME'` | 先列出默认 `nodes.conf` 的节点；edit 只发送你修改过的字段（回车保持不变；short id 输入 `-` 清空）；没有任何修改则取消 |
+| 7 发布 | `... node publish` | |
+
+约定：
+
+- 流程是“收集全部输入 → 打印等价命令（flag 在节点名之前，参数值单引号，空值 `''`）→ 询问确认 → 调用命令”。**确认之前不取锁、不写入**；所有确认默认“否”（`[y/N]`），只有只读的“显示”（`node service show`）默认“是”（`[Y/n]`），直接回车即执行。回答 `n`（或任何不是 `y`/`yes` 的内容）、在默认“否”的确认处直接回车、输入结束（EOF），或在选择类提示处输入 `0`/`q`，都在没有任何副作用的情况下取消，返回 0。确认之后的取消（锁等待、事务中收到 SIGINT/SIGTERM）完全由被调用的命令按 §13.3 处理，菜单没有自己的信号处理。
+- 菜单返回被调用命令的退出码（0/1/2/4/5 的含义见各命令）；报错原样输出，菜单不改写。菜单自己发现的输入问题在确认之前报告：install 的参数不合法、端口不是整数、节点名以 `-` 开头返回 2；添加/编辑的节点字段语义不合法返回 1（与 `--publish` 命令自己的预检一致）。
+- 不可用项和原因按规格 §4.2、§4.3：安装/重装要求订阅中心为“否”，添加/管理/发布要求订阅中心为“是”；角色“不确定”时这些项都不可用并列出原因；存在未完成的发布事务时添加/管理/发布不可用。
+- 添加/管理/发布前，如果默认 `nodes.conf` 仍是旧格式：显示备份位置 `nodes.conf.bak`，请求确认后执行 `proxyctl node migrate`（沿用迁移的备份语义和默认 `nodes.conf` 的锁）。拒绝、EOF 或迁移失败：原文件保持不变，不继续注册或发布，返回 1（迁移失败时返回迁移命令自己的退出码）。非交互命令（`node publish`、`--publish` 的 CRUD）遇到旧格式仍然只拒绝（返回 1），不会自动迁移。
+
 详细的命令行为、粘贴输出格式和已知限制见 [docs/reality-node.md](reality-node.md)。
