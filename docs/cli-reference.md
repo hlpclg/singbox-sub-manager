@@ -1,6 +1,6 @@
 # CLI 参数参考
 
-本页收录 `proxyctl` 严格模式命令的参数全集（规格 §4.5）。当前包含 `node service install|reinstall|show`（Task 7）、`uninstall`、`recover`（Task 8），以及 `node publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove`（Task 9）。`bootstrap-node.sh` 的参数由 Task 11–12 交付后补充。
+本页收录 `proxyctl` 严格模式命令的参数全集（规格 §4.5）。当前包含 `node service install|reinstall|show`（Task 7）、`uninstall`、`recover`（Task 8），以及 `node publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove`（Task 9）。`bootstrap-node.sh` 首次安装模式的参数见文末（Task 11）；升级模式由 Task 12 交付后补充。
 
 旧的 `node list/add/edit/remove/enable/disable/migrate`（不带 `--publish`）解析、输出和 `--nodes PATH` 语义不变，不在本页范围内；用法见 `proxyctl node <子命令> --help` 或 README。
 
@@ -177,3 +177,23 @@ proxyctl node enable|disable|remove --publish [--min-version vX.Y.Z] NAME
 - 添加/管理/发布前，如果默认 `nodes.conf` 仍是旧格式：显示备份位置 `nodes.conf.bak`，请求确认后执行 `proxyctl node migrate`（沿用迁移的备份语义和默认 `nodes.conf` 的锁）。拒绝、EOF 或迁移失败：原文件保持不变，不继续注册或发布，返回 1（迁移失败时返回迁移命令自己的退出码）。非交互命令（`node publish`、`--publish` 的 CRUD）遇到旧格式仍然只拒绝（返回 1），不会自动迁移。
 
 详细的命令行为、粘贴输出格式和已知限制见 [docs/reality-node.md](reality-node.md)。
+
+## `bootstrap-node.sh`（首次安装模式）
+
+```text
+sudo bash bootstrap-node.sh
+sudo bash bootstrap-node.sh [--replace-proxyctl] --name NAME --server ADDR [--port PORT] [--sni SNI]
+```
+
+脚本自己只认识 `--replace-proxyctl`；其余参数不解释，原样传给 `proxyctl node service install`（解析、取值校验和退出码以该命令为准，见上文 `install`）。
+
+| 形式 | 行为 |
+|---|---|
+| 无参数，stdin 与 stdout 都是终端 | `proxyctl` 确认后 `exec proxyctl node`（交互菜单） |
+| 无参数，任一端不是终端 | `proxyctl` 确认后输出用法，返回 2 |
+| 带参数 | 去掉 `--replace-proxyctl`，其余参数逐字节不变地 `exec proxyctl node service install ...` |
+
+- `--replace-proxyctl`：本机 `/usr/local/bin/proxyctl` 的 `.sha256` 缺失或与二进制不符时，授权重新安装固定版本的 `proxyctl`。它不会替换或降级校验通过的 `proxyctl`，也不会传给 `proxyctl`。可以和其他参数同时出现，位置不限。
+- 固定版本（`v0.10.0`）是脚本内置的，不接受环境变量或参数覆盖。下载每个文件限时 120 秒，锁等待最长 30 秒。
+- 退出码：`1` 修改之前失败（非 root、OS 或架构不支持、订阅中心角色不是“否”、取锁超时、下载或校验失败、本机 `proxyctl` 决策表要求停止）；`2` 用法错误；带参数或进入菜单时，其余退出码就是被 exec 的 `proxyctl` 命令的退出码。
+- 决策表、角色预检和锁顺序见 [reality-node.md](reality-node.md) 的“首次安装”一节。

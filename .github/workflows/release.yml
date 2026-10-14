@@ -38,13 +38,21 @@ jobs:
           go-version: "1.22.x"
       - name: Test
         run: go test ./...
+      - name: Shell syntax
+        run: |
+          bash -n install-proxy.sh
+          bash -n merge-nodes.sh
+          bash -n bootstrap-node.sh
+          bash -n tests/test_reality_probe.sh
+          bash -n tests/test_shared_guards.sh
+          bash -n tests/test_bootstrap_node.sh
       - name: ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck install-proxy.sh merge-nodes.sh
+          shellcheck install-proxy.sh merge-nodes.sh bootstrap-node.sh
           shellcheck tests/test_install_json.sh tests/test_install_proxyctl.sh tests/test_install_monitor.sh tests/test_install_update.sh
-          shellcheck tests/test_reality_probe.sh tests/test_shared_guards.sh
+          shellcheck tests/test_reality_probe.sh tests/test_shared_guards.sh tests/test_bootstrap_node.sh
       - name: Build and validate proxyctl
         run: |
           mkdir -p dist
@@ -60,6 +68,7 @@ jobs:
           bash tests/test_install_monitor.sh
           bash tests/test_install_update.sh
           bash tests/test_shared_guards.sh
+          bash tests/test_bootstrap_node.sh
           cd dist
           sha256sum proxyctl-linux-* > checksums.txt
       - name: Verify pinned Reality runtime assets

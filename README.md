@@ -366,6 +366,43 @@ proxyctl node migrate
 
 **版本兼容警告**：一旦 `nodes.conf` 写入 `TYPE=` 字段（执行过 `node migrate`、`node add` 或任何其他节点管理命令之后），就不能再被 v0.8.x 的 `proxyctl` 或 `merge-nodes.sh` 解析——它们会报 `unknown key "TYPE"` 并失败。升级到 v0.9.0 后，必须同时把 `install-proxy.sh`/`merge-nodes.sh` 换成 v0.9.0 tag 下的版本，不要混用旧脚本。
 
+## 节点机首次安装（bootstrap-node.sh，v0.10 起）
+
+在独立的节点机（Debian 12、Ubuntu 22.04/24.04，amd64/arm64）上首次搭建 VLESS Reality 服务，**首次两步，之后只需记住 `sudo proxyctl node`**：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+```
+
+```bash
+sudo bash bootstrap-node.sh
+```
+
+第二步在终端里运行时，脚本装好固定版本的 `proxyctl`（校验 SHA256 和版本，原子安装到 `/usr/local/bin/proxyctl`，并写同目录的 `.sha256`）后直接进入 `proxyctl node` 菜单；以后管理这台节点机，直接运行 `sudo proxyctl node`。需要脚本化安装时，把参数写在后面，它们原样交给 `proxyctl node service install`：
+
+```bash
+sudo bash bootstrap-node.sh --name node-a --server 203.0.113.10
+```
+
+在管道或脚本里不带参数运行（stdin 或 stdout 不是终端）时，`proxyctl` 装好之后输出用法并返回 2。
+
+可选：执行前先校验脚本本身。下载同一 Release 的 `checksums.txt`，只校验已下载的 `bootstrap-node.sh`（`--ignore-missing` 跳过清单里本地没有的文件）：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/checksums.txt
+sha256sum -c --ignore-missing checksums.txt
+```
+
+输出 `bootstrap-node.sh: OK` 才继续。
+
+要点：
+
+- **订阅中心上不要运行它。** 脚本只在“订阅中心=否”的主机上继续：`/etc/singbox-sub-manager/install.json`、`/var/lib/singbox-sub-manager/token`、默认 `nodes.conf` 三者都不存在。订阅中心（或残留了其中任何一个文件的主机）会被拒绝并返回 1，不下载、不修改；订阅中心的升级请用 `install-proxy.sh update`。节点机上误创建了 `nodes.conf` 时，删除它再重试。
+- 只负责**首次安装**：本机已有同版本且可信的 `proxyctl` 时直接复用；已有更新版本的 `proxyctl`（`/usr/local/bin/proxyctl` 校验通过且版本不低于 v0.10.0）时不替换、不降级，返回 1 并提示直接运行 `sudo proxyctl node`；低于 v0.10.0 的旧版本（没有节点机功能）会被替换为固定版本。
+- 本机 `proxyctl` 的 `.sha256` 缺失或与二进制不符时，脚本**不会执行**这个二进制，直接返回 1。这通常是安装在两次文件替换之间被中断。确认后加 `--replace-proxyctl` 重新运行即可修复安装文件：它只授权重装这个无法校验的文件，**不会**替换或降级一个校验通过的 `proxyctl`（与降级是两回事），其余参数照常传给 `proxyctl node service install`。`--replace-proxyctl` 本身不会传给 `proxyctl`。
+- 脚本只写 `/usr/local/bin/proxyctl` 及其 `.sha256`，不创建任何 Reality 实例资产；卸载 Reality 实例也不会删除 `proxyctl`。
+- 取不到 `/run/lock/singbox-sub-manager.lock`（另一个安装、升级或节点操作正在进行）时最多等待 30 秒，超时返回 1。每个下载文件限时 120 秒。参数全集见 [docs/cli-reference.md](docs/cli-reference.md)，节点生命周期见 [docs/reality-node.md](docs/reality-node.md)。
+
 ## 健康检查（proxyctl health）
 
 v0.4 起提供订阅中心本机健康检查（只读），帮助及时发现服务、配置、文件或网络层面的故障。

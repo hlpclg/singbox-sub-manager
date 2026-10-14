@@ -1,6 +1,6 @@
 # Reality 节点（施工中，v0.10）
 
-本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单（`sudo proxyctl node`，Task 10）也已可用；bootstrap 首装脚本尚未交付（Task 11–12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
+本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单（`sudo proxyctl node`，Task 10）也已可用；bootstrap 首装脚本（`bootstrap-node.sh`，Task 11）已经可用；`--upgrade` 升级模式尚未交付（Task 12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
 
 完整设计见 [v0.10 定稿规格](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)；已完成 Task 的真实验证证据见 [reality-node-validation.md](reality-node-validation.md)。
 
@@ -106,6 +106,58 @@ sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 - `--export-backup` 归档没有受支持的导入或解压恢复方式，见上文。
 - 真实 systemd 上 uninstall/purge 的一个恢复窗口尚未验证，待 Task 13 真机验收：unit 文件已删除之后、`daemon-reload` 完成之前发生崩溃，或 `daemon-reload` 调用本身失败时，回滚的降级步骤会对已不存在的 unit 文件执行 `systemctl disable`，真实 systemd 可能拒绝，结果是返回 5（而不是 4 或 0），事务区和现场原样保留；处理方式见 [troubleshooting.md](troubleshooting.md) 中关于退出码 5 的通用做法。
 
+## 首次安装（`bootstrap-node.sh`，Task 11，规格 §12）
+
+**首次两步，之后只需记住 `sudo proxyctl node`**。脚本是 v0.10.0 Release 的 asset：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+```
+
+```bash
+sudo bash bootstrap-node.sh
+```
+
+可选校验：另下载同一 Release 的 `checksums.txt`，执行 `sha256sum -c --ignore-missing checksums.txt`，看到 `bootstrap-node.sh: OK` 再运行脚本。
+
+执行顺序（先到先停，前面任何一步失败都不会进入下一步）：
+
+1. 解析自身参数（用法错误返回 2，早于 root 检查、加锁和网络）。
+2. 检查 root、OS（Debian 12、Ubuntu 22.04/24.04）、架构（amd64/arm64）。
+3. 角色预检：订阅中心角色必须是“否”（`install.json`、`/var/lib/singbox-sub-manager/token`、默认 `nodes.conf` 三者都不存在）。角色是“是”或“不确定”（包括只剩其中一个文件，或没有 `install.json` 的旧订阅中心）一律返回 1，不下载，并提示订阅中心的升级使用 `install-proxy.sh update`；误创建在节点机上的 `nodes.conf` 删除后重试。
+4. 取 L1（`/run/lock/singbox-sub-manager.lock`，等待最长 30 秒，超时返回 1）。持锁期间复查角色、判定本机 `proxyctl`、必要时安装固定版本。L1 同时是共享二进制锁，期间 `install-proxy.sh`、`merge-nodes.sh`、`node service` 变更命令都会等待。
+5. exec 之前先关闭锁文件描述符，因此 `proxyctl node` / `node service install` 可以正常重新取锁并复查角色。
+
+### 本机已有 `proxyctl` 时的决策
+
+固定版本是脚本内置的 `v0.10.0`，不能由环境变量或参数改写。只有 `.sha256` 校验通过的二进制才会被执行（先比对哈希，再 `version`）。
+
+| 本机 proxyctl | 处理 |
+|---|---|
+| 不存在 | 安装固定版本 |
+| `.sha256` 缺失，或与二进制哈希不符 | 不执行该二进制。无 `--replace-proxyctl`：返回 1；有：安装固定版本 |
+| 校验通过，版本不可解析（含 `dev`） | 返回 1 |
+| 校验通过，版本等于固定版本 | 能力探测（`proxyctl node service --help` 退出码 0）通过则复用，否则返回 1 |
+| 校验通过，版本不低于 v0.10.0 且不同于固定版本 | 返回 1，不替换、不降级；比固定版本新时提示直接运行 `sudo proxyctl node` |
+| 校验通过，版本低于 v0.10.0 | 安装固定版本（旧版本没有节点机功能，且这台主机没有需要保护的状态） |
+
+`--replace-proxyctl` 只修复**无法校验的安装文件**（`.sha256` 缺失或不符，典型原因是安装在二进制与 sidecar 两次 rename 之间被 SIGKILL 或断电打断）；它不会替换、降级任何一个校验通过的 `proxyctl`，对“版本相同但缺能力”“版本不可解析”“版本更新”这几行也没有效果。`/usr/local/bin/proxyctl` 或其 `.sha256` 不是普通文件（目录、符号链接）时脚本直接返回 1，不执行、不替换，请先人工检查。
+
+### 安装步骤（需要安装时）
+
+1. 在 `/usr/local/bin/` 里用 `mktemp` 创建临时文件，下载 `proxyctl-linux-<amd64|arm64>` 和 `checksums.txt`（来自 `https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/`，每个文件限时 120 秒）。
+2. `checksums.txt` 中必须恰好有一行对应该资产，SHA256 必须匹配；下载得到的二进制 `version` 输出必须等于 `v0.10.0`，`node service --help` 退出码必须为 0。任何一项失败：删除全部临时文件，返回 1，已安装的文件保持原样。
+3. 先 rename 二进制（0755），再 rename `.sha256`（0644，内容为小写十六进制哈希加换行，与 `install-proxy.sh` 布局相同），都在同一目录内；最后复核已安装二进制的哈希等于 sidecar、`version` 等于固定版本。
+4. SIGINT/SIGTERM 在任何阶段都会终止进行中的下载、删除临时文件、释放锁，返回 1。
+
+### 确认 `proxyctl` 之后
+
+- 无参数且 stdin、stdout 都是终端：`exec proxyctl node`（菜单）。
+- 带参数：去掉 `--replace-proxyctl` 后其余参数原样（逐字节）交给 `exec proxyctl node service install ...`；退出码就是该命令的退出码。
+- 无参数且不是终端：输出用法，返回 2（此时 `proxyctl` 已经装好或修复）。
+
+脚本自己的退出码：`1` 修改之前失败（root/OS/架构/角色不符、锁超时、下载或校验失败、`proxyctl` 决策表要求停止），`2` 用法错误。其余退出码来自被 exec 的 `proxyctl`（含义见 cli-reference）。脚本不写任何 Reality 实例资产，只写 `proxyctl` 及其 `.sha256`。
+
 ## 交互菜单（`sudo proxyctl node`，Task 10，规格 §4.4）
 
 节点机上不带参数运行 `sudo proxyctl node`（stdin 与 stdout 都是终端）即可用菜单完成安装与日常管理，不必记住命令行参数；管道或脚本里仍只输出用法并返回 2。非 root 时只提示用 `sudo` 重新运行（返回 1），不读取角色。菜单首行显示“订阅中心=是/否/不确定”与 Reality 代理服务的状态；当前状态下不可用的项照样显示并注明原因。存在未完成的事务时，角色行下方给出 `sudo proxyctl node service recover`（发布事务则是 `sudo proxyctl node publish --recover`），菜单没有恢复项。
@@ -180,6 +232,6 @@ X25519 推导的正确性由 RFC 7748 §6.1 的标准测试向量验证（`inter
 
 ## 尚未实现
 
-- bootstrap 首装脚本（`bootstrap-node.sh`）及其 `--upgrade` 模式：Task 11–12。
+- `bootstrap-node.sh --upgrade` 升级模式：Task 12。
 
 “已实现：只读检测”与“已实现：实例配置、私有下载与自检”两节描述的 Task 2/6 库函数已被上文 `node service install/reinstall/show` 消费，不再是仅能通过 Go 测试触达的独立层。
