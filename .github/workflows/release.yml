@@ -43,12 +43,22 @@ jobs:
           bash -n install-proxy.sh
           bash -n merge-nodes.sh
           bash -n bootstrap-node.sh
+          bash -n tests/test_caddy_apt.sh
+          bash -n tests/test_install_json.sh
+          bash -n tests/test_install_monitor.sh
+          bash -n tests/test_install_proxyctl.sh
+          bash -n tests/test_install_update.sh
           bash -n tests/test_reality_probe.sh
           bash -n tests/test_shared_guards.sh
           bash -n tests/test_bootstrap_node.sh
           bash -n tests/test_bootstrap_upgrade.sh
           bash -n tests/test_bootstrap_restore.sh
+          bash -n tests/test_release_assets.sh
+          bash -n tests/test_v010_flow.sh
       - name: ShellCheck
+        # tests/test_caddy_apt.sh is the one existing test ShellCheck 0.9.0
+        # reports findings for; it may not be edited (spec 14.6), so it is the
+        # documented exemption in tests/test_release_assets.sh (SHELLCHECK_EXEMPT).
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
@@ -56,6 +66,7 @@ jobs:
           shellcheck tests/test_install_json.sh tests/test_install_proxyctl.sh tests/test_install_monitor.sh tests/test_install_update.sh
           shellcheck tests/test_reality_probe.sh tests/test_shared_guards.sh tests/test_bootstrap_node.sh
           shellcheck tests/test_bootstrap_upgrade.sh tests/test_bootstrap_restore.sh
+          shellcheck tests/test_release_assets.sh tests/test_v010_flow.sh
       - name: Build and validate proxyctl
         run: |
           mkdir -p dist
@@ -74,8 +85,26 @@ jobs:
           bash tests/test_bootstrap_node.sh
           bash tests/test_bootstrap_upgrade.sh
           bash tests/test_bootstrap_restore.sh
+          bash tests/test_caddy_apt.sh
+          bash tests/test_release_assets.sh
+          # Prints an explicit SKIP for the real-filesystem section (it needs
+          # PROXYCTL_REAL_FS_TESTS=1, root and a throw-away host); everything
+          # else in it runs.
+          bash tests/test_v010_flow.sh
+          cp install-proxy.sh merge-nodes.sh bootstrap-node.sh dist/
           cd dist
-          sha256sum proxyctl-linux-* > checksums.txt
+          sha256sum proxyctl-linux-amd64 proxyctl-linux-arm64 install-proxy.sh merge-nodes.sh bootstrap-node.sh > checksums.txt # release-checksums-command
+      - name: Verify release assets in dist
+        # Both binaries must print exactly the tag: the amd64 one is run
+        # directly, the arm64 one (it cannot run on this runner) through
+        # qemu-user. `go version -m` is no option: -trimpath drops -ldflags
+        # from the recorded build settings. The five files must also match
+        # checksums.txt, and the v0.9 checksum parser must find exactly one
+        # entry per binary.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+          DIST_DIR=dist EXPECT_VERSION="$GITHUB_REF_NAME" bash tests/test_release_assets.sh
       - name: Verify pinned Reality runtime assets
         # --verify-assets only (network, no root/systemd needed); see
         # docs/reality-node-validation.md for what the real-runtime gates
@@ -88,4 +117,7 @@ jobs:
           files: |
             dist/proxyctl-linux-amd64
             dist/proxyctl-linux-arm64
+            dist/install-proxy.sh
+            dist/merge-nodes.sh
+            dist/bootstrap-node.sh
             dist/checksums.txt

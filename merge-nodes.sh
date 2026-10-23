@@ -8,7 +8,7 @@ TOKEN_FILE="${TOKEN_FILE:-$STATE_DIR/token}"
 SUB_ROOT="${SUB_ROOT:-/var/www/proxy-sub}"
 PROXYCTL_BIN="${PROXYCTL_BIN:-/usr/local/bin/proxyctl}"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.9.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.10.0}"
 PROXYCTL_VALIDATED_BIN=""
 
 # v0.10 shared lock ordering (spec §11.1, §11.3): the whole run holds L1

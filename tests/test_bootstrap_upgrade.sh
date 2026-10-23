@@ -1442,12 +1442,119 @@ test_signal_matrix() {
   check_signal_outcome "second signal during the rollback" 4 OLD
 }
 
+# --- Task 13 follow-ups: setsid --wait and stale previous-dir temp files -------------------
+
+# A fake `setsid` that behaves as util-linux does when its caller is a process
+# group leader: without --wait it forks the real setsid into the background and
+# returns 0 at once (so the caller cannot see the child's exit status); with
+# --wait it execs the real one, which waits and returns the child's status.
+write_leader_setsid() {
+  cat > "$C/fake/setsid" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_LOG_DIR/setsid.log"
+real="$(PATH=/usr/bin:/bin:/usr/sbin:/sbin command -v setsid)"
+if [[ "${1:-}" == --wait || "${1:-}" == -w ]]; then exec "$real" "$@"; fi
+"$real" "$@" </dev/null >/dev/null 2>&1 &
+exit 0
+EOF
+  chmod 0755 "$C/fake/setsid"
+}
+
+test_setsid_wait() {
+  up_case setsid-wait-failing-show
+  make_instance
+  snap_inst
+  write_leader_setsid
+  EXTRA_ENV=("STUB_SHOW_MODE=fail")
+  run_boot --upgrade
+  expect_rc "setsid as a group leader + failing show: the failure is seen (rc 1)" 1
+  expect "setsid as a group leader + failing show: reported as the compatibility check failing" stderr_has "failed with exit code 3"
+  expect "setsid as a group leader + failing show: installed pair unchanged" installed_is_old
+  expect "setsid as a group leader + failing show: no previous copy" prev_absent
+  expect "the check runs through 'setsid --wait timeout'" \
+    bash -c 'grep -q "^--wait timeout " "$1"' _ "$C/log/setsid.log"
+
+  up_case setsid-wait-ok-show
+  make_instance
+  snap_inst
+  write_leader_setsid
+  run_boot --upgrade
+  assert_upgraded "setsid as a group leader + passing show"
+  expect "passing show also ran through 'setsid --wait'" \
+    bash -c 'grep -q "^--wait timeout " "$1"' _ "$C/log/setsid.log"
+}
+
+test_stale_previous_tmp() {
+  local other_uid_file="" before_link_target
+  up_case prev-stale-tmp
+  make_instance
+  snap_inst
+  mkdir -p "$PREV" "$C/outside"
+  chmod 0700 "$PREV"
+  printf 'stale-1\n' > "$PREV/.proxyctl.tmp.AAAAAA"
+  printf 'stale-2\n' > "$PREV/.proxyctl.tmp.BBBBBB"
+  printf 'outside-secret\n' > "$C/outside/target"
+  before_link_target="$(sha_of "$C/outside/target")"
+  ln -s "$C/outside/target" "$PREV/.proxyctl.tmp.LINK"
+  ln -s /nonexistent-stale-target "$PREV/.proxyctl.tmp.DANGLING"
+  mkdir -p "$PREV/.proxyctl.tmp.DIR"
+  printf 'keep\n' > "$PREV/.proxyctl.tmp.DIR/inner"
+  printf 'unrelated\n' > "$PREV/.proxyctl.other"
+  printf 'unrelated\n' > "$PREV/proxyctl.tmp.NODOT"
+  printf 'unrelated\n' > "$PREV/.proxyctl.tm"
+  if [[ "$(command -p id -u)" == 0 ]]; then
+    other_uid_file="$PREV/.proxyctl.tmp.OTHERUID"
+    printf 'not-mine\n' > "$other_uid_file"
+    chown 12345:12345 "$other_uid_file"
+  fi
+  run_boot --upgrade
+  assert_upgraded "stale temp files in the previous dir"
+  expect "stale regular temp files are removed" \
+    bash -c '[[ ! -e "$1/.proxyctl.tmp.AAAAAA" && ! -e "$1/.proxyctl.tmp.BBBBBB" ]]' _ "$PREV"
+  expect "a symlink named like a temp file is kept as a symlink" \
+    bash -c '[[ -L "$1/.proxyctl.tmp.LINK" && "$(readlink "$1/.proxyctl.tmp.LINK")" == "$2" ]]' _ "$PREV" "$C/outside/target"
+  expect "the symlink target outside the previous dir is untouched" \
+    bash -c '[[ "$(sha256sum < "$1" | cut -d" " -f1)" == "$2" ]]' _ "$C/outside/target" "$before_link_target"
+  expect "a dangling symlink named like a temp file is kept" \
+    bash -c '[[ -L "$1/.proxyctl.tmp.DANGLING" ]]' _ "$PREV"
+  expect "a directory named like a temp file and its content are kept" \
+    bash -c '[[ -d "$1/.proxyctl.tmp.DIR" && "$(cat "$1/.proxyctl.tmp.DIR/inner")" == keep ]]' _ "$PREV"
+  expect "nothing outside the matching regular files was even attempted (no removal warning)" \
+    bash -c '! grep -q "could not remove" "$1"' _ "$C/stderr"
+  expect "entries that do not match the temp name are kept" \
+    bash -c '[[ -f "$1/.proxyctl.other" && -f "$1/proxyctl.tmp.NODOT" && -f "$1/.proxyctl.tm" ]]' _ "$PREV"
+  if [[ -n "$other_uid_file" ]]; then
+    expect "a temp-named file owned by another user is kept (root run)" \
+      bash -c '[[ -f "$1" && "$(stat -c %u "$1")" == 12345 ]]' _ "$other_uid_file"
+  else
+    echo "NOTE: the other-owner temp-file case needs root to create a foreign-owned file; not run as uid $(command -p id -u)"
+  fi
+
+  # Stale cleanup must not weaken the existing guarantee: a failure between
+  # the two previous-copy files still leaves the installed pair untouched.
+  up_case prev-stale-tmp-then-fail-between-files
+  make_instance
+  snap_inst
+  mkdir -p "$PREV"
+  chmod 0700 "$PREV"
+  printf 'stale\n' > "$PREV/.proxyctl.tmp.CCCCCC"
+  EXTRA_ENV=("FAKE_MV_RULE=fail:dest:$PREV/proxyctl.sha256")
+  run_boot --upgrade
+  expect_rc "stale temp + save fails between the two files: 1" 1
+  expect "stale temp + save fails between files: installed pair unchanged" installed_is_old
+  expect "stale temp + save fails between files: install dir clean" bin_dir_clean
+  expect "stale temp + save fails between files: the stale file was cleaned before the save" \
+    bash -c '[[ ! -e "$1/.proxyctl.tmp.CCCCCC" ]]' _ "$PREV"
+  expect "stale temp + save fails between files: installed pair never renamed" \
+    bash -c '! grep -q " $2\$" "$1" && ! grep -q " $3\$" "$1"' _ "$C/log/mv.log" "$BIN" "$SIDE"
+}
+
 # --- script-level properties that tests cannot observe from outside -----------------------
 
 test_script_structure() {
   new_case structure
   expect "the compatibility check child gets fds 8 and 9 closed" \
-    bash -c 'grep -Eq "setsid timeout .*node service show.*8>&- 9>&-" "$1"' _ "$SCRIPT"
+    bash -c 'grep -Eq "setsid( --wait)? timeout .*node service show.*8>&- 9>&-" "$1"' _ "$SCRIPT"
   expect "L3 is re-taken after the check and the asset snapshot is compared" \
     bash -c 'grep -q "acquire_l3 \"after the compatibility check\"" "$1" && grep -q "\"\$after\" != \"\$before\"" "$1"' _ "$SCRIPT"
 }
@@ -1651,6 +1758,8 @@ main() {
   test_lock_handover
   test_change_during_check
   test_previous_copy
+  test_stale_previous_tmp
+  test_setsid_wait
   test_replacement_faults
   test_signal_matrix
   test_script_structure

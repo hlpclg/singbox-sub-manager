@@ -202,3 +202,67 @@ $ bash tests/test_reality_probe.sh --bogus           # 未知参数，usage，ex
 静态 `systemd-analyze verify` 确认。多 OS/多架构的真实 systemd 生命周期覆盖，以及非回环私网
 目标的动态拒绝验证，仍然阻塞，未被冒充为已完成——这两类差距需要计划 Task 13 的真实一次性
 VM 环境补齐。**本次未创建任何生产生命周期代码，未标记本 Task 完成，未进入 Task 2。**
+
+---
+
+# v0.10 Task 13 — 同 tag Release 集成与自动化流程验证记录
+
+本节记录计划 Task 13 在**自动化**层面做了什么、怎么复跑、环境是什么，以及**哪些没有完成**。
+规格 §14.5 的两机真机验收、FlClash 实际出口等**没有执行，下面不把任何一项写成“通过”**。
+证据针对的是提交 `c5e91ed` 之上的**未提交工作区**；精确的提交对象、Go 全量门禁和独立终审证据由
+Task 13 封账时补入计划，不在本节。
+
+## 自动化覆盖了什么
+
+| 项目 | 命令 | 环境 | 结果（本次实测） |
+|---|---|---|---|
+| 三脚本版本、ci/release 登记规则、release 资产清单与顺序、`checksums.txt`（真实命令对合成 dist）与 v0.9 解析 | `bash tests/test_release_assets.sh` | ubuntu:24.04 容器（arm64，OrbStack），root 与 uid 1000 各一个全新容器 | 145 通过，0 失败 |
+| 同上 + 真实 dist（两个二进制+三个脚本）：`sha256sum -c`、清单、二进制版本串 | `DIST_DIR=dist EXPECT_VERSION=v0.10.0 bash tests/test_release_assets.sh` | `golang:1.22@sha256:1cf6c45ba39db9fd6db16922041d074a63c935556a05c5ccb62d181034df7f02` 容器（Debian 12，arm64，另装 gawk 与 qemu-user-static） | 174 通过，0 失败；arm64 二进制本机直接运行，amd64 二进制经 qemu-user 运行，均精确打印 `v0.10.0` |
+| 真实 `proxyctl` 的严格模式解析（退出码 2 先于 root/锁/网络/写入） | `bash tests/test_v010_flow.sh` | 同 ubuntu:24.04 容器，root 与 uid 1000 | 12 通过，0 失败，1 个区段显式 SKIP（真实文件系统区段未 opt-in） |
+| 节点机侧 fresh→install→show→uninstall→show→reinstall→`uninstall --purge --export-backup`；订阅中心侧 legacy→`migrate`→粘贴节点打印的 add→重复粘贴→`--min-version` 拒绝→节点打印的 disable→enable→remove；中心上 `node service install`/`show`/`bootstrap-node.sh` 被拒绝 | `PROXYCTL_REAL_FS_TESTS=1 PROXYCTL_REAL_CANDIDATE=<proxyctl> bash tests/test_v010_flow.sh`（一次性 root 容器，需访问 github.com 与 SNI 主机） | ubuntu:24.04 容器（arm64），候选二进制由上面的 golang:1.22 容器以 `-X main.Version=v0.10.0` 构建；连续运行两次均 122 通过 0 失败，第二次证明清理干净 | 真实 sing-box 1.14.1 下载并校验、真实配置与本机自检；订阅文件通过 127.0.0.1:443 的一次性 TLS 服务以 HTTPS 取回并与磁盘字节比对 |
+| bootstrap 小修 | `bash tests/test_bootstrap_upgrade.sh` | 同上 | 新增 `setsid --wait`、PREVIOUS_DIR 遗留临时文件两组用例；见下“已知冲突” |
+| `PROXYCTL_VERSION` 升到 v0.10.0 | `bash tests/test_install_monitor.sh`（第 12、26 行字面量改为 `v0.10.0`，批准的唯一既有测试改动） | 同上 | 通过 |
+
+静态：`bash -n` 与 ShellCheck 0.9.0（ubuntu:24.04 的 apt 包）对三个脚本和全部 `tests/test_*.sh`（`tests/test_caddy_apt.sh` 除外，见下）通过。
+
+CI 登记规则（R1 `bash -n`、R2 ShellCheck、R3 执行、R4 每个脚本被至少一个已登记测试引用、R5 无 `continue-on-error`/`|| true`/步骤级 `if:`）由 `tests/test_release_assets.sh` 对 `ci.yml` 与 `release.yml` 同时检查；
+`tests/test_reality_probe.sh` 必须以 `--verify-assets` 登记，`tests/test_caddy_apt.sh` 在 `ci.yml` 以离线模式、在 `release.yml` 以 `CADDY_APT_SMOKE=1` 登记。
+`tests/test_caddy_apt.sh` 是唯一的 ShellCheck 例外：它是既有测试，ShellCheck 0.9.0 对它有 info/warning 级别提示，规格 §14.6 禁止修改既有测试，所以只做 `bash -n` 和执行，不做 ShellCheck；例外在 `SHELLCHECK_EXEMPT` 中显式列出。
+
+CI 中 `tests/test_v010_flow.sh` 的真实文件系统区段会打印明确的 SKIP 并计入 skipped；它**不是**条件跳过冒充通过：该区段需要 root、网络和一次性主机，CI 里不运行。
+
+### 变异验证（本 Task 新增逻辑）
+
+- `test_release_assets.sh`：对 workflow 与脚本做了 20 个变异（去掉 merge-nodes 资产、checksums 带路径前缀/重复/用通配符/缺脚本、去掉 cp、去掉标记、去掉某测试的 `bash -n`、把执行行注释掉、ShellCheck 列表缺项、`|| true`、`continue-on-error`、步骤级 `if:`、permissions 增加项、去掉 `--verify-assets`、去掉 DIST_DIR 校验、去掉 `EXPECT_VERSION`、去掉 caddy smoke、merge-nodes 版本回到 v0.9.0 等），全部被抓到。DIST_DIR 模式另验：错误的期望版本、arm64 二进制 `-X` 为 `v0.10.0-rc1`、arm64 二进制不带 `-X`、构建后改动二进制使 checksums 过期、缺少 `EXPECT_VERSION`，均失败。
+- `test_v010_flow.sh`：对候选 Go 二进制做了 3 个变异（节点机输出的 `--min-version` 改为 `v0.10.1`、`enable` 与 `disable` 的 `want` 取反、取消 `node service` 的角色检查），均被抓到（分别多项、9、3 项失败）。
+- bootstrap 小修：`setsid` 不带 `--wait`、清理时不排除符号链接/不检查属主/匹配目录/glob 过宽，均被新用例抓到（`rm -rf` 单独替换在 `-f` 守卫下行为等价，无法由行为区分）。
+
+## 接缝调查与未覆盖的缺口（B2）
+
+`cmd/proxyctl`、`internal/realitynode`、`internal/transaction`、`internal/publish`、`internal/role`、`internal/hostlock` 不读取任何环境变量，也不提供改变根路径的 flag：实例/订阅中心路径、锁文件、sing-box 下载地址（固定为 GitHub Release）、HTTPS 复验地址（127.0.0.1:443）都编译在内。Go 测试靠包内变量和结构体（`newServiceRuntime`、`newPublishRuntime`、`realitynode.Env`、`publish.Env`）注入，shell 测试无法使用。**本 Task 未修改任何 Go 生产代码**，所以集成流程只能对真实固定路径运行（一次性 root 容器），能借用的接缝只有两个：`systemctl` 从 PATH 解析，Go 读取 `SSL_CERT_FILE`。
+
+因此真实流程里：
+
+- systemd 由**有状态的假 `systemctl`** 代替，它只管理 `proxyctl-reality.service` 的 loaded/enabled/active 状态，`start`/`restart` 真的启动 unit 里的 `ExecStart`（真实 sing-box 与真实生成的配置）。它**不模拟任何 systemd 沙箱**（`ProtectSystem`、`NoNewPrivileges`、`Restart=` 等）。
+- Caddy 由 `openssl s_server -WWW` 在 127.0.0.1:443 代替，证书由 `SSL_CERT_FILE` 指向的一次性自签证书信任。
+- 节点机输出的 add/disable/enable/remove 命令被原样粘贴执行（`sudo` 与 `proxyctl` 以 shell 函数代替）；两种角色在同一台一次性主机上先后出现，因为角色检测使它们不能同时存在。
+
+## 未完成 / 未覆盖（准确标记）
+
+| 项目 | 状态 | 说明 |
+|---|---|---|
+| 规格 §14.5 六步两机真机验收（订阅中心 + 全新 AWS 节点机） | **未完成** | 没有访问授权的一次性订阅中心和节点 VM；上表的容器流程不能替代 |
+| FlClash 更新订阅后握手成功、实际用作出口 | **未完成** | 无客户端访问 |
+| §14.5 第 3 步各受限目标（IMDS、本机其他端口、`0.0.0.0:22`、`<server>:22`、IPv6 `fd00:ec2::254`、解析到私网的域名）经节点的动态拒绝 | **未完成** | Task 1 遗留的私网动态拒绝验证仍然阻塞（容器网络层对非自有地址返回伪连通性）；本 Task 未补 |
+| 真实 systemd（unit 沙箱、`Restart=`、journald、多 OS Debian 12/Ubuntu 22.04/24.04 的真实 VM） | **未完成** | 只有假 `systemctl`；Task 1 遗留项未关闭 |
+| arm64 真机的 sing-box 握手/路由 | **未完成** | arm64 容器里的流程使用 arm64 sing-box 下载与自检通过，但那是容器，不是 arm64 真机 VM；amd64 同理（本机容器是 arm64，未在 amd64 实机/容器上运行流程测试，CI 之外的 amd64 实跑待补） |
+| 真实 GitHub Release 下载 `bootstrap-node.sh` 及其固定 tag 资产 | **未完成** | v0.10.0 未发布；bootstrap 的下载路径只由既有 `tests/test_bootstrap_*.sh` 用假 `curl` 覆盖，本 Task 的流程测试没有走 bootstrap 首装 |
+| 真实终端 Ctrl-C | **未完成** | 信号路径仍只由脚本测试里的 `kill -INT` 与 Go 的 context 取消测试覆盖 |
+| 真实 Go 候选段（`test_bootstrap_upgrade.sh` 的 `PROXYCTL_REAL_FS_TESTS=1` 区段）未入 CI | **仍未入 CI** | CI 显示 SKIP 计数；封账审查时在 ubuntu:24.04 容器以 root + 真实候选单独重跑：902 通过、0 失败、0 跳过 |
+| Go 全量门禁（Go 1.22 容器 `go test -race`、`go vet`、`gofmt -l`） | 不在本节 | 由主会话在封账时复跑，本节只写聚焦验证 |
+
+## 本 Task 发现的问题（未修，范围外或需决策）
+
+- **`go version -m` 无法校验 `-X main.Version`**：release 构建使用 `-trimpath`，Go 在 `-trimpath` 下不把 `-ldflags` 写进构建信息（golang/go#52372），所以计划里“arm64 用 `go version -m` 检查 `-X main.Version`”无法成立。改为在 release 里安装 `qemu-user-static`，用 qemu-user 真正运行 arm64 二进制并比较 `version` 的输出。
+- **Debian 12 默认 awk（mawk 1.3.4 20200120）不支持 `{64}` 区间表达式**：`install-proxy.sh`、`merge-nodes.sh`、`bootstrap-node.sh` 校验 `checksums.txt` 的 awk（`$1 ~ /^[[:xdigit:]]{64}$/`）在这种 awk 上对任何文件都匹配 0 条，会被判为“没有恰好一条记录”。`tests/test_release_assets.sh` 因此把“awk 支持区间表达式”写成前置断言，而不是静默得出 0。规格声明支持 Debian 12，此项需要用户决定是否在所属 Task 修复。
+- **既有断言放宽（已获用户批准）**：`bootstrap-node.sh` 的 `setsid --wait` 修改（C1）使 `tests/test_bootstrap_upgrade.sh` 里既有断言 `the compatibility check child gets fds 8 and 9 closed` 的正则 `setsid timeout .*node service show.*8>&- 9>&-` 不再匹配；已批准仅把它放宽为 `setsid( --wait)? timeout ...`，fd 关闭的断言意图不变，别的断言不动。

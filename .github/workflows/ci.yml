@@ -21,14 +21,24 @@ jobs:
           bash -n install-proxy.sh
           bash -n merge-nodes.sh
           bash -n bootstrap-node.sh
+          bash -n tests/test_caddy_apt.sh
+          bash -n tests/test_install_json.sh
+          bash -n tests/test_install_monitor.sh
+          bash -n tests/test_install_proxyctl.sh
+          bash -n tests/test_install_update.sh
           bash -n tests/test_reality_probe.sh
           bash -n tests/test_shared_guards.sh
           bash -n tests/test_bootstrap_node.sh
           bash -n tests/test_bootstrap_upgrade.sh
           bash -n tests/test_bootstrap_restore.sh
+          bash -n tests/test_release_assets.sh
+          bash -n tests/test_v010_flow.sh
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck
+        # tests/test_caddy_apt.sh is the one existing test ShellCheck 0.9.0
+        # reports findings for; it may not be edited (spec 14.6), so it is the
+        # documented exemption in tests/test_release_assets.sh (SHELLCHECK_EXEMPT).
         run: |
           shellcheck install-proxy.sh
           shellcheck merge-nodes.sh
@@ -42,6 +52,8 @@ jobs:
           shellcheck tests/test_bootstrap_node.sh
           shellcheck tests/test_bootstrap_upgrade.sh
           shellcheck tests/test_bootstrap_restore.sh
+          shellcheck tests/test_release_assets.sh
+          shellcheck tests/test_v010_flow.sh
       - name: Go fmt
         run: if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then echo "Go code is not formatted"; exit 1; fi
       - name: Shell tests
@@ -54,6 +66,12 @@ jobs:
           bash tests/test_bootstrap_node.sh
           bash tests/test_bootstrap_upgrade.sh
           bash tests/test_bootstrap_restore.sh
+          bash tests/test_caddy_apt.sh
+          bash tests/test_release_assets.sh
+          # Prints an explicit SKIP for the real-filesystem section (it needs
+          # PROXYCTL_REAL_FS_TESTS=1, root and a throw-away host); everything
+          # else in it runs.
+          bash tests/test_v010_flow.sh
           # --verify-assets only: downloads and SHA256-verifies the pinned
           # sing-box release. It needs network but not root or a real
           # systemd host, so normal CI can run it without pretending to

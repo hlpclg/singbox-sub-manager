@@ -541,7 +541,10 @@ compat_check() {
   # timeout enforces SHOW_TIMEOUT. Neither fd 9 (L1) nor fd 8 (L3) is inherited.
   bg_arm
   BG_GROUP=1
-  setsid timeout -s KILL "$SHOW_TIMEOUT" "$CAND_BIN" node service show >/dev/null 8>&- 9>&- </dev/null &
+  # --wait: setsid forks (and its parent returns at once) when it happens to be a
+  # process group leader, which would make wait_bg see exit 0 before the check
+  # ran; with --wait it always waits for and returns the child's exit status.
+  setsid --wait timeout -s KILL "$SHOW_TIMEOUT" "$CAND_BIN" node service show >/dev/null 8>&- 9>&- </dev/null &
   BG_PID=$!
   bg_disarm
   wait_bg || rc=$?
@@ -599,6 +602,14 @@ save_previous() {
   for p in "$prev_bin" "$prev_side"; do
     if [[ -L "$p" ]] || { [[ -e "$p" ]] && [[ ! -f "$p" ]]; }; then
       die "$p is not a regular file; inspect it manually. Nothing was replaced."
+    fi
+  done
+  # A SIGKILLed earlier run can leave write_atomic temp files behind. Remove only
+  # those: inside PREVIOUS_DIR, matching the temp name, a regular file (never a
+  # symlink or directory, so nothing is followed) owned by the current user.
+  for p in "$PREVIOUS_DIR"/.proxyctl.tmp.*; do
+    if [[ -f "$p" && ! -L "$p" && -O "$p" ]]; then
+      rm -f -- "$p" || echo "warning: could not remove the stale temp file $p" >&2
     fi
   done
 

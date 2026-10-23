@@ -42,4 +42,32 @@ sudo bash bootstrap-node.sh --upgrade
 
 ## 订阅中心升级
 
-按 README“升级与回滚（install-proxy.sh update / rollback）”一节操作。订阅中心从 v0.9 升到 v0.10 时，`install-proxy.sh`、`merge-nodes.sh` 必须与二进制来自同一个 tag。
+订阅中心用现有的 `install-proxy.sh update` / `rollback`（更新会话、配置快照、健康检查）。README“升级与回滚（install-proxy.sh update / rollback）”一节是通用步骤；下面是从 v0.9 升到 v0.10 的补充。
+
+### 从 v0.9 升到 v0.10
+
+1. 在订阅中心执行 v0.9 的 `sudo ./install-proxy.sh update`（以及需要时的 `rollback`），沿用 v0.9 的更新会话、快照和回滚。v0.9 的脚本会拉取**最新** Release 的 `proxyctl` 并按 `checksums.txt` 校验。
+2. v0.10 的 `checksums.txt` 除两个 `proxyctl-linux-*` 二进制外，还新增了 `install-proxy.sh`、`merge-nodes.sh`、`bootstrap-node.sh` 三个脚本条目，文件名都不带路径。v0.9 脚本解析 `checksums.txt` 的方式（要求每个二进制恰好一条匹配）读取它时仍然只会匹配到一条二进制记录，所以 v0.9 的 `update` 不受新增条目影响。
+3. v0.10 的 `proxyctl` 在 v0.9 脚本持有 L1 锁期间，以子进程方式执行 `health`、`restore`：`restore` 只取 L2 → L3，不申请 L1，不会被持锁的脚本自己挡住。
+4. 升级完成后，**先**执行 `proxyctl version` 确认实际升级到的版本。v0.9 的 `update` 拉取的是最新 Release，所以升级时它可能已经高于 v0.10.0。
+5. 再从**与 `proxyctl version` 同一个 tag** 的 Release 下载 `install-proxy.sh` 和 `merge-nodes.sh`，核对 `checksums.txt`，替换旧副本：
+
+   ```bash
+   TAG="$(proxyctl version)"
+   BASE="https://github.com/hlpclg/singbox-sub-manager/releases/download/${TAG}"
+   curl -fsSLO "${BASE}/install-proxy.sh"
+   curl -fsSLO "${BASE}/merge-nodes.sh"
+   curl -fsSLO "${BASE}/checksums.txt"
+   sha256sum -c --ignore-missing checksums.txt
+   ```
+
+   `sha256sum -c` 必须对两个脚本都报 OK，再用它们替换你实际在用的旧副本。
+6. **删除**内置 `PROXYCTL_VERSION=v0.9.0` 的旧副本（含各目录里残留的拷贝）。原因：脚本内置的 `PROXYCTL_VERSION` 与本机二进制版本不同时，下一次 `install` 或 `merge` 会把本机二进制替换成脚本内置的版本；脚本版本更旧时这就是**降级**。同一个 tag 的脚本与二进制不会互相替换。
+
+不要从 `main` 分支下载脚本，也不要把 v0.10 的二进制和 v0.9 的脚本混用。
+
+### 对 `update`、`monitor` 和发布的影响
+
+- **备份取 L2**：v0.10 起 `proxyctl backup` 创建归档时要取 L2（monitor 使用的锁，等待上限 30 秒）。`install-proxy.sh update` 在更新前做的快照走 `backup`；如果 monitor 恰好有一轮运行超过 30 秒，快照会因锁超时失败，**更新随之中止，不做任何替换**，可以直接重试。
+- **发布与 monitor**：`proxyctl node publish` 和带 `--publish` 的变更持有 L1 + L2。发布持有 L2 的这段时间（最长约为 HTTPS 验证超时加渲染时间），`proxyctl monitor` 的 TryLock 可能失败并返回 3，对应的 systemd unit 那一轮会显示为 failed，下一轮自动恢复正常，不需要处理。
+- **不是全局串行**：只有 `publish`、`--publish` 变更和 `merge-nodes.sh` 与 backup/restore/monitor 串行。`install-proxy.sh` 在持有 L1、未持有 L2 时调用 `proxyctl merge`，用户手动执行的 `proxyctl merge` / `subscription build` 都不加锁，默认路径的兼容模式 CRUD 只取 L1，独立执行的 `restore` 只取 L2 和 L3；这些旧路径的并发行为本版本不变。标准发布入口是 `proxyctl node publish`。
