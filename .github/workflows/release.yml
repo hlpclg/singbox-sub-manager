@@ -46,6 +46,8 @@ jobs:
           bash -n tests/test_reality_probe.sh
           bash -n tests/test_shared_guards.sh
           bash -n tests/test_bootstrap_node.sh
+          bash -n tests/test_bootstrap_upgrade.sh
+          bash -n tests/test_bootstrap_restore.sh
       - name: ShellCheck
         run: |
           sudo apt-get update
@@ -53,6 +55,7 @@ jobs:
           shellcheck install-proxy.sh merge-nodes.sh bootstrap-node.sh
           shellcheck tests/test_install_json.sh tests/test_install_proxyctl.sh tests/test_install_monitor.sh tests/test_install_update.sh
           shellcheck tests/test_reality_probe.sh tests/test_shared_guards.sh tests/test_bootstrap_node.sh
+          shellcheck tests/test_bootstrap_upgrade.sh tests/test_bootstrap_restore.sh
       - name: Build and validate proxyctl
         run: |
           mkdir -p dist
@@ -69,6 +72,8 @@ jobs:
           bash tests/test_install_update.sh
           bash tests/test_shared_guards.sh
           bash tests/test_bootstrap_node.sh
+          bash tests/test_bootstrap_upgrade.sh
+          bash tests/test_bootstrap_restore.sh
           cd dist
           sha256sum proxyctl-linux-* > checksums.txt
       - name: Verify pinned Reality runtime assets

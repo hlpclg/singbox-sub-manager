@@ -1,6 +1,6 @@
 # Reality 节点（施工中，v0.10）
 
-本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单（`sudo proxyctl node`，Task 10）也已可用；bootstrap 首装脚本（`bootstrap-node.sh`，Task 11）已经可用；`--upgrade` 升级模式尚未交付（Task 12）。参数全集见 [docs/cli-reference.md](cli-reference.md)。
+本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单（`sudo proxyctl node`，Task 10）也已可用；bootstrap 首装脚本（`bootstrap-node.sh`，Task 11）已经可用；`--upgrade` 升级模式与从旧副本人工回滚的步骤（Task 12）已经可用。参数全集见 [docs/cli-reference.md](cli-reference.md)。
 
 完整设计见 [v0.10 定稿规格](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)；已完成 Task 的真实验证证据见 [reality-node-validation.md](reality-node-validation.md)。
 
@@ -138,7 +138,7 @@ sudo bash bootstrap-node.sh
 | `.sha256` 缺失，或与二进制哈希不符 | 不执行该二进制。无 `--replace-proxyctl`：返回 1；有：安装固定版本 |
 | 校验通过，版本不可解析（含 `dev`） | 返回 1 |
 | 校验通过，版本等于固定版本 | 能力探测（`proxyctl node service --help` 退出码 0）通过则复用，否则返回 1 |
-| 校验通过，版本不低于 v0.10.0 且不同于固定版本 | 返回 1，不替换、不降级；比固定版本新时提示直接运行 `sudo proxyctl node` |
+| 校验通过，版本不低于 v0.10.0 且不同于固定版本 | 返回 1，不替换、不降级；比固定版本新时提示直接运行 `sudo proxyctl node`，比固定版本旧时提示执行 `sudo bash bootstrap-node.sh --upgrade`（见下文“升级”） |
 | 校验通过，版本低于 v0.10.0 | 安装固定版本（旧版本没有节点机功能，且这台主机没有需要保护的状态） |
 
 `--replace-proxyctl` 只修复**无法校验的安装文件**（`.sha256` 缺失或不符，典型原因是安装在二进制与 sidecar 两次 rename 之间被 SIGKILL 或断电打断）；它不会替换、降级任何一个校验通过的 `proxyctl`，对“版本相同但缺能力”“版本不可解析”“版本更新”这几行也没有效果。`/usr/local/bin/proxyctl` 或其 `.sha256` 不是普通文件（目录、符号链接）时脚本直接返回 1，不执行、不替换，请先人工检查。
@@ -157,6 +157,125 @@ sudo bash bootstrap-node.sh
 - 无参数且不是终端：输出用法，返回 2（此时 `proxyctl` 已经装好或修复）。
 
 脚本自己的退出码：`1` 修改之前失败（root/OS/架构/角色不符、锁超时、下载或校验失败、`proxyctl` 决策表要求停止），`2` 用法错误。其余退出码来自被 exec 的 `proxyctl`（含义见 cli-reference）。脚本不写任何 Reality 实例资产，只写 `proxyctl` 及其 `.sha256`。
+
+## 升级（`bootstrap-node.sh --upgrade`，Task 12，规格 §12）
+
+节点机在套件更新规格交付之前的**唯一**升级入口（节点机不支持 `install-proxy.sh update`，订阅中心才用它）。从**目标版本的 Release** 下载该版本的 `bootstrap-node.sh`（目标版本就是脚本内置的 `v0.10.0`），再升级：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+```
+
+```bash
+sudo bash bootstrap-node.sh --upgrade
+```
+
+`--upgrade` 必须是唯一参数；与任何其他参数（包括 `--replace-proxyctl`）同时出现返回 2，早于 root 检查、加锁和网络。升级模式不 exec `proxyctl`，做完就退出。
+
+顺序（先到先停）：解析参数 → root、OS、架构 → 角色预检（订阅中心角色必须是“否”，否则返回 1，不下载）→ 取 L1（`/run/lock/singbox-sub-manager.lock`，30 秒）→ 取 L3（`/run/lock/proxyctl-reality.lock`，10 秒）→ 持锁复查角色 → 检查实例事务 → 判定本机 `proxyctl` → 下载并验证候选 → 只读兼容检查 → 保存旧副本 → 替换 → 验证。
+
+- **实例事务**：`/var/lib/proxyctl-reality-txn/` 或 `/var/lib/.proxyctl-reality-txn.tomb-*` 存在时返回 1，提示先执行 `sudo proxyctl node service recover`，不下载，`proxyctl` 字节不变。
+- **本机 `proxyctl` 的判定**：
+
+| 本机 proxyctl | 处理 |
+|---|---|
+| 不存在 | 返回 1，提示不带 `--upgrade` 运行以完成首次安装 |
+| `.sha256` 缺失或与二进制哈希不符 | 不执行该二进制，返回 1，提示不带 `--upgrade`、改用 `--replace-proxyctl` |
+| 不是普通文件（目录、符号链接） | 返回 1，不执行 |
+| 版本不可解析（含 `dev`） | 返回 1 |
+| 版本等于固定版本 | 返回 0，说明已是该版本；不下载、不做任何修改 |
+| 版本高于固定版本 | 返回 1，不降级 |
+| 版本低于固定版本 | 升级 |
+
+- **候选验证**（任一项失败：删除临时文件，返回 1，其余一概不动）：在 `/usr/local/bin/` 里用 `mktemp` 建临时文件 → 下载 `proxyctl` 与 `checksums.txt`（每个文件 120 秒）→ SHA256 → `version` 必须等于 `v0.10.0` → `node service --help` 退出码为 0。
+- **只读兼容检查**：用通过验证的候选二进制读取本机实例，防止升级后新版本读不懂旧实例。`/var/lib/proxyctl-reality/`、`/etc/proxyctl-reality/`、unit 文件、`/usr/local/lib/proxyctl-reality/` 四个资产根**全部不存在**时没有状态需要验证，跳过；只要有任何一个存在（包括残缺的、悬空符号链接）就执行候选的 `node service show`，必须在 15 秒内（含它自己等 L3）返回 0，stdout 丢弃，诊断信息（stderr）保留。未知 schema、状态不一致、锁超时、执行失败、超时都拒绝升级，返回 1，原二进制、`.sha256`、旧副本和全部实例资产保持不变。检查不会迁移或改写任何状态。
+  锁交接：父进程一直持有 L1（所以实例变更和共享二进制替换都被挡住）、关闭自己的 fd 8 释放 L3；子进程不继承 fd 8 和 fd 9，由 `show` 自己取得并释放 L3。子进程结束后父进程重新取 L3（10 秒），复查角色、事务区/墓碑，并确认四个资产根下每一项的存在性、类型、内容、属主和 mode 与检查前一致；有变化或重取不到锁返回 1，不替换。超时或收到信号时先终止并回收子进程及其子孙，再清理、解锁。
+- **旧副本**：`/var/lib/proxyctl-bootstrap/previous/`（目录 root:root 0700；`proxyctl` 0700，`proxyctl.sha256` 0600），只保留最近一次升级前的那一对，下次升级时覆盖。每个文件先写同目录临时文件、fsync、再 rename，两个文件写完并 fsync 目录后，核对旧副本两文件互相匹配且等于当前安装的字节，才允许开始替换；保存失败返回 1，已安装的二进制和 `.sha256` 不变。保存期间断电可能留下**不匹配的旧副本**，它不能直接用于人工回滚（见下文哈希门禁）。该目录不属于 Reality 实例，不参与角色检测。
+- **替换与验证**：先 rename 二进制（0755），再 rename `.sha256`（0644），都是同目录临时文件；验证已安装二进制的哈希等于 `.sha256`、`proxyctl version` 等于 `v0.10.0`。替换或验证失败：从旧副本恢复两个文件并校验，恢复成功返回 4，恢复失败返回 5，两种情况都输出旧副本路径。
+- **信号**：替换开始之前收到 SIGINT/SIGTERM（下载、兼容检查、保存旧副本期间）：终止并回收子进程，删除临时文件，返回 1。替换开始之后、验证完成之前收到：不打断替换，按失败规则恢复旧副本，返回 4（恢复失败 5）。验证全部通过即成功边界，之后收到的信号只完成临时文件清理和解锁，返回 0，不回滚。
+- **成功后**：stderr 提示新版本固定的 sing-box 版本可能与实例当前使用的不同，请执行 `sudo proxyctl node service show` 查看，必要时 `sudo proxyctl node service reinstall`；锁 fd 8、9 在退出前已关闭。
+
+### 退出码（升级模式）
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功，或本机已是该版本（未做任何修改） |
+| 1 | 替换之前失败（角色、事务、`proxyctl` 判定、下载与校验、兼容检查、取锁超时、保存旧副本失败），已安装文件不变 |
+| 2 | 用法错误（`--upgrade` 之外还有任何参数） |
+| 4 | 替换或验证失败，已从旧副本恢复，旧版本仍在 |
+| 5 | 替换或验证失败，**恢复也失败**，需人工介入；输出旧副本路径，按下文修复 |
+
+### 人工回滚（从旧副本恢复）
+
+只有在下面**全部**满足时才支持直接换回旧版本：
+
+- 升级后只执行过只读的 `node service show`（含兼容检查本身）。只读 `show` 不改变实例，回滚窗口保持打开。
+- 升级后**没有**执行过任何 `node service` 生命周期变更命令：`install`、`reinstall`、`uninstall`、`uninstall --purge`、`recover`、`recover --abandon`，**包括失败的和被取消的变更**。
+- 实例没有未完成事务或墓碑。
+
+一旦执行过任何这类变更命令，新版本可能已经写出了旧版本不认识的格式：**不要直接把旧二进制换回去**，保留新二进制，使用匹配版本的 `recover` 或后续独立的迁移方案；降级不能用来绕过未知 schema 检查。**无法确认是否满足上述条件时，不要执行，先停下来。**
+
+恢复步骤（以 root 执行；先按 L1→L3 取锁，**先验证旧副本是普通文件且二进制哈希与 `.sha256` 严格匹配，才会执行或覆盖任何东西**，两个文件各自原子替换，最后验证并解锁）。把下面这段保存成文件（例如 `restore-proxyctl.sh`），用 `sudo bash restore-proxyctl.sh` 执行；不要直接粘进交互 shell（里面有 `set -eu` 和 `exit`）。这段命令由测试 `tests/test_bootstrap_restore.sh` 原样抽出，在临时根里用真实 flock 执行：
+
+<!-- proxyctl-manual-restore:begin -->
+```bash
+set -eu
+L1=/run/lock/singbox-sub-manager.lock
+L3=/run/lock/proxyctl-reality.lock
+BIN=/usr/local/bin/proxyctl
+PREV=/var/lib/proxyctl-bootstrap/previous
+
+# 1. 先 L1 后 L3，整个恢复期间持有
+exec 9>"$L1"; flock -w 30 9
+exec 8>"$L3"; flock -w 10 8
+
+# 2. 旧副本必须是普通文件（不是符号链接/目录），且二进制哈希等于 .sha256；
+#    不满足就停止：不执行旧副本，也不覆盖当前安装
+for f in "$PREV/proxyctl" "$PREV/proxyctl.sha256"; do
+  if [ ! -f "$f" ] || [ -L "$f" ]; then echo "旧副本缺失或不是普通文件: $f" >&2; exit 1; fi
+done
+for f in "$BIN" "$BIN.sha256"; do
+  if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then echo "当前安装不是普通文件: $f" >&2; exit 1; fi
+done
+want="$(tr -d '[:space:]' < "$PREV/proxyctl.sha256")"
+have="$(sha256sum "$PREV/proxyctl" | cut -d' ' -f1)"
+if [ -z "$want" ] || [ "$want" != "$have" ]; then echo "旧副本二进制与 .sha256 不匹配，停止" >&2; exit 1; fi
+
+# 3. 在目标目录里准备两个临时文件并再次核对
+tmp_bin="$(mktemp "$(dirname "$BIN")/.proxyctl.restore.XXXXXX")"
+tmp_side="$(mktemp "$(dirname "$BIN")/.proxyctl.restore.XXXXXX")"
+cat "$PREV/proxyctl" > "$tmp_bin"; chmod 0755 "$tmp_bin"
+printf '%s\n' "$want" > "$tmp_side"; chmod 0644 "$tmp_side"
+if [ "$(sha256sum "$tmp_bin" | cut -d' ' -f1)" != "$want" ]; then rm -f "$tmp_bin" "$tmp_side"; echo "临时文件校验失败，停止" >&2; exit 1; fi
+
+# 4. 各自原子替换：先二进制，后 .sha256
+mv -f "$tmp_bin" "$BIN"
+mv -f "$tmp_side" "$BIN.sha256"
+
+# 5. 验证后才执行；最后解锁
+if [ "$(sha256sum "$BIN" | cut -d' ' -f1)" != "$want" ] || [ "$(tr -d '[:space:]' < "$BIN.sha256")" != "$want" ]; then echo "恢复后校验失败，不要使用 $BIN" >&2; exit 1; fi
+"$BIN" version
+exec 8>&- 9>&-
+```
+<!-- proxyctl-manual-restore:end -->
+
+恢复只改 `/usr/local/bin/proxyctl` 和 `.sha256`，不碰任何实例资产，也不会改写旧副本。步骤中途被打断时旧副本仍在，整段重新执行即可（幂等）。恢复后再运行一次 `sudo proxyctl node service show` 确认实例读取正常。
+
+### 升级被 SIGKILL 或断电打断：安装文件修复
+
+SIGKILL 和断电无法被捕获。两次安装 rename 之间被打断，会留下**新二进制配旧 `.sha256`**：普通运行（包括不带参数的 `bootstrap-node.sh`）发现 `.sha256` 不符就拒绝执行这个二进制并返回 1。此时用**同一个目标 Release** 的 `bootstrap-node.sh` 加 `--replace-proxyctl` 修复安装文件，修好后再按首次安装模式进入原有菜单或 `install` 流程；不要用更旧的脚本降级：
+
+```bash
+sudo bash bootstrap-node.sh --replace-proxyctl
+```
+
+已安装实例的主机上不带安装参数、又不在终端里运行时，修复本身成功（两个文件一致），随后按首次安装模式的非交互规则输出用法并返回 2，这个 2 不表示修复失败，之后直接运行 `sudo proxyctl node` 即可。修复只重写 `/usr/local/bin/proxyctl` 及 `.sha256`，不触碰实例资产。这与上面的“人工回滚（降级）”是两回事：修复把两个文件修成同一个目标版本，回滚是换回旧版本。
+
+保存旧副本期间被打断则留下不匹配的旧副本，当前安装不受影响；人工回滚的哈希门禁会拒绝它。
+
+### 限制
+
+本版本没有 `proxyctl update/rollback` 命令，也没有节点机更新会话；升级只有 `bootstrap-node.sh --upgrade`，回退只有上面的人工步骤。带会话和自动回滚的节点机升级由后续套件规格定义。
 
 ## 交互菜单（`sudo proxyctl node`，Task 10，规格 §4.4）
 
@@ -232,6 +351,6 @@ X25519 推导的正确性由 RFC 7748 §6.1 的标准测试向量验证（`inter
 
 ## 尚未实现
 
-- `bootstrap-node.sh --upgrade` 升级模式：Task 12。
+- 节点机上的 `proxyctl update/rollback` 命令和更新会话：本版本不提供，升级只有 `bootstrap-node.sh --upgrade`（见上文），带会话和自动回滚的节点机升级由后续套件规格定义。
 
 “已实现：只读检测”与“已实现：实例配置、私有下载与自检”两节描述的 Task 2/6 库函数已被上文 `node service install/reinstall/show` 消费，不再是仅能通过 Go 测试触达的独立层。

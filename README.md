@@ -403,6 +403,28 @@ sha256sum -c --ignore-missing checksums.txt
 - 脚本只写 `/usr/local/bin/proxyctl` 及其 `.sha256`，不创建任何 Reality 实例资产；卸载 Reality 实例也不会删除 `proxyctl`。
 - 取不到 `/run/lock/singbox-sub-manager.lock`（另一个安装、升级或节点操作正在进行）时最多等待 30 秒，超时返回 1。每个下载文件限时 120 秒。参数全集见 [docs/cli-reference.md](docs/cli-reference.md)，节点生命周期见 [docs/reality-node.md](docs/reality-node.md)。
 
+## 节点机升级（bootstrap-node.sh --upgrade，v0.10 起）
+
+节点机（`proxyctl` 由 `bootstrap-node.sh` 安装的独立节点主机）升级 `proxyctl` 只有这一个入口，**不要**在节点机上运行 `install-proxy.sh update`。先下载目标版本 Release 里的 `bootstrap-node.sh`（脚本内置的版本就是目标版本），再升级：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+```
+
+```bash
+sudo bash bootstrap-node.sh --upgrade
+```
+
+要点：
+
+- `--upgrade` 必须是唯一参数，带任何其他参数（包括 `--replace-proxyctl`）返回 2。同样只在“订阅中心=否”的主机上运行；存在未完成的实例事务（`sudo proxyctl node service recover` 先处理）时返回 1。
+- 已是该版本返回 0 且不下载、不修改；本机版本更高不降级（1）；`proxyctl` 不存在或 `.sha256` 不符不会被执行（1，提示不带 `--upgrade` 运行或改用 `--replace-proxyctl`）。
+- 替换之前先用下载并校验过的新版本对本机 Reality 实例做**只读兼容检查**（`node service show`，15 秒内必须返回 0；没有任何实例资产时跳过）。未知 schema、状态不一致或超时都拒绝升级，已安装的 `proxyctl`、旧副本和实例资产保持不变。
+- 升级前的 `proxyctl` 和 `.sha256` 会保存到 `/var/lib/proxyctl-bootstrap/previous/`（只保留最近一次）。替换或验证失败会自动恢复旧版本（返回 4；恢复也失败返回 5，需人工介入）。
+- 成功后提示新版本固定的 sing-box 可能与实例当前使用的不同：运行 `sudo proxyctl node service show` 查看，必要时 `sudo proxyctl node service reinstall`。
+- 本版本**没有**回滚命令和更新会话。从旧副本人工回滚只在升级后只做过只读 `show`、没有执行任何 `node service` 变更（包括失败或取消的变更、`recover`）时才安全，步骤和限制见 [docs/reality-node.md](docs/reality-node.md) 的“升级”一节；升级被 SIGKILL 或断电打断留下不一致的安装文件时，用**同一个目标 Release** 的脚本加 `--replace-proxyctl` 修复（与降级是两回事）。
+- 订阅中心的升级路径是 `install-proxy.sh update`，两条路径的区别见 [docs/upgrade.md](docs/upgrade.md)。
+
 ## 健康检查（proxyctl health）
 
 v0.4 起提供订阅中心本机健康检查（只读），帮助及时发现服务、配置、文件或网络层面的故障。

@@ -861,17 +861,6 @@ test_upgrade_args() {
     expect "'$combo': nothing downloaded, no lock taken, nothing executed" \
       bash -c '[[ ! -s "$1" && ! -e "$2" && ! -s "$3" ]]' _ "$C/log/curl.log" "$LOCKF" "$C/log/exec.log"
   done
-  new_case upgrade-alone
-  stage_download "$FIXED_VERSION" 0
-  make_installed "$FIXED_VERSION" 0 valid
-  local before
-  before="$(sha_of "$BIN")"
-  run_boot --upgrade
-  expect_rc "--upgrade alone: interim, not available in this build, 2" 2
-  expect "--upgrade alone: says it is not available" stderr_has "not available"
-  expect "--upgrade alone: nothing downloaded or executed, binary unchanged" \
-    bash -c '[[ ! -s "$1" && ! -s "$2" ]]' _ "$C/log/curl.log" "$C/log/exec.log"
-  expect "--upgrade alone: binary unchanged" bin_unchanged "$before"
 }
 
 test_no_args_non_tty() {

@@ -1,6 +1,6 @@
 # CLI 参数参考
 
-本页收录 `proxyctl` 严格模式命令的参数全集（规格 §4.5）。当前包含 `node service install|reinstall|show`（Task 7）、`uninstall`、`recover`（Task 8），以及 `node publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove`（Task 9）。`bootstrap-node.sh` 首次安装模式的参数见文末（Task 11）；升级模式由 Task 12 交付后补充。
+本页收录 `proxyctl` 严格模式命令的参数全集（规格 §4.5）。当前包含 `node service install|reinstall|show`（Task 7）、`uninstall`、`recover`（Task 8），以及 `node publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove`（Task 9）。`bootstrap-node.sh` 首次安装模式的参数见文末（Task 11）；升级模式（`--upgrade`）见文末（Task 12）。
 
 旧的 `node list/add/edit/remove/enable/disable/migrate`（不带 `--publish`）解析、输出和 `--nodes PATH` 语义不变，不在本页范围内；用法见 `proxyctl node <子命令> --help` 或 README。
 
@@ -197,3 +197,25 @@ sudo bash bootstrap-node.sh [--replace-proxyctl] --name NAME --server ADDR [--po
 - 固定版本（`v0.10.0`）是脚本内置的，不接受环境变量或参数覆盖。下载每个文件限时 120 秒，锁等待最长 30 秒。
 - 退出码：`1` 修改之前失败（非 root、OS 或架构不支持、订阅中心角色不是“否”、取锁超时、下载或校验失败、本机 `proxyctl` 决策表要求停止）；`2` 用法错误；带参数或进入菜单时，其余退出码就是被 exec 的 `proxyctl` 命令的退出码。
 - 决策表、角色预检和锁顺序见 [reality-node.md](reality-node.md) 的“首次安装”一节。
+
+## `bootstrap-node.sh --upgrade`（升级模式）
+
+```text
+sudo bash bootstrap-node.sh --upgrade
+```
+
+`--upgrade` 必须是唯一参数；与任何其他参数（包括 `--replace-proxyctl`）同时出现返回 2，早于 root 检查、加锁和网络。升级模式不 exec `proxyctl`。
+
+| 本机 proxyctl | 处理 |
+|---|---|
+| 不存在 | 返回 1，提示不带 `--upgrade` 运行 |
+| `.sha256` 缺失或不符 | 不执行，返回 1，提示 `--replace-proxyctl` |
+| 版本不可解析（含 `dev`） | 返回 1 |
+| 版本等于固定版本 | 返回 0，不下载、不修改 |
+| 版本高于固定版本 | 返回 1，不降级 |
+| 版本低于固定版本 | 升级（候选验证 → 只读兼容检查 → 保存旧副本 → 替换 → 验证） |
+
+- 退出码：`0` 成功或已是该版本；`1` 替换之前失败（已安装文件不变）；`2` 用法错误；`4` 替换或验证失败、已从旧副本恢复；`5` 恢复也失败，需人工介入（输出旧副本路径 `/var/lib/proxyctl-bootstrap/previous/`）。
+- 取消：替换开始之前收到 SIGINT/SIGTERM 返回 1；替换开始之后、验证完成之前收到按失败处理（4 或 5）；验证完成之后收到仍返回 0。
+- 锁：L1（30 秒）后 L3（10 秒）；兼容检查期间父进程只保留 L1。
+- 完整流程、旧副本、人工回滚步骤和 SIGKILL 后的修复见 [reality-node.md](reality-node.md) 的“升级”一节。
