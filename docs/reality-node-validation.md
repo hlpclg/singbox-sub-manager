@@ -264,5 +264,5 @@ CI 中 `tests/test_v010_flow.sh` 的真实文件系统区段会打印明确的 S
 ## 本 Task 发现的问题（未修，范围外或需决策）
 
 - **`go version -m` 无法校验 `-X main.Version`**：release 构建使用 `-trimpath`，Go 在 `-trimpath` 下不把 `-ldflags` 写进构建信息（golang/go#52372），所以计划里“arm64 用 `go version -m` 检查 `-X main.Version`”无法成立。改为在 release 里安装 `qemu-user-static`，用 qemu-user 真正运行 arm64 二进制并比较 `version` 的输出。
-- **Debian 12 默认 awk（mawk 1.3.4 20200120）不支持 `{64}` 区间表达式**：`install-proxy.sh`、`merge-nodes.sh`、`bootstrap-node.sh` 校验 `checksums.txt` 的 awk（`$1 ~ /^[[:xdigit:]]{64}$/`）在这种 awk 上对任何文件都匹配 0 条，会被判为“没有恰好一条记录”。`tests/test_release_assets.sh` 因此把“awk 支持区间表达式”写成前置断言，而不是静默得出 0。规格声明支持 Debian 12，此项需要用户决定是否在所属 Task 修复。
+- **Debian 12 默认 awk（mawk 1.3.4 20200120）不支持 `{64}` 区间表达式（已修复）**：`install-proxy.sh`、`merge-nodes.sh`、`bootstrap-node.sh` 校验 `checksums.txt` 的 awk 原先用 `$1 ~ /^[[:xdigit:]]{64}$/`，在该 awk 上对任何文件匹配 0 条。已改为语义等价的 `length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/`（`*name` 与大小写处理不变，仍要求恰好一条匹配）。`tests/test_release_assets.sh` 新增静态断言（三个脚本不含 `{n}` 区间）与谓词等价表，在 mawk 1.3.4 20200120 和 gawk 5.2.1 下均通过；v0.9 已发布脚本无法修复，其 `update` 在 Debian 12 上仍受此限制。
 - **既有断言放宽（已获用户批准）**：`bootstrap-node.sh` 的 `setsid --wait` 修改（C1）使 `tests/test_bootstrap_upgrade.sh` 里既有断言 `the compatibility check child gets fds 8 and 9 closed` 的正则 `setsid timeout .*node service show.*8>&- 9>&-` 不再匹配；已批准仅把它放宽为 `setsid( --wait)? timeout ...`，fd 关闭的断言意图不变，别的断言不动。

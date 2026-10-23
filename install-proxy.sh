@@ -428,8 +428,8 @@ install_proxyctl() {
     return 1
   fi
 
-  expected_count="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
-  expected_sha256="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
+  expected_count="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
+  expected_sha256="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
   if [[ "$expected_count" != "1" || -z "$expected_sha256" ]]; then
     rm -f "$tmp" "$chk_tmp"
     PROXYCTL_VALIDATED_BIN=""
@@ -1713,8 +1713,8 @@ cmd_update() {
     die "Download failed; the installed proxyctl and its checksum file are unchanged."
   fi
 
-  expected_count="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
-  expected_sha256="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
+  expected_count="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
+  expected_sha256="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
   if [[ "$expected_count" != "1" || -z "$expected_sha256" ]]; then
     rm -f "$bin_tmp" "$chk_tmp"
     set_session_status "$session_dir" failed || true

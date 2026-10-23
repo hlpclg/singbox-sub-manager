@@ -55,8 +55,8 @@ install_proxyctl_binary() {
     rm -rf "$tmp_dir"
     return 1
   fi
-  expected_count="$(awk -v file="$binary_name" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == file || $2 == "*" file) { count++ } END { print count+0 }' "$tmp_dir/checksums.txt")"
-  expected="$(awk -v file="$binary_name" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == file || $2 == "*" file) { print tolower($1) }' "$tmp_dir/checksums.txt")"
+  expected_count="$(awk -v file="$binary_name" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == file || $2 == "*" file) { count++ } END { print count+0 }' "$tmp_dir/checksums.txt")"
+  expected="$(awk -v file="$binary_name" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == file || $2 == "*" file) { print tolower($1) }' "$tmp_dir/checksums.txt")"
   actual="$(sha256_file "$tmp_dir/$binary_name" 2>/dev/null || true)"
   if [[ "$expected_count" != "1" || -z "$expected" || "$expected" != "$actual" ]]; then
     rm -rf "$tmp_dir"

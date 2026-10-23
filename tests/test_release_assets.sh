@@ -287,8 +287,14 @@ test_workflows() {
 # `install-proxy.sh update` reads checksums.txt. Do not edit.
 V09_COUNT_AWK='$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }'
 V09_SHA_AWK='$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }'
-v09_count() { awk -v asset="$1" "$V09_COUNT_AWK" "$2"; }
-v09_sha() { awk -v asset="$1" "$V09_SHA_AWK" "$2"; }
+# The scripts must also run on mawk 1.3.4 20200120 (Debian 12's default awk),
+# which has no {n} interval expressions: the same predicate, spelled with
+# length() instead. checksum_assertions uses this form so the test runs there.
+PORT_PRED='length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/'
+PORT_COUNT_AWK="$PORT_PRED"' && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }'
+PORT_SHA_AWK="$PORT_PRED"' && ($2 == asset || $2 == "*" asset) { print tolower($1) }'
+v09_count() { awk -v asset="$1" "$PORT_COUNT_AWK" "$2"; }
+v09_sha() { awk -v asset="$1" "$PORT_SHA_AWK" "$2"; }
 
 sha_of() { sha256sum "$1" | awk '{print $1}'; }
 
@@ -329,11 +335,6 @@ checksum_assertions() {
 
 test_checksums_synthetic() {
   local d="$TEST_DIR/dist" sums bad_sums b
-  # Precondition, not a skip: the v0.9 parser below uses {64}. mawk 1.3.4
-  # 20200120 (Debian 12's default awk) does not implement interval expressions
-  # and would report 0 entries for every file, hiding the real result.
-  expect "awk supports interval expressions ({n}), which the v0.9 parser needs" \
-    bash -c '[[ "$(echo aaaa | awk "/^[a]{4}\$/ { print \"y\" }")" == y ]]'
   expect "the marked release.yml command can be extracted" test -n "$(extract_checksums_command)"
   expect "the extracted command writes checksums.txt in the current directory" \
     bash -c '[[ "$1" == *"> checksums.txt" ]]' _ "$(extract_checksums_command)"
@@ -362,11 +363,49 @@ test_checksums_synthetic() {
       test "$(v09_count "$b" "$bad_sums")" = 0
   done
 
-  # the v0.10 install-proxy.sh update still reads checksums the same way.
-  expect "install-proxy.sh still parses checksums.txt with the v0.9 awk (count)" \
-    grep -qF -- "$V09_COUNT_AWK" "$REPO_ROOT/install-proxy.sh"
-  expect "install-proxy.sh still parses checksums.txt with the v0.9 awk (sha)" \
-    grep -qF -- "$V09_SHA_AWK" "$REPO_ROOT/install-proxy.sh"
+  # the scripts read checksums.txt with the v0.9 semantics, portably.
+  local sc
+  for sc in "${SCRIPTS[@]}"; do
+    expect "$sc: checksum awk programs avoid {n} interval expressions" \
+      bash -c '! grep -F "xdigit:]]{" "$1" | grep -q awk' _ "$REPO_ROOT/$sc"
+    expect "$sc: checksum awk programs use the portable 64-hex predicate" \
+      bash -c '[[ "$(grep -cF -- "$2" "$1")" -ge 2 ]]' _ "$REPO_ROOT/$sc" "$PORT_PRED"
+  done
+}
+
+# The portable predicate is the v0.9 predicate: same answers on a table of
+# lines. The v0.9 text itself needs interval support, so it only takes part
+# when this awk has it; the expected answers are fixed either way.
+test_checksum_predicate() {
+  local h64 f="$TEST_DIR/pred.txt" n
+  h64="$(printf 'a%.0s' $(seq 1 64))"
+  {
+    echo "$h64  good"
+    echo "${h64^^}  upper"
+    echo "$h64 *star"
+    echo "${h64:1}  short63"
+    echo "${h64}a  long65"
+    echo "${h64/a/g}  nothex"
+    echo "$h64  good"
+    echo "$h64  dist/path"
+  } > "$f"
+  expect "portable predicate: good appears twice -> 2" test "$(awk -v asset=good "$PORT_COUNT_AWK" "$f")" = 2
+  expect "portable predicate: upper-case hex accepted (lower-cased on output)" \
+    test "$(awk -v asset=upper "$PORT_SHA_AWK" "$f")" = "$h64"
+  expect "portable predicate: *name accepted" test "$(awk -v asset=star "$PORT_COUNT_AWK" "$f")" = 1
+  for n in short63 long65 nothex dist/path path; do
+    expect "portable predicate: $n -> 0" test "$(awk -v asset="$n" "$PORT_COUNT_AWK" "$f")" = 0
+  done
+  if [[ "$(echo aaaa | awk '/^[a]{4}$/ { print "y" }')" == y ]]; then
+    for n in good upper star short63 long65 nothex; do
+      expect "v0.9 text and portable predicate agree on $n" \
+        test "$(awk -v asset="$n" "$V09_COUNT_AWK" "$f")" = "$(awk -v asset="$n" "$PORT_COUNT_AWK" "$f")"
+    done
+    expect "v0.9 text and portable predicate agree on the extracted SHA" \
+      test "$(awk -v asset=upper "$V09_SHA_AWK" "$f")" = "$(awk -v asset=upper "$PORT_SHA_AWK" "$f")"
+  else
+    echo "NOTE: this awk has no interval expressions; the v0.9 text cannot be compared here"
+  fi
 }
 
 # ---------------------------------------------------------------------------

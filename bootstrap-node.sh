@@ -396,8 +396,8 @@ fetch_candidate() {
   download "$base/$asset" "$CAND_BIN" || die "Failed to download $asset"
   download "$base/checksums.txt" "$tmp_sums" || die "Failed to download checksums.txt"
 
-  expected_count="$(awk -v file="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == file || $2 == "*" file) { count++ } END { print count+0 }' "$tmp_sums")"
-  expected="$(awk -v file="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == file || $2 == "*" file) { print tolower($1) }' "$tmp_sums")"
+  expected_count="$(awk -v file="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == file || $2 == "*" file) { count++ } END { print count+0 }' "$tmp_sums")"
+  expected="$(awk -v file="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == file || $2 == "*" file) { print tolower($1) }' "$tmp_sums")"
   if [[ "$expected_count" != "1" || -z "$expected" ]]; then
     die "checksums.txt must contain exactly one entry for $asset (found $expected_count)"
   fi
