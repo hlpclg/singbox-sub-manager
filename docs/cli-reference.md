@@ -2,7 +2,7 @@
 
 本页收录 `proxyctl` 严格模式命令的参数全集（规格 §4.5）。当前包含 `node service install|reinstall|show`（Task 7）、`uninstall`、`recover`（Task 8），以及 `node publish` 和带 `--publish` 的 `node add/edit/enable/disable/remove`（Task 9）。`bootstrap-node.sh` 首次安装模式的参数见文末（Task 11）；升级模式（`--upgrade`）见文末（Task 12）。
 
-旧的 `node list/add/edit/remove/enable/disable/migrate`（不带 `--publish`）解析、输出和 `--nodes PATH` 语义不变，不在本页范围内；用法见 `proxyctl node <子命令> --help` 或 README。
+旧的 `node list/add/edit/remove/enable/disable/migrate`（不带 `--publish`）解析、输出和 `--nodes PATH` 语义不变，不在本页范围内；用法见本页末尾“旧版兼容：节点管理与订阅合并”。
 
 ## 严格模式规则（适用于本页全部命令）
 
@@ -219,3 +219,163 @@ sudo bash bootstrap-node.sh --upgrade
 - 取消：替换开始之前收到 SIGINT/SIGTERM 返回 1；替换开始之后、验证完成之前收到按失败处理（4 或 5）；验证完成之后收到仍返回 0。
 - 锁：L1（30 秒）后 L3（10 秒）；兼容检查期间父进程只保留 L1。
 - 完整流程、旧副本、人工回滚步骤和 SIGKILL 后的修复见 [reality-node.md](reality-node.md) 的“升级”一节。
+
+## 旧版兼容：节点管理与订阅合并
+
+以下内容原在 README，随首页精简迁入。
+
+### FlClash 使用方法
+
+1. 打开 FlClash
+2. 进入订阅管理
+3. 添加脚本输出的 `clash.yaml` 地址
+4. 更新订阅
+5. 开启 TUN
+6. 模式选择 `Rule`
+7. 在 `节点选择` 中选择 `自动选择`（测速）、`故障转移`（节点故障时自动切换）或指定节点
+
+配置默认包含：
+
+- TUN mixed stack
+- Fake-IP DNS
+- 自动路由
+- DNS 劫持
+- 国内直连
+- 国外代理
+- Google Play 下载修正规则
+- 3 个基础策略组：`节点选择`（手动选择）、`自动选择`（url-test 测速）、`故障转移`（fallback 故障转移）
+- 11 个服务策略组，可在客户端单独为每个服务切换出口：
+  - 默认出口为 `节点选择`：`AI服务`（OpenAI、Claude）、`GitHub`、`流媒体`（YouTube、Netflix、Spotify）、`Disney`、`TikTok`、`Telegram`、`Google`
+  - 默认出口为 `DIRECT`：`Bilibili`、`Apple`、`Microsoft`、`游戏`
+
+### Shadowrocket 使用方法
+
+1. 打开 Shadowrocket
+2. 添加订阅
+3. 粘贴脚本输出的 `sr.txt` 地址
+4. 更新订阅
+5. 选择节点并连接
+
+`sr.txt` 每行包含一个 Hysteria2 节点 URI。
+
+### 合并多个节点
+
+订阅中心的节点列表保存在：
+
+```bash
+/etc/singbox-sub-manager/nodes.conf
+```
+
+在每台节点上安装完成后，收集该节点的公网 IP、Hysteria2 password、Salamander obfs password 和 SNI；然后在订阅中心编辑此文件：
+
+```bash
+nano /etc/singbox-sub-manager/nodes.conf
+```
+
+格式：
+
+```text
+# 注释行会被忽略
+JP-HY2|1.1.1.1|443|PASSWORD|OBFS_PASSWORD|www.bing.com
+SG-HY2|2.2.2.2|443|PASSWORD|OBFS_PASSWORD|www.bing.com
+US-HY2|3.3.3.3|443|PASSWORD|OBFS_PASSWORD|www.bing.com
+```
+
+字段说明：
+
+```text
+节点名 | 服务器IP或域名 | 端口 | Hysteria2密码 | 混淆密码 | SNI
+```
+
+节点名不得与内置策略组名或 `DIRECT`、`REJECT` 相同——即 `节点选择`、`自动选择`、`故障转移`、`AI服务`、`GitHub`、`流媒体`、`Disney`、`TikTok`、`Telegram`、`Google`、`Bilibili`、`Apple`、`Microsoft`、`游戏`、`DIRECT`、`REJECT`，共 16 个保留名。已启用节点使用其中任一名称时，`merge` 与 `validate` 会失败并在输出中指出冲突的节点名；禁用节点不受影响。
+
+重新运行安装脚本会读取 `nodes.conf` 并生成订阅，同时保留当前节点的 token 和密钥：
+
+```bash
+sudo ./install-proxy.sh sub.example.com admin@example.com
+```
+
+也可以单独运行 `merge-nodes.sh`，避免重装服务：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/merge-nodes.sh \
+  -o merge-nodes.sh
+chmod +x merge-nodes.sh
+sudo ./merge-nodes.sh
+```
+
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.10.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+
+`proxyctl` 校验与执行逻辑：
+- 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
+- 固定路径文件缺失或任一校验不匹配时，从 GitHub Release 下载对应架构二进制并校验 SHA256 及 `version` 输出；
+- PATH 中其他同名 `proxyctl` 不会被复用或执行；
+- `install-proxy.sh` 若无法安装带 `monitor` 支持且通过校验的 `proxyctl` 会失败退出，不会启用监控 timer；
+- `merge-nodes.sh` 无内置渲染器回退，若无法获取校验通过的 `proxyctl` 会明确报错退出。
+
+自 v0.10.0 起，`merge-nodes.sh` 整个运行期间会依次获取安装锁和恢复锁（各最长等待 30 秒），从而与 `install-proxy.sh`、`backup`、`restore`、`monitor` 串行；取到两把锁后如果发现遗留的订阅发布事务，会拒绝执行并提示先运行 `proxyctl node publish --recover`。
+
+两个命令都会覆盖生成：
+
+```text
+/var/www/proxy-sub/<token>/clash.yaml
+/var/www/proxy-sub/<token>/sr.txt
+```
+
+不需要重启 Caddy，客户端更新订阅即可。
+
+### 节点管理（proxyctl node）
+
+v0.3 起可用 `proxyctl` 管理 `/etc/singbox-sub-manager/nodes.conf`，无需手改文件。
+
+```bash
+# 列出所有节点（含启用状态）
+proxyctl node list
+
+# 新增节点（缺省字段在交互终端下会追问；密码不回显）
+proxyctl node add --name JP-HY2 --server 1.2.3.4 --port 443 \
+  --password 'xxx' --obfs-password 'yyy' --sni www.bing.com
+
+# 新增 VLESS Reality 节点
+proxyctl node add --name JP-Reality --type vless-reality --server 1.2.3.4 --port 443 \
+  --uuid <uuid> --public-key <reality-public-key> --short-id '' --sni www.microsoft.com
+
+# 修改字段（只改传入项；--name 可改名）
+proxyctl node edit JP-HY2 --port 8443
+
+# 启用 / 禁用（禁用的节点保留在文件中，但不进订阅）
+proxyctl node enable JP-HY2
+proxyctl node disable JP-HY2
+
+# 删除
+proxyctl node remove JP-HY2
+
+# 生成订阅（仅包含启用节点）
+proxyctl subscription build --nodes /etc/singbox-sub-manager/nodes.conf --output DIR
+```
+
+节点文件权限为 `0600`，每次修改前自动备份为 `nodes.conf.bak`。
+
+自 v0.10.0 起，写入**默认** `nodes.conf`（即不带 `--nodes` 或 `--nodes` 指向同一文件）的 `add/edit/enable/disable/remove/migrate` 会先获取一把主机级锁，避免与 `install-proxy.sh`、`bootstrap-node.sh --upgrade`、订阅发布等操作交叉写入；取锁后如果发现本机存在 Reality 节点实例的痕迹，或存在遗留的订阅发布事务，命令会拒绝执行并返回失败，不做任何修改（这类主机应改用 `proxyctl node service ...` 管理，而不是本节的订阅中心 CRUD）。用 `--nodes PATH` 指向其他文件的调用不受影响，行为与之前完全一致。
+
+#### 从旧格式迁移
+
+v0.2 的竖线格式（`名称|服务器|端口|密码|obfs|sni`）仍可被 `subscription build` 读取，但节点管理命令要求先迁移一次：
+
+```bash
+proxyctl node migrate
+```
+
+迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。也可以在上面的交互菜单里按提示完成：菜单会先显示备份位置，确认后才迁移。
+
+#### 添加 VLESS Reality 节点
+
+VLESS Reality 只支持分节格式；仍在用竖线格式的机器必须先执行一次：
+
+```bash
+proxyctl node migrate
+```
+
+再用 `proxyctl node add --type vless-reality ...` 添加节点。VLESS Reality 节点的 `flow`（`xtls-rprx-vision`）、`fingerprint`（`chrome`）和传输方式（裸 TCP）是固定值，不支持自定义。
+
+**版本兼容警告**：一旦 `nodes.conf` 写入 `TYPE=` 字段（执行过 `node migrate`、`node add` 或任何其他节点管理命令之后），就不能再被 更早版本 的 `proxyctl` 或 `merge-nodes.sh` 解析——它们会报 `unknown key "TYPE"` 并失败。升级到 v0.9.0 后，必须同时把 `install-proxy.sh`/`merge-nodes.sh` 换成 v0.9.0 tag 下的版本，不要混用旧脚本。

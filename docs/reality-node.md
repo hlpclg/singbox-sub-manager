@@ -1,6 +1,6 @@
-# Reality 节点（施工中，v0.10）
+# Reality 节点（v0.10）
 
-本文档记录 v0.10 独立 Reality 节点功能的实现进度。`proxyctl node service install|reinstall|show`（Task 7）与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`（Task 8）已经可用；交互菜单（`sudo proxyctl node`，Task 10）也已可用；bootstrap 首装脚本（`bootstrap-node.sh`，Task 11）已经可用；`--upgrade` 升级模式与从旧副本人工回滚的步骤（Task 12）已经可用。参数全集见 [docs/cli-reference.md](cli-reference.md)。
+本文档记录 v0.10 独立 Reality 节点功能与运维规范。`proxyctl node service install|reinstall|show` 与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`；交互菜单（`sudo proxyctl node`）；bootstrap 首装脚本（`bootstrap-node.sh`）；`--upgrade` 升级模式与从旧副本人工回滚的步骤均已就绪。参数全集见 [docs/cli-reference.md](cli-reference.md)。
 
 完整设计见 [v0.10 定稿规格](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)；已完成 Task 的真实验证证据见 [reality-node-validation.md](reality-node-validation.md)。
 
