@@ -238,9 +238,9 @@ func extractSingBoxBinary(t *testing.T, tarPath string, a pinnedAsset) string {
 // real upstream release: SHA256 of both tarballs, and single-member
 // extraction with type/size enforcement for both architectures. Version
 // token match and `sing-box check` are additionally run for the host
-// architecture (amd64 in this environment); arm64 execution is not
-// available here (see docs/reality-node-validation.md) and is not
-// claimed.
+// architecture (amd64 or arm64 on linux); the other architecture's binary
+// cannot be executed on the host, so only its hash and extraction are
+// verified (see docs/reality-node-validation.md).
 func TestPinnedReleaseProbe(t *testing.T) {
 	for _, a := range pinnedAssets {
 		a := a
@@ -269,14 +269,12 @@ func TestPinnedReleaseProbe(t *testing.T) {
 			}
 		})
 	}
-	if runtime.GOARCH != "amd64" || runtime.GOOS != "linux" {
-		t.Skip("blocked: requires a real linux/amd64 target to run sing-box check")
-	}
+	host := hostPinnedAsset(t)
 
 	// Extracted directly in the parent test (not a subtest) so the
 	// binary survives past this point: a subtest's t.TempDir() is
 	// removed when that subtest returns.
-	amd64Bin := extractSingBoxBinary(t, downloadTarball(t, pinnedAssets[0]), pinnedAssets[0])
+	hostBin := extractSingBoxBinary(t, downloadTarball(t, host), host)
 
 	t.Run("check_spec_config", func(t *testing.T) {
 		id := newTestIdentity(t)
@@ -290,11 +288,29 @@ func TestPinnedReleaseProbe(t *testing.T) {
 			LocalCIDRs:    nil,
 		})
 		cfgPath := writeJSON(t, cfg)
-		out, err := exec.Command(amd64Bin, "check", "-c", cfgPath).CombinedOutput()
+		out, err := exec.Command(hostBin, "check", "-c", cfgPath).CombinedOutput()
 		if err != nil {
 			t.Fatalf("sing-box check rejected the spec §8.1 config: %v\n%s", err, out)
 		}
 	})
+}
+
+// hostPinnedAsset returns the pinned release asset for the host
+// architecture. It skips, with a "blocked" reason, only when the host
+// cannot execute any pinned binary (non-linux, or an architecture with no
+// pinned asset); amd64 and arm64 linux hosts both run the full probes.
+func hostPinnedAsset(t *testing.T) pinnedAsset {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("blocked: requires a real linux target to execute the pinned binary (host %s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+	for _, a := range pinnedAssets {
+		if a.arch == runtime.GOARCH {
+			return a
+		}
+	}
+	t.Skipf("blocked: no pinned sing-box asset for linux/%s", runtime.GOARCH)
+	return pinnedAsset{}
 }
 
 // systemdAnalyzeAvailable reports whether `systemd-analyze verify` can
@@ -644,13 +660,11 @@ func nonceServer(t *testing.T, port int) (nonce string, close func()) {
 //
 // This exercises the real protocol end to end but not the systemd unit
 // wrapper (blocked in this environment, see TestRealityUnitProbe) and
-// runs on amd64 only (see TestPinnedReleaseProbe).
+// runs against the host architecture's pinned binary (amd64 or arm64).
 func TestRealityDataPathProbe(t *testing.T) {
-	if runtime.GOARCH != "amd64" || runtime.GOOS != "linux" {
-		t.Skip("blocked: requires a real linux/amd64 target to execute the pinned binary")
-	}
-	tarPath := downloadTarball(t, pinnedAssets[0])
-	bin := extractSingBoxBinary(t, tarPath, pinnedAssets[0])
+	host := hostPinnedAsset(t)
+	tarPath := downloadTarball(t, host)
+	bin := extractSingBoxBinary(t, tarPath, host)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -699,11 +713,9 @@ func TestRealityDataPathProbe(t *testing.T) {
 // and the whole config is confirmed accepted by `sing-box check` with
 // the real pinned binary. See docs/reality-node-validation.md.
 func TestRealityRoutingProbe(t *testing.T) {
-	if runtime.GOARCH != "amd64" || runtime.GOOS != "linux" {
-		t.Skip("blocked: requires a real linux/amd64 target to execute the pinned binary")
-	}
-	tarPath := downloadTarball(t, pinnedAssets[0])
-	bin := extractSingBoxBinary(t, tarPath, pinnedAssets[0])
+	host := hostPinnedAsset(t)
+	tarPath := downloadTarball(t, host)
+	bin := extractSingBoxBinary(t, tarPath, host)
 
 	t.Run("static_reject_list_and_check", func(t *testing.T) {
 		id := newTestIdentity(t)
