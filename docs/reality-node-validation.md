@@ -64,7 +64,7 @@ Go 测试对应：`TestPinnedReleaseProbe`（`internal/realitynode/probe_integra
 - `sing-box version`：输出首行按空白分词后，token 集合精确包含 `1.14.1`（不是子串匹配）。
 - 用规格 §8.1 的精确 JSON 结构（含真实生成的身份）执行 `sing-box check`，通过。
 
-arm64 二进制**只验证了哈希与归档提取**；`version`/`check` 执行在此 amd64 宿主上不可行，
+arm64 二进制**在本容器中只验证了哈希与归档提取**（arm64 真机的执行结果见文末“真机补充实测”）；`version`/`check` 执行在此 amd64 宿主上不可行，
 测试中以 `t.Logf` 显式记录为阻塞，不计入通过项。
 
 ## 2. 固定 systemd unit 模板（部分真实：静态验证）
@@ -185,14 +185,14 @@ $ bash tests/test_reality_probe.sh --bogus           # 未知参数，usage，ex
 
 ## 6. 未完成/阻塞事项一览
 
-| 项目 | 状态 | 原因 | 由谁补齐 |
+| 项目 | 状态 | 说明 | 由谁补齐 |
 |---|---|---|---|
-| Debian 12 / Ubuntu 22.04 真实 systemd 一次性 VM 覆盖 | 阻塞 | 本容器非 systemd PID 1，无法提供多 OS VM | 计划 Task 13 |
-| arm64 真机执行（version/check/握手/路由） | 阻塞 | 无 arm64 硬件或可信仿真；只验证了哈希与归档提取 | 计划 Task 13 |
-| unit 真实 enable/start/ActiveState | 阻塞 | 同上；已用 `systemd-analyze verify` 做静态替代 | 计划 Task 13 |
-| RFC1918/100.64.0.0/10/169.254.0.0/16/IPv6 ULA/link-local/IMDS 动态拒绝验证 | 阻塞 | 容器网络层对非自有地址返回伪连通性，无法作为可信对照目标 | 计划 Task 13（真实网络拓扑） |
-| 域名解析到私网地址的拒绝 | 未验证 | 需要可控 DNS 基础设施，超出本轮范围 | 后续实测 |
-| Go 命令的 Go 1.22 容器合规性 | 不合规 | 本环境无 Docker daemon | 需在有 Docker 的环境重跑，或接受本记录的例外 |
+| Debian 12 / Ubuntu 22.04 / 24.04 真实 systemd VM 覆盖 | 部分完成 | Debian 12 amd64 与 Ubuntu 24.04.5 amd64 已跑四个探针（见“真机补充实测”）；Ubuntu 22.04 只验证了订阅中心角色，节点侧与探针未跑，用户已接受该缺口 | 已接受缺口 |
+| arm64 真机执行（version/check/握手/路由） | 已完成 | Ubuntu 24.04.5 aarch64 真机四个探针全部通过且无 SKIP；探针改为按主机架构选择（提交 `f1734a8`） | 无 |
+| unit 真实 enable/start/ActiveState | 部分完成 | 节点 B、C 在 `proxyctl node service install` 后 `systemctl is-active proxyctl-reality` 为 `active`；节点 A 未记录 `is-active`，以 FlClash 出口 IP 间接证明服务运行；只观察了 ActiveState，没有检查 `is-enabled`；`TestRealityUnitProbe`（`systemd-analyze verify`，静态）在三台真机通过 | 无 |
+| RFC1918/100.64.0.0/10/169.254.0.0/16/IPv6 ULA/link-local/IMDS 动态拒绝验证 | 未完成 | `TestRealityRoutingProbe` 本身不覆盖这些目标（只静态断言规则存在并通过 `check`）；真机经客户端的间接测试证据不足，见 §14.5 第 3 步 | 需要新的服务端侧验证（例如私网靶子 + 访问日志），尚未设计 |
+| 域名解析到私网地址的拒绝 | 未验证 | 需要可控 DNS 基础设施 | 后续实测 |
+| Go 命令的 Go 1.22 容器合规性 | 已满足（本轮） | 本轮所有构建、`go vet`、`gofmt`、`go test -race ./...` 与探针编译均在 `golang:1.22`（aarch64 容器）中执行；§1–§5 的历史记录仍是 Go 1.24 的例外 | 无 |
 
 ## 结论
 
@@ -202,6 +202,8 @@ $ bash tests/test_reality_probe.sh --bogus           # 未知参数，usage，ex
 静态 `systemd-analyze verify` 确认。多 OS/多架构的真实 systemd 生命周期覆盖，以及非回环私网
 目标的动态拒绝验证，仍然阻塞，未被冒充为已完成——这两类差距需要计划 Task 13 的真实一次性
 VM 环境补齐。**本次未创建任何生产生命周期代码，未标记本 Task 完成，未进入 Task 2。**
+
+> 2026-11-02 更新：上述“多 OS/多架构真实 systemd 覆盖”已部分补齐（见文末“真机补充实测”）：Debian 12 amd64、Ubuntu 24.04.5 amd64、Ubuntu 24.04.5 aarch64 的探针通过（节点 B 首轮 `TestRealityUnitProbe` 因缺夹具失败，补夹具后通过，见探针结果表）。非回环私网目标的动态拒绝验证仍未完成。
 
 ---
 
@@ -250,18 +252,80 @@ CI 中 `tests/test_v010_flow.sh` 的真实文件系统区段会打印明确的 S
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| 真机：Debian 12 amd64 节点机安装 Reality 服务（systemd unit active/enabled，TCP 443 监听，退出码 0） | 用户报告已通过 | 无原始命令输出、被测提交/二进制、`proxyctl`/sing-box 版本记录；本次文档审查未复核 |
-| 真机：Ubuntu 24.04 amd64 订阅中心 `node add --publish` 注册并发布 | 用户报告已通过 | 同上，无原始记录 |
-| 真机：FlClash 拉取订阅、握手成功、出口 IP 等于节点机公网 IP | 用户报告已通过 | 同上，无原始记录 |
-| 规格 §14.5 第 3 步各受限目标（IMDS、本机其他端口、`0.0.0.0:22`、`<server>:22`、IPv6 `fd00:ec2::254`、解析到私网的域名）经节点的动态拒绝 | **未完成** | Task 1 遗留的动态拒绝验证仍未补 |
-| 真机：卸载、disable/enable、重装、`uninstall --purge`、角色菜单 | **未完成** | 没有真机记录；仅有容器内 `test_v010_flow.sh` 覆盖 |
-| 规格 §14.5 全六步闭环 | **未完成** | 由以上缺口决定；不得作为 Task 14 的“流程稳定”依据，需用户补记录或明确接受缺口 |
-| Debian 12 / Ubuntu 22.04 / 24.04 多 OS 真实 VM、arm64 真机 | **未完成** | 仅有 amd64 单点报告；arm64 由 qemu 与容器测试覆盖 |
-| 真实 GitHub Release 下载 `bootstrap-node.sh` 资产 | **未完成** | v0.10.0 未发布 |
+| 第 1 步：订阅中心 `proxyctl node migrate` | 部分 | 订阅中心（Ubuntu 22.04）已是分节格式，返回 `already in sectioned format; nothing to do`，退出码未记录；没有走到真正的 legacy 迁移路径，该路径只有容器内 `test_v010_flow.sh` 覆盖 |
+| 第 2 步：节点机安装、中心注册、FlClash 出口 | 已通过（两台） | Debian 12 amd64 与 Ubuntu 24.04.5 amd64：`install` 退出码 0；FlClash 选中节点后 `curl https://ifconfig.me` 返回节点公网 IP（节点 B 另有 `curl -x socks5h://… https://ifconfig.me` 退出码 0）；`is-active` 仅节点 B 记录为 `active`；中心 `add` 的退出码未记录 |
+| 第 3 步：受限目标经节点的动态拒绝 | **未完成** | 仅有间接证据：IMDS 在 FlClash 连接记录中经节点发出 78B、收到 0B；`127.0.0.1:28080` 的 curl 返回 Empty reply 且节点监听器无 GET。其余目标无有效证据；`Empty reply` 对没有任何规则命中的公网端口同样出现，不能区分拒绝与不通 |
+| 第 4 步：uninstall、disable、reinstall、enable | 用户报告已通过 | Ubuntu 24.04.5 amd64；用户确认 1–5 步结果正确，无原始输出记录 |
+| 第 5 步：`uninstall --purge` | 已通过（Debian 12 amd64） | 规格 §5.1 资产路径全部不存在，事务区与墓碑不存在；`/usr/local/bin/proxyctl` 与 `.sha256` 保留（0755/0644，root）；purge 后 `show` 退出码 1；purge 自身退出码未记录；`/var/lib/proxyctl-bootstrap/` 不存在 |
+| 第 6 步：角色菜单与中心拒绝 bootstrap | 已通过 | 订阅中心、Debian 12 节点机、两台新节点机的角色行与不可用原因均符合预期；订阅中心上 `sudo bash bootstrap-node.sh` 退出码 1 并列出判定依据 |
+| 规格 §14.5 全六步闭环 | **未完成** | 第 3 步未完成，第 1 步未走真实迁移；不得作为 Task 14 的“流程稳定”依据，需用户补记录或明确接受缺口 |
+| Debian 12 / Ubuntu 22.04 / 24.04 多 OS、arm64 真机 | 部分完成 | Debian 12 amd64、Ubuntu 24.04.5 amd64、Ubuntu 24.04.5 aarch64 已验证；Ubuntu 22.04 节点侧未验证（已接受缺口） |
+| 真实 GitHub Release 下载 `bootstrap-node.sh` 与 `proxyctl` | **未完成** | v0.10.0 未发布；真机上的 `proxyctl` 均为在 `golang:1.22` 容器内以 `-X main.Version=v0.10.0` 本地交叉编译后手动放置，`bootstrap-node.sh` 从分支拷贝，没有走“从 Release 下载并校验”的首装分支 |
 | 真实终端 Ctrl-C | **未完成** | 信号路径由 `kill -INT` 与 context 取消测试覆盖 |
+
 
 ## 本 Task 发现的问题（未修，范围外或需决策）
 
 - **`go version -m` 无法校验 `-X main.Version`**：release 构建使用 `-trimpath`，Go 在 `-trimpath` 下不把 `-ldflags` 写进构建信息（golang/go#52372），所以计划里“arm64 用 `go version -m` 检查 `-X main.Version`”无法成立。改为在 release 里安装 `qemu-user-static`，用 qemu-user 真正运行 arm64 二进制并比较 `version` 的输出。
 - **Debian 12 默认 awk（mawk 1.3.4 20200120）不支持 `{64}` 区间表达式（已修复）**：`install-proxy.sh`、`merge-nodes.sh`、`bootstrap-node.sh` 校验 `checksums.txt` 的 awk 原先用 `$1 ~ /^[[:xdigit:]]{64}$/`，在该 awk 上对任何文件匹配 0 条。已改为语义等价的 `length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/`（`*name` 与大小写处理不变，仍要求恰好一条匹配）。`tests/test_release_assets.sh` 新增静态断言（三个脚本不含 `{n}` 区间）与谓词等价表，在 mawk 1.3.4 20200120 和 gawk 5.2.1 下均通过；v0.9 已发布脚本无法修复，其 `update` 在 Debian 12 上仍受此限制。
 - **既有断言放宽（已获用户批准）**：`bootstrap-node.sh` 的 `setsid --wait` 修改（C1）使 `tests/test_bootstrap_upgrade.sh` 里既有断言 `the compatibility check child gets fds 8 and 9 closed` 的正则 `setsid timeout .*node service show.*8>&- 9>&-` 不再匹配；已批准仅把它放宽为 `setsid( --wait)? timeout ...`，fd 关闭的断言意图不变，别的断言不动。
+
+
+---
+
+# v0.10 真机补充实测（2026-11-01 至 2026-11-02）
+
+脱敏：不记录 uuid、公钥、short_id、公网地址和私钥。被测对象：`feature/v0.10.0`（探针改动前 `07b35da`，探针改动 `f1734a8`（最初提交为 `ee2d7ca`，已被 amend，代码树相同））。所有 Go 产物由 `golang:1.22` 容器构建（宿主为 Apple 芯片，容器 aarch64，交叉编译 `CGO_ENABLED=0 -trimpath`）。
+
+## 被测机器与产物
+
+| 机器 | 系统/架构 | 内存 | 用途 |
+|---|---|---|---|
+| 订阅中心 | Ubuntu 22.04（在用的生产订阅中心，未记录架构） | 未记录 | 中心角色、`migrate`、`add --publish` 注册、拒绝 bootstrap；**未跑探针** |
+| 节点 A | Debian 12 amd64 | — | 安装、探针、`purge` |
+| 节点 B | Ubuntu 24.04.5 amd64（先在 412MB 实例上 OOM，更换配置后安装成功） | 更换后未记录 | 安装、探针、uninstall→disable→reinstall→enable |
+| 节点 C | Ubuntu 24.04.5 aarch64 | 约 1.8GB | 探针、安装 |
+
+| 产物 | SHA256 |
+|---|---|
+| `proxyctl` linux/amd64（`-X main.Version=v0.10.0`，源码 `07b35da`） | `1f487352ae5abbedd564d3cdbd2b3890ec1faf17f27d0773b61a51a0f32a065a` |
+| `proxyctl` linux/arm64（同上） | `ea96cacb19ef5f68a174e702c023433edd56ecc509240fac0c8abaec055bcc7e` |
+| `realitynode.test` amd64（探针改动前，`07b35da`） | `02212c8c2f377976499c6b43283679f3df077090c8913030854563f0809f9842` |
+| `realitynode.test` arm64（由与 `f1734a8` 相同的工作区代码树构建（构建时尚未提交）） | `f2628ff6aee553a0642ac57efbe1cdec88d2dd79601c89815b72ee22906cc4ca` |
+
+`proxyctl` 与 `.sha256` 手动放置（`install -m 0755` / `0644`，root:root）；`.sha256` 是只含小写哈希的一行，与 `bootstrap-node.sh` 写入的格式一致。
+
+## 探针结果
+
+命令：`sudo ./realitynode.test -test.run '^Test(PinnedReleaseProbe|RealityUnitProbe|RealityDataPathProbe|RealityRoutingProbe)$' -test.v`，工作目录需包含 `testdata/probe/reality.service`（首次在没有夹具的目录运行时 `TestRealityUnitProbe` 因 `open testdata/probe/reality.service` 失败，这是运行环境问题，补夹具后通过）。
+
+| 机器 | `PinnedReleaseProbe` | `RealityUnitProbe` | `RealityDataPathProbe` | `RealityRoutingProbe`（4 子测试） | SKIP |
+|---|---|---|---|---|---|
+| 节点 A Debian 12 amd64 | 通过（amd64 执行 `version` 与 `check_spec_config`；arm64 仅哈希与提取） | 通过 | 通过 | 通过 | 无 |
+| 节点 B Ubuntu 24.04.5 amd64 | 同上 | 通过 | 通过 | 通过 | 无 |
+| 节点 C Ubuntu 24.04.5 aarch64（探针改动前） | arm64 子测试 `version` 通过；`check_spec_config` 因 amd64 限制 SKIP，整体标 SKIP | 通过 | **SKIP** | **SKIP** | 3 个，原因 `requires a real linux/amd64 target` |
+| 节点 C Ubuntu 24.04.5 aarch64（`f1734a8`） | 通过（arm64 执行 `version` 与 `check_spec_config`） | 通过 | 通过 | 通过 | 无 |
+
+同一探针在 `golang:1.22` aarch64 容器中也无 SKIP 通过。
+
+`TestRealityRoutingProbe` 的四个子测试是：静态拒绝列表与 `check`、自检端口放行、回环其他端口被拒、`0.0.0.0` 绑定被拒。它**不**动态覆盖 RFC1918、100.64.0.0/10、169.254.0.0/16（含 IMDS）、IPv6 ULA/link-local、解析到私网地址的域名。
+
+## arm64 安装
+
+节点 C：`proxyctl node service install` 退出码 0；`systemctl is-active proxyctl-reality` 为 `active`；私有 `sing-box` 为 `ELF 64-bit LSB executable, ARM aarch64`（版本目录 `1.14.1`，动态链接）；`node service show` 退出码 0；`bootstrap-node.sh` 识别已有 `proxyctl` 后进入菜单并退出 0。
+
+## 发现
+
+1. **412MB 内存的实例上 `install` 被 OOM killer 杀掉**：`Killed`，退出码 137；`dmesg` 显示 `Out of memory: Killed process … (proxyctl) … anon-rss:197748kB`，机器总内存 412MB、无 swap。更换为更大配置后（内存未记录）安装退出码 0。规格与计划没有最低内存要求，是否补文档或改为流式处理需决策，**未修**。被杀之后的现场检查输出（事务区、`show`、`recover`）未记录，所以“SIGKILL 后可自愈”没有被验证；只能说明后续在更大内存的机器上安装未受影响。
+2. **节点自己的公网地址在拒绝列表中**：按 §8.1，`--server` 地址在拒绝列表中，所以经该节点访问它自己的公网地址（包括 SSH）预期会被拒绝。真机上观察到：FlClash 选中节点后 SSH 到该节点断开，切回直连后恢复；`<server>:22` 经节点的 curl 返回 `Empty reply`（与无规则命中的公网端口表现相同，不能单独证明是规则拒绝）。运维 SSH 需要直连规则或不经代理，应写入运维文档。
+3. **`instance.json` 中 `sni` 显示为链接格式**是聊天复制通道的渲染效果：`grep -c https`、`grep -c '\['` 均为 0，`"sni":"[a-z0-9.-]+"` 匹配 1 行。不是程序缺陷。
+4. FlClash 对回环/私网目标有自己的分流，客户端侧间接测试不能区分“规则拒绝”与“没到节点”，所以第 3 步需要服务端侧证据。
+
+## 剩余缺口
+
+- §14.5 第 3 步各受限目标的动态拒绝（需要服务端侧验证）。
+- 域名解析到私网地址的拒绝。
+- 真实 legacy→sectioned 的 `migrate` 路径（真机）。
+- 真实 GitHub Release 下载并校验的首装路径（v0.10.0 未发布）。
+- Ubuntu 22.04 节点侧与探针（已接受缺口）。
+- 第 4 步仅为用户报告，无原始输出。
