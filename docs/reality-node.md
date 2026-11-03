@@ -104,6 +104,7 @@ sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 - 修改后的私网拒绝列表只在 `install`/`reinstall` 时生成；网卡地址或 `--server` 解析结果变化后须重新执行一次 `reinstall`。
 - `reinstall` 不接受修改 `name`/`server`/`port`/`sni`；需要这些变化时先 `uninstall --purge` 再重新 `install`（公钥、UUID、short_id 会重新生成，订阅中心需要先 `remove` 旧节点再 `add`）。
 - `--export-backup` 归档没有受支持的导入或解压恢复方式，见上文。
+- 内存：下载 sing-box 时，`extractMember`（`internal/realitynode/download.go`）会把解包出来的整个 `sing-box` 成员（约 76–81 MB）先读入内存缓冲区再写盘，缓冲区扩容过程中旧缓冲区在被回收前仍占用内存，所以瞬时占用数倍于二进制本身（这是读代码得出的原因，未用内存分析工具实测）。真机上，总内存 412 MB、无 swap 的实例执行 `install` 时 `proxyctl` 内存涨到约 197 MB 被 OOM killer 杀掉（`Killed`，退出码 137）；总内存约 1.8 GB 的 arm64 实例上安装成功。**节点机建议至少 1 GB 内存**，该下限尚未在 1 GB 实例上实测确认。内存不足被杀之后，见 [troubleshooting.md](troubleshooting.md) 的“安装被 OOM killer 杀掉”。
 - 真实 systemd 上 uninstall/purge 的一个恢复窗口尚未验证，待 Task 13 真机验收：unit 文件已删除之后、`daemon-reload` 完成之前发生崩溃，或 `daemon-reload` 调用本身失败时，回滚的降级步骤会对已不存在的 unit 文件执行 `systemctl disable`，真实 systemd 可能拒绝，结果是返回 5（而不是 4 或 0），事务区和现场原样保留；处理方式见 [troubleshooting.md](troubleshooting.md) 中关于退出码 5 的通用做法。
 
 ## 首次安装（`bootstrap-node.sh`，Task 11，规格 §12）
