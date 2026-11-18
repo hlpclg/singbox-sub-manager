@@ -124,7 +124,7 @@ sudo bash bootstrap-node.sh
 执行顺序（先到先停，前面任何一步失败都不会进入下一步）：
 
 1. 解析自身参数（用法错误返回 2，早于 root 检查、加锁和网络）。
-2. 检查 root、OS（Debian 12、Ubuntu 22.04/24.04）、架构（amd64/arm64）。
+2. 检查 root、OS（Debian 12、Ubuntu 22.04/24.04/26.04）、架构（amd64/arm64）。
 3. 角色预检：订阅中心角色必须是“否”（`install.json`、`/var/lib/singbox-sub-manager/token`、默认 `nodes.conf` 三者都不存在）。角色是“是”或“不确定”（包括只剩其中一个文件，或没有 `install.json` 的旧订阅中心）一律返回 1，不下载，并提示订阅中心的升级使用 `install-proxy.sh update`；误创建在节点机上的 `nodes.conf` 删除后重试。
 4. 取 L1（`/run/lock/singbox-sub-manager.lock`，等待最长 30 秒，超时返回 1）。持锁期间复查角色、判定本机 `proxyctl`、必要时安装固定版本。L1 同时是共享二进制锁，期间 `install-proxy.sh`、`merge-nodes.sh`、`node service` 变更命令都会等待。
 5. exec 之前先关闭锁文件描述符，因此 `proxyctl node` / `node service install` 可以正常重新取锁并复查角色。

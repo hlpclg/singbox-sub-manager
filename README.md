@@ -31,6 +31,7 @@
 |---|---:|---|
 | Ubuntu | 22.04 LTS | 支持 |
 | Ubuntu | 24.04 LTS | 支持 |
+| Ubuntu | 26.04 LTS（含 26.04.1） | 支持 |
 | Debian | 12 | 支持 |
 
 当前版本使用 `apt` 安装依赖，因此暂不支持直接运行在以下系统：
@@ -82,7 +83,7 @@ US-HY2 ─┘
 
 需要准备：
 
-1. 一台 Ubuntu 22.04、Ubuntu 24.04 或 Debian 12 服务器
+1. 一台 Ubuntu 22.04、24.04、26.04 或 Debian 12 服务器
 2. 一个已经解析到服务器公网 IP 的域名
 3. root 权限或可使用 `sudo` 的用户
 4. AWS、Oracle Cloud 或其他云平台安全组已放行相应端口
@@ -127,7 +128,7 @@ sudo proxyctl node migrate
 
 ### 第二步：在独立节点机安装 VLESS Reality 服务
 
-在独立的节点机（Debian 12、Ubuntu 22.04/24.04）上执行两步首次安装：
+在独立的节点机（Debian 12、Ubuntu 22.04/24.04/26.04）上执行两步首次安装：
 
 ```bash
 curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
@@ -735,7 +736,7 @@ make build
 2. **本地测试**：在具备工具的环境中运行全部测试 (`bash -n install-proxy.sh`, `bash -n merge-nodes.sh`, `bash tests/test_install_proxyctl.sh`, `bash tests/test_install_json.sh`, `bash tests/test_install_monitor.sh`, `go test -v ./...`)；
 3. **代码提交**：获取用户明确授权后提交并推送至 `main` 分支；
 4. **打 Tag 推送**：获取用户明确授权后创建并推送对应版本 Tag（例如 `git tag v0.6.0`）；
-5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Debian 12) 与 `release` 工作流全部成功通过；
+5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Ubuntu 26.04 / Debian 12) 与 `release` 工作流全部成功通过；
 6. **发布校验**：在 GitHub Release 页面确认 `proxyctl-linux-amd64`、`proxyctl-linux-arm64` 及 `checksums.txt` 3 个 Asset 已发布，且 `./dist/proxyctl-linux-amd64 version` 正确输出 Tag 名称。
 
 ## 贡献

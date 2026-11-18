@@ -599,7 +599,7 @@ test_not_root() {
 
 test_os_matrix() {
   local spec id ver want
-  for spec in "ubuntu 22.04 ok" "ubuntu 24.04 ok" "debian 12 ok" \
+  for spec in "ubuntu 22.04 ok" "ubuntu 24.04 ok" "ubuntu 26.04 ok" "debian 12 ok" \
               "ubuntu 20.04 no" "ubuntu 25.04 no" "debian 11 no" "debian 13 no" \
               "fedora 40 no" "alpine 3.19 no"; do
     read -r id ver want <<<"$spec"

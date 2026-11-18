@@ -23,6 +23,7 @@ func TestCheckPlatform(t *testing.T) {
 		{"debian 12 arm64", Env{GOARCH: "arm64", SystemdAvailable: ok, OSRelease: rel("debian", "12")}, false},
 		{"ubuntu 22.04", Env{GOARCH: "amd64", SystemdAvailable: ok, OSRelease: rel("ubuntu", "22.04")}, false},
 		{"ubuntu 24.04", Env{GOARCH: "arm64", SystemdAvailable: ok, OSRelease: rel("ubuntu", "24.04")}, false},
+		{"ubuntu 26.04", Env{GOARCH: "arm64", SystemdAvailable: ok, OSRelease: rel("ubuntu", "26.04")}, false},
 		{"explicit linux", Env{GOOS: "linux", GOARCH: "amd64", SystemdAvailable: ok, OSRelease: rel("debian", "12")}, false},
 		{"ubuntu 20.04 unsupported", Env{GOARCH: "amd64", SystemdAvailable: ok, OSRelease: rel("ubuntu", "20.04")}, true},
 		{"ubuntu 23.10 unsupported", Env{GOARCH: "amd64", SystemdAvailable: ok, OSRelease: rel("ubuntu", "23.10")}, true},

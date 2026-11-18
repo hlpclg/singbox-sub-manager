@@ -734,13 +734,13 @@ func checkPlatform(env *Env) error {
 }
 
 // checkSupportedOSRelease mirrors install-proxy.sh's require_supported_os
-// (Debian 12; Ubuntu 22.04/24.04) — spec §8.1: "OS满足与安装器相同的支持
+// (Debian 12; Ubuntu 22.04/24.04/26.04) — spec §8.1: "OS满足与安装器相同的支持
 // 范围".
 func checkSupportedOSRelease(id, versionID string) error {
 	switch id {
 	case "ubuntu":
-		if versionID != "22.04" && versionID != "24.04" {
-			return fmt.Errorf("realitynode: only Ubuntu 22.04 and 24.04 are supported (got %q)", versionID)
+		if versionID != "22.04" && versionID != "24.04" && versionID != "26.04" {
+			return fmt.Errorf("realitynode: only Ubuntu 22.04, 24.04, and 26.04 are supported (got %q)", versionID)
 		}
 	case "debian":
 		if versionID != "12" {

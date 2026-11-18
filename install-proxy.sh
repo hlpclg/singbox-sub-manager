@@ -91,8 +91,8 @@ require_supported_os() {
     OS="${ID:-}"
     VER="${VERSION_ID:-}"
     if [[ "$OS" == "ubuntu" ]]; then
-      if [[ "$VER" != "22.04" && "$VER" != "24.04" ]]; then
-        echo "ERROR: Only Ubuntu 22.04 and 24.04 are supported" >&2
+      if [[ "$VER" != "22.04" && "$VER" != "24.04" && "$VER" != "26.04" ]]; then
+        echo "ERROR: Only Ubuntu 22.04, 24.04, and 26.04 are supported" >&2
         exit 1
       fi
     elif [[ "$OS" == "debian" ]]; then

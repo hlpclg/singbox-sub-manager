@@ -204,7 +204,7 @@ require_supported_os() {
   # shellcheck disable=SC1090
   os_ver="$(. "$OS_RELEASE_FILE" >/dev/null 2>&1; printf '%s' "${VERSION_ID:-}")"
   if [[ "$os_id" == "ubuntu" ]]; then
-    [[ "$os_ver" == "22.04" || "$os_ver" == "24.04" ]] || die "Only Ubuntu 22.04 and 24.04 are supported"
+    [[ "$os_ver" == "22.04" || "$os_ver" == "24.04" || "$os_ver" == "26.04" ]] || die "Only Ubuntu 22.04, 24.04, and 26.04 are supported"
   elif [[ "$os_id" == "debian" ]]; then
     [[ "$os_ver" == "12" ]] || die "Only Debian 12 is supported"
   else
