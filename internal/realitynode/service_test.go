@@ -804,7 +804,9 @@ func TestInstallRollbackOnSelfcheckFailure(t *testing.T) {
 	script := buildFakeSingboxScript(t, "1.14.1")
 	env, sysd, roots := testEnv(t, script, "1.14.1")
 
-	result := Install(context.Background(), env, validInstallParams())
+	params := validInstallParams()
+	params.Port = freeTCPPort(t)
+	result := Install(context.Background(), env, params)
 	if result.Err != nil {
 		t.Fatalf("unexpected hard error: %v (result=%+v)", result.Err, result)
 	}

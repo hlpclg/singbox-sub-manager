@@ -857,7 +857,9 @@ func TestFailureAfterTransactionBegan(t *testing.T) {
 		script := buildFakeSingboxScript(t, "1.14.1") // selfcheck fails -> rollback
 		env, sysd, roots := testEnv(t, script, "1.14.1")
 		sysd.stopErr = errors.New("simulated: systemctl stop failed")
-		res := Install(context.Background(), env, validInstallParams())
+		params := validInstallParams()
+		params.Port = freeTCPPort(t)
+		res := Install(context.Background(), env, params)
 		if res.PreTransaction || res.Err == nil {
 			t.Fatalf("want a non-pre-transaction error, got %+v", res)
 		}
