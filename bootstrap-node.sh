@@ -524,14 +524,18 @@ snapshot_assets() {
 # the parent re-takes L3 and re-checks role, transaction state and that no
 # instance asset changed.
 compat_check() {
-  local before after rc=0
+  local before after timeout_cmd rc=0
 
   if instance_assets_absent; then
     echo "No Reality instance assets found; skipping the compatibility check." >&2
     return 0
   fi
   command -v setsid >/dev/null 2>&1 || die "setsid is required for the compatibility check"
-  command -v timeout >/dev/null 2>&1 || die "timeout is required for the compatibility check"
+  # Ubuntu 26.04's uutils timeout can leave descendants alive after -s KILL.
+  if ! timeout_cmd="$(command -v gnutimeout || command -v timeout)" ||
+    [[ "$("$timeout_cmd" --version 2>/dev/null)" != *"GNU coreutils"* ]]; then
+    die "GNU timeout is required for the compatibility check (Ubuntu 26.04: install gnu-coreutils)"
+  fi
 
   before="$(snapshot_assets)" || die "Cannot read the Reality instance assets for the compatibility check"
   echo "Checking that proxyctl $PROXYCTL_VERSION can read the existing Reality instance (node service show)." >&2
@@ -544,7 +548,7 @@ compat_check() {
   # --wait: setsid forks (and its parent returns at once) when it happens to be a
   # process group leader, which would make wait_bg see exit 0 before the check
   # ran; with --wait it always waits for and returns the child's exit status.
-  setsid --wait timeout -s KILL "$SHOW_TIMEOUT" "$CAND_BIN" node service show >/dev/null 8>&- 9>&- </dev/null &
+  setsid --wait "$timeout_cmd" -s KILL "$SHOW_TIMEOUT" "$CAND_BIN" node service show >/dev/null 8>&- 9>&- </dev/null &
   BG_PID=$!
   bg_disarm
   wait_bg || rc=$?

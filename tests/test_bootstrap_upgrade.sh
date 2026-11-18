@@ -1460,6 +1460,13 @@ EOF
   chmod 0755 "$C/fake/setsid"
 }
 
+setsid_used_gnu_timeout() {
+  local wait_flag timer signal_flag signal
+  read -r wait_flag timer signal_flag signal _ < "$1" || return 1
+  [[ "$wait_flag" == --wait && "$signal_flag" == -s && "$signal" == KILL ]] || return 1
+  [[ "$("$timer" --version 2>/dev/null)" == *"GNU coreutils"* ]]
+}
+
 test_setsid_wait() {
   up_case setsid-wait-failing-show
   make_instance
@@ -1471,8 +1478,8 @@ test_setsid_wait() {
   expect "setsid as a group leader + failing show: reported as the compatibility check failing" stderr_has "failed with exit code 3"
   expect "setsid as a group leader + failing show: installed pair unchanged" installed_is_old
   expect "setsid as a group leader + failing show: no previous copy" prev_absent
-  expect "the check runs through 'setsid --wait timeout'" \
-    bash -c 'grep -q "^--wait timeout " "$1"' _ "$C/log/setsid.log"
+  expect "the check runs through setsid --wait with GNU timeout" \
+    setsid_used_gnu_timeout "$C/log/setsid.log"
 
   up_case setsid-wait-ok-show
   make_instance
@@ -1480,8 +1487,8 @@ test_setsid_wait() {
   write_leader_setsid
   run_boot --upgrade
   assert_upgraded "setsid as a group leader + passing show"
-  expect "passing show also ran through 'setsid --wait'" \
-    bash -c 'grep -q "^--wait timeout " "$1"' _ "$C/log/setsid.log"
+  expect "passing show also used setsid --wait with GNU timeout" \
+    setsid_used_gnu_timeout "$C/log/setsid.log"
 }
 
 test_stale_previous_tmp() {
@@ -1554,7 +1561,7 @@ test_stale_previous_tmp() {
 test_script_structure() {
   new_case structure
   expect "the compatibility check child gets fds 8 and 9 closed" \
-    bash -c 'grep -Eq "setsid( --wait)? timeout .*node service show.*8>&- 9>&-" "$1"' _ "$SCRIPT"
+    grep -Eq 'setsid --wait "\$timeout_cmd" .*node service show.*8>&- 9>&-' "$SCRIPT"
   expect "L3 is re-taken after the check and the asset snapshot is compared" \
     bash -c 'grep -q "acquire_l3 \"after the compatibility check\"" "$1" && grep -q "\"\$after\" != \"\$before\"" "$1"' _ "$SCRIPT"
 }

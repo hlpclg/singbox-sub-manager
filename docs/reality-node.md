@@ -161,6 +161,8 @@ sudo bash bootstrap-node.sh
 
 ## 升级（`bootstrap-node.sh --upgrade`，Task 12，规格 §12）
 
+Ubuntu 26.04 上，节点升级的兼容检查使用 GNU `timeout` 结束超时的进程组。标准系统已提供 `gnutimeout`。精简镜像若缺少该命令且默认 `timeout` 为 uutils，请先安装 `gnu-coreutils`。
+
 节点机在套件更新规格交付之前的**唯一**升级入口（节点机不支持 `install-proxy.sh update`，订阅中心才用它）。从**目标版本的 Release** 下载该版本的 `bootstrap-node.sh`（目标版本就是脚本内置的 `v0.10.0`），再升级：
 
 ```bash
