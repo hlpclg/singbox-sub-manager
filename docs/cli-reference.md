@@ -194,7 +194,7 @@ sudo bash bootstrap-node.sh [--replace-proxyctl] --name NAME --server ADDR [--po
 | 带参数 | 去掉 `--replace-proxyctl`，其余参数逐字节不变地 `exec proxyctl node service install ...` |
 
 - `--replace-proxyctl`：本机 `/usr/local/bin/proxyctl` 的 `.sha256` 缺失或与二进制不符时，授权重新安装固定版本的 `proxyctl`。它不会替换或降级校验通过的 `proxyctl`，也不会传给 `proxyctl`。可以和其他参数同时出现，位置不限。
-- 固定版本（`v0.10.0`）是脚本内置的，不接受环境变量或参数覆盖。下载每个文件限时 120 秒，锁等待最长 30 秒。
+- 固定版本（`v0.10.1`）是脚本内置的，不接受环境变量或参数覆盖。下载每个文件限时 120 秒，锁等待最长 30 秒。
 - 退出码：`1` 修改之前失败（非 root、OS 或架构不支持、订阅中心角色不是“否”、取锁超时、下载或校验失败、本机 `proxyctl` 决策表要求停止）；`2` 用法错误；带参数或进入菜单时，其余退出码就是被 exec 的 `proxyctl` 命令的退出码。
 - 决策表、角色预检和锁顺序见 [reality-node.md](reality-node.md) 的“首次安装”一节。
 
@@ -304,7 +304,7 @@ chmod +x merge-nodes.sh
 sudo ./merge-nodes.sh
 ```
 
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.10.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
+`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.10.1`（或由 `PROXYCTL_VERSION` 指定的）Release。
 
 `proxyctl` 校验与执行逻辑：
 - 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；

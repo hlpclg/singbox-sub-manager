@@ -40,16 +40,16 @@
 #
 # NOT covered here (kept honest in docs/reality-node-validation.md):
 #   real systemd (unit sandboxing, Restart=, journald), the private/loopback
-#   dynamic rejection through the tunnel (Task 1 real-host gate), the arm64
-#   binary, the real GitHub Release download of bootstrap-node.sh (v0.10.0 is
-#   not published), a real terminal Ctrl-C, FlClash and the spec 14.5 two-host
-#   run. Fault injection and cancellation of the Go transaction code stay in the
-#   Go tests; this file does not mock them.
+#   dynamic rejection through the tunnel (Task 1 real-host gate), the other
+#   architecture's binary, the GitHub Release download of bootstrap-node.sh,
+#   terminal Ctrl-C, FlClash and the spec 14.5 two-host run. The Go tests cover
+#   fault injection and cancellation of the Go transaction code.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_DIR="$(mktemp -d)"
-FIXED_VERSION="v0.10.0"
+FIXED_VERSION="v0.10.1"
+MIN_NODE_VERSION="v0.10.0"
 
 pass=0
 fail=0
@@ -274,7 +274,7 @@ NODE_PORT="8443"
 
 add_cmd_shape_ok() {
   local c="$1"
-  [[ "$c" == "sudo proxyctl node add --publish --min-version $FIXED_VERSION --type vless-reality --server '$NODE_SERVER' --port '$NODE_PORT' --uuid '"* \
+  [[ "$c" == "sudo proxyctl node add --publish --min-version $MIN_NODE_VERSION --type vless-reality --server '$NODE_SERVER' --port '$NODE_PORT' --uuid '"* \
     && "$c" == *" --name '$NODE_NAME'" ]]
 }
 
@@ -311,7 +311,7 @@ test_node_side() {
   expect "install: the role line goes to stderr" err_has "subscription center role: no"
   expect "install: stdout holds exactly one executable command" cmd_count_is 1
   ADD_CMD="$(one_cmd)"
-  expect "install: the command is the stable add template (--publish --min-version $FIXED_VERSION --type vless-reality, name last)" add_cmd_shape_ok "$ADD_CMD"
+  expect "install: the command is the stable add template (--publish --min-version $MIN_NODE_VERSION --type vless-reality, name last)" add_cmd_shape_ok "$ADD_CMD"
   expect "install: no private key in the output" no_secret_in_streams
   expect "install: manifest is installed" manifest_state_is installed
   expect "install: state directory holds exactly manifest/instance/secrets" state_files_are "instance.json manifest.json secrets.json"
@@ -338,7 +338,7 @@ test_node_side() {
   run_c node service show
   expect_rc "show (installed): 0" 0
   expect "show (installed): the same add command as install printed" test "$(one_cmd)" = "$ADD_CMD"
-  expect "show (installed): the enable alternative is a comment line" out_has "# sudo proxyctl node enable --publish --min-version v0.10.0 '$NODE_NAME'"
+  expect "show (installed): the enable alternative is a comment line" out_has "# sudo proxyctl node enable --publish --min-version $MIN_NODE_VERSION '$NODE_NAME'"
   expect "show (installed): no private key in the output" no_secret_in_streams
   expect "show does not change anything" test "$(digest_node_assets)" = "$tx_digest"
 
@@ -349,8 +349,8 @@ test_node_side() {
   expect_rc "uninstall: 0" 0
   expect "uninstall: one executable command" cmd_count_is 1
   DISABLE_CMD="$(one_cmd)"
-  expect "uninstall: it is the disable command" test "$DISABLE_CMD" = "sudo proxyctl node disable --publish --min-version v0.10.0 '$NODE_NAME'"
-  expect "uninstall: the remove alternative is a comment line" out_has "# sudo proxyctl node remove --publish --min-version v0.10.0 '$NODE_NAME'"
+  expect "uninstall: it is the disable command" test "$DISABLE_CMD" = "sudo proxyctl node disable --publish --min-version $MIN_NODE_VERSION '$NODE_NAME'"
+  expect "uninstall: the remove alternative is a comment line" out_has "# sudo proxyctl node remove --publish --min-version $MIN_NODE_VERSION '$NODE_NAME'"
   expect "uninstall: the shared proxyctl is reported as kept (stderr)" err_has "/usr/local/bin/proxyctl"
   expect "uninstall: the service is stopped, the port closed" bash -c '! (exec 3<>/dev/tcp/127.0.0.1/'"$NODE_PORT"') 2>/dev/null'
   expect "uninstall: unit, config dir and private binary are gone" \
@@ -369,7 +369,7 @@ test_node_side() {
   expect_rc "reinstall (from uninstalled): 0" 0
   expect "reinstall: one executable command" cmd_count_is 1
   ENABLE_CMD="$(one_cmd)"
-  expect "reinstall: it is the enable command" test "$ENABLE_CMD" = "sudo proxyctl node enable --publish --min-version v0.10.0 '$NODE_NAME'"
+  expect "reinstall: it is the enable command" test "$ENABLE_CMD" = "sudo proxyctl node enable --publish --min-version $MIN_NODE_VERSION '$NODE_NAME'"
   expect "reinstall: the commented add alternative is the original add command (same identity, clients keep working)" \
     test "$(grep -E '^# sudo proxyctl node add ' "$TEST_DIR/out" | sed 's/^# //')" = "$ADD_CMD"
   expect "reinstall: secrets.json is the same identity" test "$(sha_of /var/lib/proxyctl-reality/secrets.json)" = "$before_secret"
@@ -384,7 +384,7 @@ test_node_side() {
   run_c node service uninstall --purge --export-backup "$TEST_DIR/export.tgz"
   expect_rc "uninstall --purge --export-backup: 0" 0
   REMOVE_CMD="$(one_cmd)"
-  expect "purge: the remove command" test "$REMOVE_CMD" = "sudo proxyctl node remove --publish --min-version v0.10.0 '$NODE_NAME'"
+  expect "purge: the remove command" test "$REMOVE_CMD" = "sudo proxyctl node remove --publish --min-version $MIN_NODE_VERSION '$NODE_NAME'"
   expect "purge: the archive exists with mode 600 (it holds the private key; contents are not printed)" \
     test "$(stat -c %a "$TEST_DIR/export.tgz")" = 600
   expect "purge: the archive lists the identity files" \

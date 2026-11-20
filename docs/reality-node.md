@@ -109,10 +109,10 @@ sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
 
 ## 首次安装（`bootstrap-node.sh`，Task 11，规格 §12）
 
-**首次两步，之后只需记住 `sudo proxyctl node`**。脚本是 v0.10.0 Release 的 asset：
+**首次两步，之后只需记住 `sudo proxyctl node`**。脚本是 v0.10.1 Release 的 asset：
 
 ```bash
-curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/bootstrap-node.sh
 ```
 
 ```bash
@@ -131,7 +131,7 @@ sudo bash bootstrap-node.sh
 
 ### 本机已有 `proxyctl` 时的决策
 
-固定版本是脚本内置的 `v0.10.0`，不能由环境变量或参数改写。只有 `.sha256` 校验通过的二进制才会被执行（先比对哈希，再 `version`）。
+固定版本是脚本内置的 `v0.10.1`，不能由环境变量或参数改写。只有 `.sha256` 校验通过的二进制才会被执行（先比对哈希，再 `version`）。
 
 | 本机 proxyctl | 处理 |
 |---|---|
@@ -146,8 +146,8 @@ sudo bash bootstrap-node.sh
 
 ### 安装步骤（需要安装时）
 
-1. 在 `/usr/local/bin/` 里用 `mktemp` 创建临时文件，下载 `proxyctl-linux-<amd64|arm64>` 和 `checksums.txt`（来自 `https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/`，每个文件限时 120 秒）。
-2. `checksums.txt` 中必须恰好有一行对应该资产，SHA256 必须匹配；下载得到的二进制 `version` 输出必须等于 `v0.10.0`，`node service --help` 退出码必须为 0。任何一项失败：删除全部临时文件，返回 1，已安装的文件保持原样。
+1. 在 `/usr/local/bin/` 里用 `mktemp` 创建临时文件，下载 `proxyctl-linux-<amd64|arm64>` 和 `checksums.txt`（来自 `https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/`，每个文件限时 120 秒）。
+2. `checksums.txt` 中必须恰好有一行对应该资产，SHA256 必须匹配；下载得到的二进制 `version` 输出必须等于 `v0.10.1`，`node service --help` 退出码必须为 0。任何一项失败：删除全部临时文件，返回 1，已安装的文件保持原样。
 3. 先 rename 二进制（0755），再 rename `.sha256`（0644，内容为小写十六进制哈希加换行，与 `install-proxy.sh` 布局相同），都在同一目录内；最后复核已安装二进制的哈希等于 sidecar、`version` 等于固定版本。
 4. SIGINT/SIGTERM 在任何阶段都会终止进行中的下载、删除临时文件、释放锁，返回 1。
 
@@ -163,10 +163,10 @@ sudo bash bootstrap-node.sh
 
 Ubuntu 26.04 上，节点升级的兼容检查使用 GNU `timeout` 结束超时的进程组。标准系统已提供 `gnutimeout`。精简镜像若缺少该命令且默认 `timeout` 为 uutils，请先安装 `gnu-coreutils`。
 
-节点机在套件更新规格交付之前的**唯一**升级入口（节点机不支持 `install-proxy.sh update`，订阅中心才用它）。从**目标版本的 Release** 下载该版本的 `bootstrap-node.sh`（目标版本就是脚本内置的 `v0.10.0`），再升级：
+节点机在套件更新规格交付之前的**唯一**升级入口（节点机不支持 `install-proxy.sh update`，订阅中心才用它）。从**目标版本的 Release** 下载该版本的 `bootstrap-node.sh`（目标版本就是脚本内置的 `v0.10.1`），再升级：
 
 ```bash
-curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/bootstrap-node.sh
 ```
 
 ```bash
@@ -190,11 +190,11 @@ sudo bash bootstrap-node.sh --upgrade
 | 版本高于固定版本 | 返回 1，不降级 |
 | 版本低于固定版本 | 升级 |
 
-- **候选验证**（任一项失败：删除临时文件，返回 1，其余一概不动）：在 `/usr/local/bin/` 里用 `mktemp` 建临时文件 → 下载 `proxyctl` 与 `checksums.txt`（每个文件 120 秒）→ SHA256 → `version` 必须等于 `v0.10.0` → `node service --help` 退出码为 0。
+- **候选验证**（任一项失败：删除临时文件，返回 1，其余一概不动）：在 `/usr/local/bin/` 里用 `mktemp` 建临时文件 → 下载 `proxyctl` 与 `checksums.txt`（每个文件 120 秒）→ SHA256 → `version` 必须等于 `v0.10.1` → `node service --help` 退出码为 0。
 - **只读兼容检查**：用通过验证的候选二进制读取本机实例，防止升级后新版本读不懂旧实例。`/var/lib/proxyctl-reality/`、`/etc/proxyctl-reality/`、unit 文件、`/usr/local/lib/proxyctl-reality/` 四个资产根**全部不存在**时没有状态需要验证，跳过；只要有任何一个存在（包括残缺的、悬空符号链接）就执行候选的 `node service show`，必须在 15 秒内（含它自己等 L3）返回 0，stdout 丢弃，诊断信息（stderr）保留。未知 schema、状态不一致、锁超时、执行失败、超时都拒绝升级，返回 1，原二进制、`.sha256`、旧副本和全部实例资产保持不变。检查不会迁移或改写任何状态。
   锁交接：父进程一直持有 L1（所以实例变更和共享二进制替换都被挡住）、关闭自己的 fd 8 释放 L3；子进程不继承 fd 8 和 fd 9，由 `show` 自己取得并释放 L3。子进程结束后父进程重新取 L3（10 秒），复查角色、事务区/墓碑，并确认四个资产根下每一项的存在性、类型、内容、属主和 mode 与检查前一致；有变化或重取不到锁返回 1，不替换。超时或收到信号时先终止并回收子进程及其子孙，再清理、解锁。
 - **旧副本**：`/var/lib/proxyctl-bootstrap/previous/`（目录 root:root 0700；`proxyctl` 0700，`proxyctl.sha256` 0600），只保留最近一次升级前的那一对，下次升级时覆盖。每个文件先写同目录临时文件、fsync、再 rename，两个文件写完并 fsync 目录后，核对旧副本两文件互相匹配且等于当前安装的字节，才允许开始替换；保存失败返回 1，已安装的二进制和 `.sha256` 不变。保存期间断电可能留下**不匹配的旧副本**，它不能直接用于人工回滚（见下文哈希门禁）。该目录不属于 Reality 实例，不参与角色检测。
-- **替换与验证**：先 rename 二进制（0755），再 rename `.sha256`（0644），都是同目录临时文件；验证已安装二进制的哈希等于 `.sha256`、`proxyctl version` 等于 `v0.10.0`。替换或验证失败：从旧副本恢复两个文件并校验，恢复成功返回 4，恢复失败返回 5，两种情况都输出旧副本路径。
+- **替换与验证**：先 rename 二进制（0755），再 rename `.sha256`（0644），都是同目录临时文件；验证已安装二进制的哈希等于 `.sha256`、`proxyctl version` 等于 `v0.10.1`。替换或验证失败：从旧副本恢复两个文件并校验，恢复成功返回 4，恢复失败返回 5，两种情况都输出旧副本路径。
 - **信号**：替换开始之前收到 SIGINT/SIGTERM（下载、兼容检查、保存旧副本期间）：终止并回收子进程，删除临时文件，返回 1。替换开始之后、验证完成之前收到：不打断替换，按失败规则恢复旧副本，返回 4（恢复失败 5）。验证全部通过即成功边界，之后收到的信号只完成临时文件清理和解锁，返回 0，不回滚。
 - **成功后**：stderr 提示新版本固定的 sing-box 版本可能与实例当前使用的不同，请执行 `sudo proxyctl node service show` 查看，必要时 `sudo proxyctl node service reinstall`；锁 fd 8、9 在退出前已关闭。
 

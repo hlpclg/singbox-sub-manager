@@ -5,7 +5,7 @@
 # root, so it runs unchanged as root and as uid 1000.
 #
 #   synthetic mode (default)
-#     - the three scripts carry the same version, v0.10.0;
+#     - the three scripts carry the same version, v0.10.1;
 #     - ci.yml and release.yml both register every script and every
 #       tests/test_*.sh for `bash -n`, ShellCheck and execution (rules below);
 #     - release.yml publishes exactly the two binaries, the three scripts and
@@ -51,7 +51,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CI_YML="${CI_YML:-$REPO_ROOT/.github/workflows/ci.yml}"
 RELEASE_YML="${RELEASE_YML:-$REPO_ROOT/.github/workflows/release.yml}"
-TARGET_VERSION="v0.10.0"
+TARGET_VERSION="v0.10.1"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 

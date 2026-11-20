@@ -40,7 +40,7 @@ trap cleanup EXIT
 
 SCRIPT="$REPO_ROOT/bootstrap-node.sh"
 SCRIPT_UNDER_TEST="$SCRIPT"
-FIXED_VERSION="v0.10.0"
+FIXED_VERSION="v0.10.1"
 OLD_VERSION="v0.9.0"
 
 pass=0
@@ -712,11 +712,11 @@ test_upgrade_table() {
   expect "newer installed: unchanged" installed_is_old
 
   up_case table-newer-patch
-  make_installed "v0.10.1" 0 valid
+  make_installed "v0.10.2" 0 valid
   OLD_SHA="$(sha_of "$BIN")"
   run_boot --upgrade
-  expect_rc "v0.10.1 > v0.10.0: 1" 1
-  expect "v0.10.1: no download" no_curl
+  expect_rc "v0.10.2 > v0.10.1: 1" 1
+  expect "v0.10.2: no download" no_curl
 
   local ov
   for ov in v0.9.0 v0.9.9 v0.8.0; do
@@ -824,7 +824,7 @@ test_candidate_verification() {
   assert_untouched "duplicate checksums entry"
 
   up_case cand-version-wrong
-  stage_download "v0.10.1" 0
+  stage_download "v0.10.2" 0
   run_boot --upgrade
   expect_rc "candidate version mismatch: 1" 1
   lines="$(grep '^NEW' "$C/log/exec.log" | tr '\n' ';')"
@@ -1573,7 +1573,7 @@ test_script_structure() {
 #   - PROXYCTL_REAL_FS_TESTS=1 (explicit opt-in; use a throw-away container),
 #   - euid 0 (the fixtures need root:root ownership and `show` requires root),
 #   - a candidate is available: PROXYCTL_REAL_CANDIDATE=/path/to/proxyctl
-#     (built with -ldflags "-X main.Version=v0.10.0") or `go` is on PATH,
+#     (built with -ldflags "-X main.Version=v0.10.1") or `go` is on PATH,
 #   - none of the real paths exist (nothing of the host is ever touched).
 # Without the opt-in it prints SKIP. With the opt-in and a missing prerequisite
 # it FAILS loudly. Everything it creates is removed by the EXIT cleanup. `show`
