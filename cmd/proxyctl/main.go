@@ -4,12 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
-	"strings"
 
 	"github.com/hlpclg/singbox-sub-manager/internal/nodes"
 	"github.com/hlpclg/singbox-sub-manager/internal/render"
+	"github.com/hlpclg/singbox-sub-manager/internal/subscriptionvalidate"
 )
 
 var Version = "dev"
@@ -51,7 +50,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func usage(stderr io.Writer) int {
 	fmt.Fprintln(stderr, "usage: proxyctl <command> [args]")
 	fmt.Fprintln(stderr, "commands:")
-	fmt.Fprintln(stderr, "  node     list|add|edit|remove|enable|disable|migrate")
+	fmt.Fprintln(stderr, "  node     list|add|edit|remove|enable|disable|migrate|publish")
 	fmt.Fprintln(stderr, "  merge    --nodes nodes.conf --output DIR")
 	fmt.Fprintln(stderr, "  validate --nodes nodes.conf")
 	fmt.Fprintln(stderr, "  subscription build --nodes nodes.conf --output DIR")
@@ -109,53 +108,9 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	for _, n := range ns {
-		if err := nodes.Validate(n); err != nil {
-			fmt.Fprintln(stderr, "validation failed:", err)
-			return 1
-		}
-	}
-
-	if err := render.CheckNodeNames(ns); err != nil {
+	if _, err := subscriptionvalidate.Validate(ns); err != nil {
 		fmt.Fprintln(stderr, "validation failed:", err)
 		return 1
-	}
-
-	clashYaml := render.Clash(ns)
-	if strings.Contains(clashYaml, "CHANGE_ME") {
-		fmt.Fprintln(stderr, "validation failed: generated clash.yaml contains placeholder 'CHANGE_ME'")
-		return 1
-	}
-
-	if err := validateClashYAML(clashYaml); err != nil {
-		fmt.Fprintln(stderr, "validation failed:", err)
-		return 1
-	}
-
-	sr := render.Shadowrocket(ns)
-	if strings.TrimSpace(sr) == "" {
-		fmt.Fprintln(stderr, "validation failed: generated Shadowrocket output is empty")
-		return 1
-	}
-	lines := strings.Split(strings.TrimSpace(sr), "\n")
-	if len(lines) != len(ns) {
-		fmt.Fprintf(stderr, "validation failed: generated %d Shadowrocket URI line(s), want %d\n", len(lines), len(ns))
-		return 1
-	}
-	for i, l := range lines {
-		u, err := url.Parse(l)
-		if err != nil {
-			fmt.Fprintf(stderr, "validation failed: generated Shadowrocket URI at line %d is invalid: %v\n", i+1, err)
-			return 1
-		}
-		wantScheme := "hysteria2"
-		if ns[i].Type == nodes.TypeVlessReality {
-			wantScheme = "vless"
-		}
-		if u.Scheme != wantScheme {
-			fmt.Fprintf(stderr, "validation failed: generated Shadowrocket URI at line %d has wrong scheme\n", i+1)
-			return 1
-		}
 	}
 
 	fmt.Fprintln(stdout, "validation passed")

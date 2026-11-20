@@ -41,6 +41,23 @@ HARNESS="$TEST_DIR/harness.sh"
 
 grep -q '^sha256_file()' "$HARNESS" || { echo "production sha256_file function is missing" >&2; exit 1; }
 
+# Exercise the production OS check with the same VERSION_ID Ubuntu uses
+# for its LTS point releases.
+{
+  extract_function require_supported_os | sed 's|/etc/os-release|"$OS_RELEASE_FIXTURE"|g'
+  printf '%s\n' 'require_supported_os'
+} > "$TEST_DIR/os-check.sh"
+for version in 22.04 24.04 26.04 25.04; do
+  printf 'ID=ubuntu\nVERSION_ID="%s"\n' "$version" > "$TEST_DIR/os-release"
+  if OS_RELEASE_FIXTURE="$TEST_DIR/os-release" bash -e "$TEST_DIR/os-check.sh" 2>"$TEST_DIR/os-check.err"; then
+    [[ "$version" != 25.04 ]] || { echo "Unsupported Ubuntu $version accepted" >&2; exit 1; }
+  elif [[ "$version" != 25.04 ]]; then
+    echo "Supported Ubuntu $version rejected" >&2
+    cat "$TEST_DIR/os-check.err" >&2
+    exit 1
+  fi
+done
+
 NODES_CONF="$TEST_DIR/nodes.conf"
 printf '%s\n' '# managed-by: installer' 'Node1|1.2.3.4|443|pass123|obfs123|example.com' > "$NODES_CONF"
 

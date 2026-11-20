@@ -39,6 +39,20 @@ LOG_FILE="$LOG_DIR/installer.log"
 SUB_ROOT="/var/www/proxy-sub"
 LOCK_FILE="/run/lock/singbox-sub-manager.lock"
 
+# v0.10 reverse-guard paths (spec §11.5, §11.2): a Reality node instance and
+# this subscription-center installer must never coexist on the same host,
+# and install/update/rollback must not run over a leftover publish
+# transaction. Injectable via env vars so tests never touch real system
+# paths.
+REALITY_UNIT_FILE="${REALITY_UNIT_FILE:-/etc/systemd/system/proxyctl-reality.service}"
+REALITY_CONFIG_DIR="${REALITY_CONFIG_DIR:-/etc/proxyctl-reality}"
+REALITY_STATE_DIR="${REALITY_STATE_DIR:-/var/lib/proxyctl-reality}"
+REALITY_BIN_DIR="${REALITY_BIN_DIR:-/usr/local/lib/proxyctl-reality}"
+REALITY_TXN_DIR="${REALITY_TXN_DIR:-/var/lib/proxyctl-reality-txn}"
+REALITY_TOMB_GLOB="${REALITY_TOMB_GLOB:-/var/lib/.proxyctl-reality-txn.tomb-*}"
+PUBLISH_TXN_DIR="${PUBLISH_TXN_DIR:-/var/lib/singbox-sub-manager/publish}"
+PUBLISH_TOMB_GLOB="${PUBLISH_TOMB_GLOB:-/var/lib/singbox-sub-manager/.publish.tomb-*}"
+
 # Not fully used in v0.2.0, pre-created for v0.3.0
 TEMPLATE_DIR="/usr/share/singbox-sub-manager/templates"
 EXAMPLES_DIR="/usr/share/singbox-sub-manager/examples"
@@ -53,7 +67,7 @@ CADDY_APT_BOOTSTRAP_ORIGINALS=()
 CADDY_APT_BOOTSTRAP_FILES=()
 PROXYCTL_BIN="${PROXYCTL_BIN:-/usr/local/bin/proxyctl}"
 PROXYCTL_REPOSITORY="${PROXYCTL_REPOSITORY:-hlpclg/singbox-sub-manager}"
-PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.9.0}"
+PROXYCTL_VERSION="${PROXYCTL_VERSION:-v0.10.0}"
 PROXYCTL_VALIDATED_BIN=""
 UPDATES_DIR="${UPDATES_DIR:-$STATE_DIR/updates}"
 BACKUPS_DIR="${BACKUPS_DIR:-$STATE_DIR/backups}"
@@ -77,8 +91,8 @@ require_supported_os() {
     OS="${ID:-}"
     VER="${VERSION_ID:-}"
     if [[ "$OS" == "ubuntu" ]]; then
-      if [[ "$VER" != "22.04" && "$VER" != "24.04" ]]; then
-        echo "ERROR: Only Ubuntu 22.04 and 24.04 are supported" >&2
+      if [[ "$VER" != "22.04" && "$VER" != "24.04" && "$VER" != "26.04" ]]; then
+        echo "ERROR: Only Ubuntu 22.04, 24.04, and 26.04 are supported" >&2
         exit 1
       fi
     elif [[ "$OS" == "debian" ]]; then
@@ -112,11 +126,48 @@ acquire_installer_lock() {
   fi
 }
 
+# reject_if_incompatible_host implements spec §11.5's reverse check: after
+# the installer lock is held, refuse install/update/rollback if this host
+# shows any trace of a Reality node instance (any asset from spec §5.1's
+# table, not the lock file), or a leftover publish transaction/tombstone.
+# Neither role may be established on a host the other has already claimed.
+reject_if_incompatible_host() {
+  local path
+  for path in "$REALITY_UNIT_FILE" "$REALITY_CONFIG_DIR" "$REALITY_STATE_DIR" "$REALITY_BIN_DIR" "$REALITY_TXN_DIR"; do
+    if [[ -e "$path" ]]; then
+      echo "ERROR: this host has Reality node instance traces ($path); refusing to install/update/rollback the subscription center here" >&2
+      exit 1
+    fi
+  done
+
+  local tomb
+  shopt -s nullglob
+  for tomb in $REALITY_TOMB_GLOB; do
+    shopt -u nullglob
+    echo "ERROR: a Reality node transaction tombstone exists ($tomb); refusing to install/update/rollback the subscription center here" >&2
+    exit 1
+  done
+  shopt -u nullglob
+
+  if [[ -e "$PUBLISH_TXN_DIR" ]]; then
+    echo "ERROR: a leftover publish transaction exists ($PUBLISH_TXN_DIR); run 'proxyctl node publish --recover' first" >&2
+    exit 1
+  fi
+  shopt -s nullglob
+  for tomb in $PUBLISH_TOMB_GLOB; do
+    shopt -u nullglob
+    echo "ERROR: a leftover publish transaction tombstone exists ($tomb); run 'proxyctl node publish --recover' first" >&2
+    exit 1
+  done
+  shopt -u nullglob
+}
+
 installer_preflight() {
   require_root
   require_supported_os
   prepare_runtime_dirs
   acquire_installer_lock
+  reject_if_incompatible_host
 }
 
 log() {
@@ -377,8 +428,8 @@ install_proxyctl() {
     return 1
   fi
 
-  expected_count="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
-  expected_sha256="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
+  expected_count="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
+  expected_sha256="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
   if [[ "$expected_count" != "1" || -z "$expected_sha256" ]]; then
     rm -f "$tmp" "$chk_tmp"
     PROXYCTL_VALIDATED_BIN=""
@@ -1662,8 +1713,8 @@ cmd_update() {
     die "Download failed; the installed proxyctl and its checksum file are unchanged."
   fi
 
-  expected_count="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
-  expected_sha256="$(awk -v asset="$asset" '$1 ~ /^[[:xdigit:]]{64}$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
+  expected_count="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { count++ } END { print count+0 }' "$chk_tmp")"
+  expected_sha256="$(awk -v asset="$asset" 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == asset || $2 == "*" asset) { print tolower($1) }' "$chk_tmp")"
   if [[ "$expected_count" != "1" || -z "$expected_sha256" ]]; then
     rm -f "$bin_tmp" "$chk_tmp"
     set_session_status "$session_dir" failed || true

@@ -1,14 +1,14 @@
 # singbox-sub-manager
 
-一键部署 sing-box Hysteria2 节点，并生成统一的 FlClash 与 Shadowrocket 订阅。
+一键部署 sing-box Hysteria2 与独立 VLESS Reality 节点，并生成统一的 FlClash 与 Shadowrocket 订阅。
 
-> Deploy sing-box Hysteria2 nodes and generate unified FlClash and Shadowrocket subscriptions.
+> Deploy sing-box Hysteria2 & VLESS Reality nodes and generate unified FlClash & Shadowrocket subscriptions.
 
 ## 功能
 
 - 一键安装或更新 sing-box
 - 一键安装和配置 Caddy
-- 部署 Hysteria2 服务端
+- 部署 Hysteria2 服务端及独立 VLESS Reality 节点
 - 自动生成随机订阅路径
 - 自动生成 FlClash/Mihomo 配置
 - 自动生成 Shadowrocket 订阅
@@ -31,6 +31,7 @@
 |---|---:|---|
 | Ubuntu | 22.04 LTS | 支持 |
 | Ubuntu | 24.04 LTS | 支持 |
+| Ubuntu | 26.04 LTS（含 26.04.1） | 支持 |
 | Debian | 12 | 支持 |
 
 当前版本使用 `apt` 安装依赖，因此暂不支持直接运行在以下系统：
@@ -82,7 +83,7 @@ US-HY2 ─┘
 
 需要准备：
 
-1. 一台 Ubuntu 22.04、Ubuntu 24.04 或 Debian 12 服务器
+1. 一台 Ubuntu 22.04、24.04、26.04 或 Debian 12 服务器
 2. 一个已经解析到服务器公网 IP 的域名
 3. root 权限或可使用 `sudo` 的用户
 4. AWS、Oracle Cloud 或其他云平台安全组已放行相应端口
@@ -102,7 +103,11 @@ AWS EC2 用户需要同时检查：
 - 域名 DNS 解析
 - Elastic IP 或公网 IP 是否正确
 
-## 一键安装
+## 四步部署主流程
+
+### 第一步：安装订阅中心并完成迁移
+
+在作为订阅中心的服务器上执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/install-proxy.sh \
@@ -113,210 +118,85 @@ chmod +x install-proxy.sh
 sudo ./install-proxy.sh sub.example.com admin@example.com
 ```
 
-也可以直接执行：
+安装器新装的订阅中心默认写出 legacy 格式节点；由于后续发布功能要求分节格式，安装完成后请立即执行一次迁移：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/install-proxy.sh \
-  | sudo bash -s -- sub.example.com admin@example.com
+sudo proxyctl node migrate
 ```
 
-参数说明：
+或运行 `sudo proxyctl node` 进入菜单，按提示确认后完成迁移。
+
+### 第二步：在独立节点机安装 VLESS Reality 服务
+
+在独立的节点机（Debian 12、Ubuntu 22.04/24.04/26.04）上执行两步首次安装：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+sudo bash bootstrap-node.sh
+```
+
+脚本安装校验 `proxyctl` 后会自动进入菜单；也可直接执行带参命令：
+
+```bash
+sudo proxyctl node service install --name 'My-Reality' --server '节点公网IP' --port 443 --sni 'www.microsoft.com'
+```
+
+安装成功后，终端 stdout 会输出一条可直接粘贴的推荐注册命令。
+
+### 第三步：在订阅中心粘贴推荐命令
+
+复制节点机安装成功时输出的命令，在订阅中心粘贴执行：
+
+```bash
+sudo proxyctl node add --publish --min-version v0.10.0 --type vless-reality --server '<server>' --port '443' --uuid '<uuid>' --public-key '<pubkey>' --short-id '<short_id>' --sni 'www.microsoft.com' --name 'My-Reality'
+```
+
+订阅中心将在单一事务中原子更新节点并自动完成本地 Caddy HTTPS 验证与发布。
+
+### 第四步：在客户端导入并使用订阅
+
+订阅地址格式为：
 
 ```text
-sub.example.com   用于提供订阅文件的域名
-admin@example.com Caddy / Let's Encrypt 使用的联系邮箱
+FlClash:      https://sub.example.com/<token>/clash.yaml
+Shadowrocket: https://sub.example.com/<token>/sr.txt
 ```
 
-示例：
+在客户端（FlClash、Shadowrocket 等）添加上述链接并更新订阅，选择对应节点即可使用。订阅 token 保存在订阅中心的 `/var/lib/singbox-sub-manager/token`，重复运行安装脚本不会改变。FlClash/Shadowrocket 的使用要点、旧版节点管理与 `merge-nodes.sh` 见 [docs/cli-reference.md](docs/cli-reference.md)。
+
+## 日常管理入口（交互菜单）
+
+无论在订阅中心还是独立节点机，日常管理统一只需运行：
 
 ```bash
-sudo bash install-proxy.sh aws-jp.example.com admin@example.com
+sudo proxyctl node
 ```
 
-## 安装结果
+终端会自动感知当前主机角色（订阅中心 / 节点机），提供对应的增删改查、服务重装、卸载及订阅重新发布选项。
 
-脚本运行完成后会输出两个订阅地址：
+高级 CLI 参数及自动化调用详见 [docs/cli-reference.md](docs/cli-reference.md)；独立节点生命周期详见 [docs/reality-node.md](docs/reality-node.md)；升级与回滚详见 [docs/upgrade.md](docs/upgrade.md)；故障处理详见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
-```text
-FlClash:
-https://sub.example.com/<随机token>/clash.yaml
+## 节点机升级（bootstrap-node.sh --upgrade，v0.10 起）
 
-Shadowrocket:
-https://sub.example.com/<随机token>/sr.txt
-```
-
-随机 token 保存于：
-
-```text
-/var/lib/singbox-sub-manager/token
-```
-
-重复运行安装脚本时，订阅地址默认不会改变。
-
-Hysteria2 密钥保存于：
-
-```text
-/etc/singbox-sub-manager/config.env
-```
-
-重复运行安装脚本时，以下内容默认不会改变：
-
-- Hysteria2 password
-- Salamander obfs password
-- 订阅 token
-- 订阅 URL
-
-## FlClash 使用方法
-
-1. 打开 FlClash
-2. 进入订阅管理
-3. 添加脚本输出的 `clash.yaml` 地址
-4. 更新订阅
-5. 开启 TUN
-6. 模式选择 `Rule`
-7. 在 `节点选择` 中选择 `自动选择`（测速）、`故障转移`（节点故障时自动切换）或指定节点
-
-配置默认包含：
-
-- TUN mixed stack
-- Fake-IP DNS
-- 自动路由
-- DNS 劫持
-- 国内直连
-- 国外代理
-- Google Play 下载修正规则
-- 3 个基础策略组：`节点选择`（手动选择）、`自动选择`（url-test 测速）、`故障转移`（fallback 故障转移）
-- 11 个服务策略组，可在客户端单独为每个服务切换出口：
-  - 默认出口为 `节点选择`：`AI服务`（OpenAI、Claude）、`GitHub`、`流媒体`（YouTube、Netflix、Spotify）、`Disney`、`TikTok`、`Telegram`、`Google`
-  - 默认出口为 `DIRECT`：`Bilibili`、`Apple`、`Microsoft`、`游戏`
-
-## Shadowrocket 使用方法
-
-1. 打开 Shadowrocket
-2. 添加订阅
-3. 粘贴脚本输出的 `sr.txt` 地址
-4. 更新订阅
-5. 选择节点并连接
-
-`sr.txt` 每行包含一个 Hysteria2 节点 URI。
-
-## 合并多个节点
-
-订阅中心的节点列表保存在：
+节点机（`proxyctl` 由 `bootstrap-node.sh` 安装的独立节点主机）升级 `proxyctl` 只有这一个入口，**不要**在节点机上运行 `install-proxy.sh update`。先下载目标版本 Release 里的 `bootstrap-node.sh`（脚本内置的版本就是目标版本），再升级：
 
 ```bash
-/etc/singbox-sub-manager/nodes.conf
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
 ```
-
-在每台节点上安装完成后，收集该节点的公网 IP、Hysteria2 password、Salamander obfs password 和 SNI；然后在订阅中心编辑此文件：
 
 ```bash
-nano /etc/singbox-sub-manager/nodes.conf
+sudo bash bootstrap-node.sh --upgrade
 ```
 
-格式：
+要点：
 
-```text
-# 注释行会被忽略
-JP-HY2|1.1.1.1|443|PASSWORD|OBFS_PASSWORD|www.bing.com
-SG-HY2|2.2.2.2|443|PASSWORD|OBFS_PASSWORD|www.bing.com
-US-HY2|3.3.3.3|443|PASSWORD|OBFS_PASSWORD|www.bing.com
-```
-
-字段说明：
-
-```text
-节点名 | 服务器IP或域名 | 端口 | Hysteria2密码 | 混淆密码 | SNI
-```
-
-节点名不得与内置策略组名或 `DIRECT`、`REJECT` 相同——即 `节点选择`、`自动选择`、`故障转移`、`AI服务`、`GitHub`、`流媒体`、`Disney`、`TikTok`、`Telegram`、`Google`、`Bilibili`、`Apple`、`Microsoft`、`游戏`、`DIRECT`、`REJECT`，共 16 个保留名。已启用节点使用其中任一名称时，`merge` 与 `validate` 会失败并在输出中指出冲突的节点名；禁用节点不受影响。
-
-重新运行安装脚本会读取 `nodes.conf` 并生成订阅，同时保留当前节点的 token 和密钥：
-
-```bash
-sudo ./install-proxy.sh sub.example.com admin@example.com
-```
-
-也可以单独运行 `merge-nodes.sh`，避免重装服务：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/merge-nodes.sh \
-  -o merge-nodes.sh
-chmod +x merge-nodes.sh
-sudo ./merge-nodes.sh
-```
-
-`merge-nodes.sh` 会下载并校验 GitHub Release 中的 `proxyctl`。这要求项目已发布对应的 `v0.9.0`（或由 `PROXYCTL_VERSION` 指定的）Release。
-
-`proxyctl` 校验与执行逻辑：
-- 只复用固定路径 `/usr/local/bin/proxyctl`，且要求版本匹配、当前 SHA256 与同路径 `.sha256` 记录一致；
-- 固定路径文件缺失或任一校验不匹配时，从 GitHub Release 下载对应架构二进制并校验 SHA256 及 `version` 输出；
-- PATH 中其他同名 `proxyctl` 不会被复用或执行；
-- `install-proxy.sh` 若无法安装带 `monitor` 支持且通过校验的 `proxyctl` 会失败退出，不会启用监控 timer；
-- `merge-nodes.sh` 无内置渲染器回退，若无法获取校验通过的 `proxyctl` 会明确报错退出。
-
-两个命令都会覆盖生成：
-
-```text
-/var/www/proxy-sub/<token>/clash.yaml
-/var/www/proxy-sub/<token>/sr.txt
-```
-
-不需要重启 Caddy，客户端更新订阅即可。
-
-## 节点管理（proxyctl node）
-
-v0.3 起可用 `proxyctl` 管理 `/etc/singbox-sub-manager/nodes.conf`，无需手改文件。
-
-```bash
-# 列出所有节点（含启用状态）
-proxyctl node list
-
-# 新增节点（缺省字段在交互终端下会追问；密码不回显）
-proxyctl node add --name JP-HY2 --server 1.2.3.4 --port 443 \
-  --password 'xxx' --obfs-password 'yyy' --sni www.bing.com
-
-# 新增 VLESS Reality 节点
-proxyctl node add --name JP-Reality --type vless-reality --server 1.2.3.4 --port 443 \
-  --uuid <uuid> --public-key <reality-public-key> --short-id '' --sni www.microsoft.com
-
-# 修改字段（只改传入项；--name 可改名）
-proxyctl node edit JP-HY2 --port 8443
-
-# 启用 / 禁用（禁用的节点保留在文件中，但不进订阅）
-proxyctl node enable JP-HY2
-proxyctl node disable JP-HY2
-
-# 删除
-proxyctl node remove JP-HY2
-
-# 生成订阅（仅包含启用节点）
-proxyctl subscription build --nodes /etc/singbox-sub-manager/nodes.conf --output DIR
-```
-
-节点文件权限为 `0600`，每次修改前自动备份为 `nodes.conf.bak`。
-
-### 从旧格式迁移
-
-v0.2 的竖线格式（`名称|服务器|端口|密码|obfs|sni`）仍可被 `subscription build` 读取，但节点管理命令要求先迁移一次：
-
-```bash
-proxyctl node migrate
-```
-
-迁移会把文件重写为分节格式并把原文件备份到 `nodes.conf.bak`。
-
-### 添加 VLESS Reality 节点
-
-VLESS Reality 只支持分节格式；仍在用竖线格式的机器必须先执行一次：
-
-```bash
-proxyctl node migrate
-```
-
-再用 `proxyctl node add --type vless-reality ...` 添加节点。VLESS Reality 节点的 `flow`（`xtls-rprx-vision`）、`fingerprint`（`chrome`）和传输方式（裸 TCP）是固定值，不支持自定义。
-
-**版本兼容警告**：一旦 `nodes.conf` 写入 `TYPE=` 字段（执行过 `node migrate`、`node add` 或任何其他节点管理命令之后），就不能再被 v0.8.x 的 `proxyctl` 或 `merge-nodes.sh` 解析——它们会报 `unknown key "TYPE"` 并失败。升级到 v0.9.0 后，必须同时把 `install-proxy.sh`/`merge-nodes.sh` 换成 v0.9.0 tag 下的版本，不要混用旧脚本。
+- `--upgrade` 必须是唯一参数，带任何其他参数（包括 `--replace-proxyctl`）返回 2。同样只在“订阅中心=否”的主机上运行；存在未完成的实例事务（`sudo proxyctl node service recover` 先处理）时返回 1。
+- 已是该版本返回 0 且不下载、不修改；本机版本更高不降级（1）；`proxyctl` 不存在或 `.sha256` 不符不会被执行（1，提示不带 `--upgrade` 运行或改用 `--replace-proxyctl`）。
+- 替换之前先用下载并校验过的新版本对本机 Reality 实例做**只读兼容检查**（`node service show`，15 秒内必须返回 0；没有任何实例资产时跳过）。未知 schema、状态不一致或超时都拒绝升级，已安装的 `proxyctl`、旧副本和实例资产保持不变。
+- 升级前的 `proxyctl` 和 `.sha256` 会保存到 `/var/lib/proxyctl-bootstrap/previous/`（只保留最近一次）。替换或验证失败会自动恢复旧版本（返回 4；恢复也失败返回 5，需人工介入）。
+- 成功后提示新版本固定的 sing-box 可能与实例当前使用的不同：运行 `sudo proxyctl node service show` 查看，必要时 `sudo proxyctl node service reinstall`。
+- 本版本**没有**回滚命令和更新会话。从旧副本人工回滚只在升级后只做过只读 `show`、没有执行任何 `node service` 变更（包括失败或取消的变更、`recover`）时才安全，步骤和限制见 [docs/reality-node.md](docs/reality-node.md) 的“升级”一节；升级被 SIGKILL 或断电打断留下不一致的安装文件时，用**同一个目标 Release** 的脚本加 `--replace-proxyctl` 修复（与降级是两回事）。
+- 订阅中心的升级路径是 `install-proxy.sh update`，两条路径的区别见 [docs/upgrade.md](docs/upgrade.md)。
 
 ## 健康检查（proxyctl health）
 
@@ -392,9 +272,13 @@ proxyctl monitor status
 
 状态文件位于 `/var/lib/singbox-sub-manager/monitor-state.json`，暂停标记位于 `/var/lib/singbox-sub-manager/monitor-paused`。`monitor` 输出机器可读 JSON；退出码 0 表示最终健康，1 表示恢复失败，2 表示降级但未发生失败恢复，3 表示无法可靠决策。
 
+`monitor` 与 `backup`、`restore` 共用同一把恢复锁：如果某一轮 `monitor` 恰好与 `proxyctl backup`（自 v0.10.0 起）或 `restore` 同时运行，那一轮会因为拿不到锁直接返回退出码 3，不会重试或等待；下一个 5 分钟周期会照常恢复正常。这不代表监控失效，只代表那一轮跳过了。
+
 ## 备份与恢复（proxyctl backup / restore）
 
 `proxyctl backup` 把单机全部持久化状态打包成一个可校验的 `.tar.gz` 归档：`/etc/singbox-sub-manager/` 整棵配置树、`/etc/sing-box/config.json`、`/etc/caddy/Caddyfile`、订阅 token、monitor 状态与暂停标记。不存在的路径记入归档清单的“跳过”而不是报错。
+
+自 v0.10.0 起，`backup` 创建归档前会先获取与 `restore`、`monitor` 相同的恢复锁（v0.9 及更早版本不加锁）；这样打包时读到的状态与 `restore`/`monitor` 不会互相踩踏，但也意味着 `monitor` 一轮运行超过 30 秒时，`backup` 会等到锁释放或报错退出，不会静默用不一致的状态打包。
 
 ```bash
 # 创建备份（默认写入 /var/lib/singbox-sub-manager/backups/，保留最近 10 份）
@@ -433,6 +317,8 @@ sudo proxyctl restore /path/backup.tar.gz --no-restart
 
 monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明确报错，提示稍后重试或先执行 `proxyctl monitor pause`，不会无限等待，也不会绕过锁。
 
+自 v0.10.0 起，`restore` 在恢复锁之后还会额外获取 Reality 节点锁（同样有界等待），并在持锁期间复查：若本机存在任何 Reality 节点实例的痕迹（`proxyctl node service ...` 安装的资产、未完成事务或墓碑），或存在遗留的订阅发布事务，`restore` 会拒绝执行并返回失败，不做任何修改。这是为了避免恢复流程覆盖一台本应是 Reality 节点、而不是订阅中心的主机；同样地，`install-proxy.sh` 的 `install`/`update`/`rollback` 也会做同样的检查。
+
 ### 恢复对 monitor 的影响
 
 `monitor-state.json` 和 `monitor-paused` 属于备份范围，恢复时按归档中的存在性精确还原：
@@ -442,6 +328,16 @@ monitor 正在运行并持有恢复锁时，`restore` 会在有界等待后明�
 - 状态文件按归档还原，失败计数会一并回退到备份时刻。
 
 `restore` 不会自行启动或恢复 monitor，命令输出会明确说明本次恢复对 monitor 的影响。
+
+### 锁的适用范围（已知限制）
+
+`backup`、`restore`、`monitor` 与合并多个节点用的 `merge-nodes.sh` 共用同一套锁，彼此互斥；但这**不是**全局串行保证，以下几种旧路径仍可能与它们并发写入，本版本不解决：
+
+- `install-proxy.sh` 在只持有安装锁、还未持有恢复锁的窗口内调用 `proxyctl merge` 写订阅文件，可能与 `monitor`、`backup`、`restore` 并发。
+- 用户手动执行的 `proxyctl merge` / `subscription build` 不加锁。
+- 写默认 `nodes.conf` 的兼容模式 CRUD（`node add/edit/...`，见上文）只取安装锁，独立执行的 `restore` 只取恢复锁和 Reality 节点锁；两者理论上可能同时写 `nodes.conf`，这是已知的旧竞争，本版本未收紧。
+
+因此“发布相关操作与 backup/restore/monitor 串行”只对 `proxyctl node publish`、带 `--publish` 的变更（都持有安装锁和恢复锁）和 `merge-nodes.sh` 成立；默认 CRUD 只取安装锁，只与它们互斥、不与 `monitor` 争用恢复锁。这些都不能理解为整个工具链的全局互斥，所以把 `proxyctl node publish` 作为标准发布入口。
 
 ### 退出码
 
@@ -483,63 +379,17 @@ sudo ./install-proxy.sh rollback --to backup-20260909T100000Z.tar.gz
 
 升级会话保存在 `/var/lib/singbox-sub-manager/updates/<时间戳>/`，目录权限 `0700`，内部文件 `0600`。成功升级后保留最近一个成功会话，供之后手动 `rollback`；只有下一次成功升级才会清理更旧的成功会话。失败的会话一律保留，不自动删除。
 
+自 v0.10.0 起，第 2 步创建配置快照时调用的 `proxyctl backup` 会先取恢复锁（有界等待 30 秒）。如果 `monitor` 恰好在那一轮运行超过 30 秒并一直持有这把锁，快照创建会因为锁超时失败；`update` 按上面第 2 步的既有规则中止，提示「未能创建升级前配置快照，线上二进制未被触碰」，可以直接重试，不会留下半成品会话。
+
 收到 `SIGINT`/`SIGTERM` 时的行为分三种：会话元数据尚未落盘（还在建快照或暂存旧二进制）时，删除这个不完整的会话并清理下载临时文件，线上文件未被触碰；元数据已落盘后中断，保留整个会话并清理临时文件，之后可以用 `rollback` 回到升级前状态；如果中断发生在健康检查期间，新二进制已经在位、会话状态停在 `in_progress`，不会自动回滚，需要你自己执行 `sudo ./install-proxy.sh rollback`。三种情况都以退出码 130 结束并打印说明。
 
 不完整的会话（没有 `session.meta`）不会被 `rollback` 选中，不带参数的 `rollback` 只会回到最近一个完整会话。
 
-重跑安装脚本会把 proxyctl 拉回安装脚本内置的 `PROXYCTL_VERSION`：`update` 之后如果再执行 `sudo ./install-proxy.sh <domain>`，二进制会被降级回安装脚本固定的版本。升级后需要重跑安装时，用 `sudo PROXYCTL_VERSION=<tag> ./install-proxy.sh <domain>` 指定当前版本。
+重跑安装脚本会把 proxyctl 拉回安装脚本内置的 `PROXYCTL_VERSION`：`update` 之后如果再执行 `sudo ./install-proxy.sh <domain>`，二进制会被重置为安装脚本固定的版本。升级后需要重跑安装时，用 `sudo PROXYCTL_VERSION=<tag> ./install-proxy.sh <domain>` 指定当前版本。
 
 `rollback` 不带参数时使用最近一次会话：先恢复配置（如果该会话有快照），再校验并恢复二进制对。会话里只有配置快照而没有暂存二进制时，会明确告诉你「二进制未变更」。找不到任何会话或归档时报错退出，不会静默无操作。
 
-### 升级到 v0.8.0 后重新生成订阅
-
-`sudo ./install-proxy.sh update` 只升级 `proxyctl` 二进制，**不会**重新生成订阅文件；已有的 `clash.yaml` / `sr.txt` 仍是升级前渲染出的旧内容。升级到 v0.8.0 后，用以下任一方式重新生成订阅，才能拿到新增的 14 个策略组：
-
-```bash
-# 方式一：下载 v0.8.0 tag 下固定版本的 merge-nodes.sh（不要用 main 分支）
-curl -fsSLO https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/v0.8.0/merge-nodes.sh
-chmod +x merge-nodes.sh
-sudo ./merge-nodes.sh
-
-# 方式二：直接调用已升级的 proxyctl 二进制
-sudo /usr/local/bin/proxyctl merge --nodes /etc/singbox-sub-manager/nodes.conf --output "/var/www/proxy-sub/$(sudo cat /var/lib/singbox-sub-manager/token)"
-```
-
-两种方式都会原地覆盖已有订阅文件：方式一（`merge-nodes.sh`）会把 `/var/www/proxy-sub` 下的属主与权限重置为 `caddy:caddy`、目录 755 / 文件 644（与安装脚本一致）；方式二只覆盖文件内容，保留原有属主与权限。
-
-**警告**：旧版本 `merge-nodes.sh` 内置较旧的 `PROXYCTL_VERSION`（例如 v0.7.1 脚本默认使用 v0.7.1）。如果你手头还留着旧版 `merge-nodes.sh`，它发现本机 `proxyctl` 版本与内置版本不同时会自动下载该旧版本并覆盖 `/usr/local/bin/proxyctl`，导致二进制被降级，且订阅仍然是旧模板——务必使用上面方式一里固定到 `v0.8.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支。
-
-### 升级到 v0.9.0 后使用 VLESS Reality
-
-`sudo ./install-proxy.sh update` 只升级 `proxyctl` 二进制。若要在现有机器上添加 VLESS Reality 节点，先确认 `nodes.conf` 已是分节格式（`proxyctl node migrate`），再用 `proxyctl node add --type vless-reality ...`。
-
-**警告**：和 v0.8.0 一样，旧版本 `merge-nodes.sh`/`install-proxy.sh` 内置的 `PROXYCTL_VERSION` 会在发现本机 `proxyctl` 版本不同时把它降级。`nodes.conf` 一旦写入 `TYPE=` 字段，降级后的 v0.8.x 二进制会直接读取失败（报 `unknown key "TYPE"`），而不只是渲染出旧模板——务必使用下面固定到 `v0.9.0` tag 的脚本，不要用本地缓存的旧版或 `main` 分支：
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/v0.9.0/merge-nodes.sh
-chmod +x merge-nodes.sh
-sudo ./merge-nodes.sh
-```
-
-## 获取其他节点的连接信息
-
-在每台 Hysteria2 节点服务器上执行：
-
-```bash
-sudo cat /etc/singbox-sub-manager/config.env
-curl -4 https://api.ipify.org
-```
-
-输出类似：
-
-```text
-PASSWORD="xxxxxxxx"
-OBFS_PASSWORD="xxxxxxxx"
-```
-
-再记录该节点的公网 IP、端口和 SNI。
-
-不要将真实密码提交到公开仓库。
+历史版本的特定升级说明与降级避坑提示见 [docs/upgrade.md](docs/upgrade.md)。
 
 ## 文件结构
 
@@ -685,31 +535,7 @@ curl https://sub.example.com/<token>/clash.yaml
 
 ## 更新
 
-重新下载最新脚本并执行：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hlpclg/singbox-sub-manager/main/install-proxy.sh \
-  -o install-proxy.sh
-
-chmod +x install-proxy.sh
-
-sudo ./install-proxy.sh sub.example.com admin@example.com
-```
-
-默认会保留现有：
-
-- 订阅 token
-- Hysteria2 密码
-- 混淆密码
-
-但会重新生成：
-
-- sing-box 配置
-- Caddy 配置
-- FlClash 订阅
-- Shadowrocket 订阅
-
-如果手工修改过生成后的 `clash.yaml`，重新运行脚本后会被覆盖。应当修改脚本或模板，而不是直接长期修改生成文件。
+订阅中心升级用 `install-proxy.sh update` / `rollback`（见上文“升级与回滚”和 [docs/upgrade.md](docs/upgrade.md)）；节点机升级用 `bootstrap-node.sh --upgrade`。重新运行安装脚本会保留订阅 token 和密钥，但会重新生成 sing-box、Caddy 与订阅文件；手工修改过的 `clash.yaml` 会被覆盖。
 
 ## 常见问题
 
@@ -910,29 +736,8 @@ make build
 2. **本地测试**：在具备工具的环境中运行全部测试 (`bash -n install-proxy.sh`, `bash -n merge-nodes.sh`, `bash tests/test_install_proxyctl.sh`, `bash tests/test_install_json.sh`, `bash tests/test_install_monitor.sh`, `go test -v ./...`)；
 3. **代码提交**：获取用户明确授权后提交并推送至 `main` 分支；
 4. **打 Tag 推送**：获取用户明确授权后创建并推送对应版本 Tag（例如 `git tag v0.6.0`）；
-5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Debian 12) 与 `release` 工作流全部成功通过；
+5. **CI 门禁等待**：等待 GitHub Actions 的 `caddy-apt-smoke` (Ubuntu 22.04 / Ubuntu 24.04 / Ubuntu 26.04 / Debian 12) 与 `release` 工作流全部成功通过；
 6. **发布校验**：在 GitHub Release 页面确认 `proxyctl-linux-amd64`、`proxyctl-linux-arm64` 及 `checksums.txt` 3 个 Asset 已发布，且 `./dist/proxyctl-linux-amd64 version` 正确输出 Tag 名称。
-
-## 路线图
-
-计划支持：
-
-- Rocky Linux 9
-- AlmaLinux 9
-- Amazon Linux 2023
-- Reality
-- TUIC
-- 多协议订阅
-- 独立节点配置文件
-- 自动拉取远程节点
-- Web 管理页面
-- 节点健康检查
-- 自动故障切换与恢复
-- 自动更新 sing-box
-- 自动备份和恢复
-- Docker 部署
-
-路线图不代表确定的发布时间。
 
 ## 贡献
 

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "reality",
+  "server": "203.0.113.7",
+  "listen_port": 443,
+  "sni": "www.microsoft.com",
+  "selfcheck_port": 41000
+}

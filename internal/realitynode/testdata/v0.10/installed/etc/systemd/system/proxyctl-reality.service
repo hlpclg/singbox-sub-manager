@@ -1,0 +1,21 @@
+[Unit]
+Description=proxyctl managed VLESS Reality (sing-box)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/proxyctl-reality/versions/1.14.1/sing-box run -c /etc/proxyctl-reality/config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=10
+TimeoutStopSec=5
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/proxyctl-reality /usr/local/lib/proxyctl-reality
+
+[Install]
+WantedBy=multi-user.target

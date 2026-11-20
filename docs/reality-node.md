@@ -1,0 +1,359 @@
+# Reality 节点（v0.10）
+
+本文档记录 v0.10 独立 Reality 节点功能与运维规范。`proxyctl node service install|reinstall|show` 与 `uninstall`、`uninstall --purge [--export-backup PATH]`、`recover [--abandon]`；交互菜单（`sudo proxyctl node`）；bootstrap 首装脚本（`bootstrap-node.sh`）；`--upgrade` 升级模式与从旧副本人工回滚的步骤均已就绪。参数全集见 [docs/cli-reference.md](cli-reference.md)。
+
+完整设计见 [v0.10 定稿规格](superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md)；已完成 Task 的真实验证证据见 [reality-node-validation.md](reality-node-validation.md)。
+
+## 本机代理服务命令（`proxyctl node service`，Task 7–8）
+
+`install`、`reinstall`、`show` 三个命令共同的顺序（规格 §8）：严格解析全部参数（含取值校验）→ 检查 root → 快速预检 → 取锁（`install`/`reinstall` 取 L1 再 L3，`show` 只取 L3，最长等待 10 秒）→ 取锁后复查 → 执行。命令必须以 root 运行；订阅中心角色必须是“否”，否则拒绝（`install`/`reinstall` 需要，快速预检与取锁后各查一次）。
+
+- 快速预检发生在取锁**之前**：`install` 检查 OS/架构/systemd、实例状态（必须未安装）、磁盘空间、`listen_port` 可绑定、选定 `selfcheck_port`、ufw 告警、§9.1 dest 探测；`reinstall` 检查参数配对、OS/架构/systemd、实例状态是否是两个允许来源之一。预检不修改任何东西，失败返回 1，且不取锁。
+- 取锁后只按规格 §8 的复查表复查：`install` 复查实例状态、目标路径冲突、`listen_port` 与 `selfcheck_port` 仍可绑定（不重复 dest 探测）；`reinstall` 复查实例状态（来源可能变化）；来源为“已卸载但保留身份”时再复查 `listen_port`，任何来源下 `selfcheck_port` 不可绑定都按下文规则重选。复查失败同样返回 1。
+- 参数取值错误（例如 `--port 70000`、IPv6 `--server`、IP 形式的 `--sni`、非法或以 `-` 开头的 `--name`）在解析阶段就返回 2，早于 root 检查、加锁和任何网络请求。
+
+### `sudo proxyctl node service install --name NAME --server ADDR [--port PORT] [--sni SNI]`
+
+- `--name`、`--server` 必填；`--port` 默认 443；`--sni` 默认 `www.microsoft.com`。全部参数遵守严格模式（§4.5）：未知/重复 flag、缺值、位置参数都返回 2；`--name` 不能以 `-` 开头。
+- 预检包括 OS/架构/systemd 可用性、磁盘空间、`listen_port` 与 `selfcheck_port` 可绑定、ufw 是否 active（仅告警）、dest 探测（TLS 1.3 握手 `<sni>:443`）。
+- 成功后依次：下载并校验 sing-box、生成身份（UUID/X25519 私钥/short_id）、生成服务端配置、`sing-box check`、写入全部资产、`daemon-reload`/`enable`/`start`、本机门禁（§9.2）、本地 Reality 数据通路与外网探测（§9.3–9.4，临时客户端使用已安装的 `/usr/local/lib/proxyctl-reality/versions/<版本>/sing-box`）、写 manifest、提交。
+- 成功时 stdout 输出一条可粘贴到订阅中心的 `sudo proxyctl node add --publish ...` 命令（见下）；stderr 提示放行云安全组端口，以及外网探测失败等告警。
+- 任一步在写入任何资产之前失败：不做任何修改，返回 1。写入开始之后失败（包括自检未通过）：自动回滚到事务前状态（即完全未安装），返回 4。检测到外部篡改、回滚失败或恢复后复查失败：返回 5，保留事务区供人工处理（`docs/troubleshooting.md`）。
+
+### `sudo proxyctl node service reinstall [--singbox-version V --singbox-sha256 H]`
+
+- 不接受 `--name`/`--server`/`--port`/`--sni`（严格模式下这些是未知 flag，返回 2）。`--singbox-version` 与 `--singbox-sha256` 必须成对出现或都不出现，否则返回 2。
+- 适用于“已安装”或“已卸载但保留身份”两种状态；复用已有的 UUID/私钥/short_id。不带版本参数时，目标版本是本次 `proxyctl` 编译期固定的 sing-box 版本：已在 `versions/<版本>/` 中且哈希与 manifest 记录一致时直接复用，否则重新下载校验。
+- 每次 reinstall 都会重新生成本机地址拒绝列表；`selfcheck_port` 不可绑定时按 install 同样的规则重新选取。
+- 私有二进制最多保留两个版本（`singbox_current` 与 `singbox_previous`），**两个版本的目录和二进制都登记在 manifest 中**（含 sha256）。提交后才清理落出窗口的旧版本，并且只清理 manifest 登记过的目录；清理步骤的前状态取自 manifest 登记的 mode/owner/sha256，而不是现场状态，所以被改动过的旧版本二进制会被拒绝删除，而不是被删掉：事务开始前发现不符，实例被判为“不一致”，reinstall 直接返回 1；事务进行中发现不符，回滚并返回 4；提交之后才发现不符，向前清理拒绝执行，返回 5 并保留事务区。
+- 目标版本的处理：目标版本已登记（等于 `singbox_current` 或 `singbox_previous`）时不重复写入。不带版本参数直接复用；显式给出版本与哈希时仍会下载并校验，要求解包得到的二进制与已登记的字节一致，一致才复用，不一致返回 1，不做任何修改。目标是 `singbox_previous` 时，当前版本变成新的 previous。目标版本的目录存在于磁盘、但没有登记在 manifest 中时，修改之前就返回 1。复用已有二进制时，同样会在修改任何受管路径之前，用该二进制对新配置执行 `sing-box check`，失败返回 1。
+- 来源为“已卸载但保留身份”时，`singbox_previous` 记为空（卸载已经删除了全部私有二进制），全部目录链和二进制都重新创建并重新下载。
+- 失败时按与 install 相同的规则回滚（含恢复旧的 config/unit/enabled 状态）。
+- 成功时 stdout 输出：来源为“已安装”时是可执行的 `add` 命令（对同名同字段的已启用节点重复执行是安全的空操作）；来源为“已卸载但保留身份”时是可执行的 `enable` 命令，附一条整行注释的备选 `add` 命令。
+
+### `sudo proxyctl node service show`
+
+- 只读，不写任何文件，不做隐式迁移；只取 L3 锁。公钥每次都从私钥实时推导。
+- 已安装：stdout 输出可执行的 `add` 命令，附一条整行注释的备选 `enable` 命令。
+- 已卸载但保留身份：先输出一行 `#` 注释说明服务未运行，再输出可执行的 `disable` 命令，附一条整行注释的备选 `remove` 命令。
+- manifest 记录的 sing-box 版本与本机 `proxyctl` 编译期固定值不同（例如执行过 `bootstrap-node.sh --upgrade` 之后）：stderr 提示执行 `reinstall`，stdout 不受影响。
+- 实例处于“未安装”“未完成事务”“不一致”时返回 1，不输出任何命令。
+
+### `sudo proxyctl node service uninstall`（Task 8，规格 §8.4）
+
+- 只适用于“已安装”状态；“已卸载但保留身份”再执行 `uninstall` 返回 1（提示用 `reinstall` 恢复，或 `uninstall --purge` 彻底清除）。
+- 顺序同其他变更命令：严格解析 → root → 快速预检（状态、实例目录里只有 manifest 登记过的内容、磁盘空间）→ 取 L1、L3 → 只复查实例状态 → 事务。**不检测订阅中心角色**：规格 §8 的复查表对 uninstall/purge/recover 只列实例状态，并且清理一个卡住的实例不应依赖 token 文件可读。
+- 事务步骤：快照 unit、config 和全部已登记版本的私有二进制 → `stop`、`disable` → 删除 unit → `daemon-reload` → 删除 config 和配置目录 → 删除私有二进制的文件和目录（含 `versions/`、`/usr/local/lib/proxyctl-reality/`）→ manifest 改写为 `uninstalled`，这一步完成后即提交。`secrets.json`、`instance.json`、`manifest.json` 保留，字节、mode、属主都不变；已卸载状态下不会生成新的身份，`install` 会被拒绝，`reinstall` 复用原身份。
+- 任一步失败（包括取消、崩溃）都从快照完整恢复：文件、目录（在 umask 077 下以记录的 0755/0700 重建，新 inode）以及 systemd 状态（重新 enable，原本 active 则 restart 并重跑门禁）。
+- stdout：一条可执行的 `disable` 命令，附一条整行注释的备选 `remove` 命令。stderr 提示 `/usr/local/bin/proxyctl` 及其 `.sha256`、`/var/lib/proxyctl-bootstrap/` 中 bootstrap 的旧副本不属于实例，已保留。
+
+### `sudo proxyctl node service uninstall --purge [--export-backup PATH]`（Task 8，规格 §8.5）
+
+- 可在“已安装”或“已卸载但保留身份”状态下执行。事务先把**全部**受管资产（unit、config、私有二进制、`secrets.json`、`instance.json`、`manifest.json`）快照进事务区；unit 存在时 `stop`、`disable`、删除、`daemon-reload`；再删除 config、私有二进制、身份、manifest 和 `/var/lib/proxyctl-reality/` 本身；全部删除完成后提交。任何一步失败都从快照完整恢复（含 systemd 状态），返回 4。
+- 成功后 `/var/lib/proxyctl-reality/`、`/etc/proxyctl-reality/`、unit、私有二进制目录、事务区和墓碑都不存在；本机不再有任何含私钥的文件（**没有隐式备份**）。L3 锁文件 `/run/lock/proxyctl-reality.lock` 不属于实例资产，可能保留。`/usr/local/bin/proxyctl` 和 `/var/lib/proxyctl-bootstrap/` 的旧副本保留（stderr 提示）。
+- 实例目录里出现 manifest 没有登记的文件或目录（会让最后的 rmdir 在修改途中失败）时，预检直接返回 1，不修改任何东西；处理掉多余内容后再执行。
+- stdout：一条可执行的 `remove` 命令，附一条整行注释的备选 `disable` 命令。
+- **`--export-backup PATH`** 是唯一会产生永久备份的途径，只能与 `--purge` 一起使用（否则返回 2），发生在取得 L3 并复查之后、事务开始之前：
+  - PATH 已存在（包括符号链接、目录）则返回 1；相对路径按当前工作目录解析；PATH 不能位于会被 purge 删除的目录里（状态目录、配置目录、私有二进制目录、事务区）。
+  - 在 PATH 所在目录用 `O_EXCL` 创建临时文件（mode 0600，名字形如 `.proxyctl-export-<随机>.tmp`），写入 tar.gz，内容仅为 `/var/lib/proxyctl-reality/` 和 `/etc/proxyctl-reality/`（存在的那些），成员名是去掉开头 `/` 的绝对路径；fsync 后用 `link` 放到 PATH（`link` 不会覆盖已有文件，目标名在检查之后被别人占用时会失败），再删除临时名。
+  - 写入失败、fsync 或 link 失败、收到取消信号：删除临时文件，返回 1，不开始事务，用户已有的文件不会被覆盖。极少见的例外：link 已成功、之后才失败（删除临时名或目录 fsync 失败）时，完整的归档保留在 PATH，返回 1，不开始事务。
+  - stderr 警告归档含私钥，请妥善保管。**本版本没有导入命令**：归档只用于留存密钥和实例参数（uuid、私钥、short_id、server、port、sni）供人工查阅或以后版本导入；把它直接解压回原位不是受支持的恢复方式——manifest 会是 `installed`，但 unit 和二进制都不存在，实例会被判为“不一致”。要重新部署请重新 `install`。
+
+### `sudo proxyctl node service recover [--abandon]`（Task 8，规格 §7.4–§7.6、§8.6）
+
+- 只在“未完成事务”状态可用（事务区或墓碑目录存在）；其他状态返回 1，不做任何修改。取锁顺序和其他变更命令相同（L1→L3，取锁后再确认状态），不检测订阅中心角色。它和自动回滚共用同一个恢复引擎，没有第二套恢复逻辑。
+- 按残留内容处理：
+  - **running / rolling_back**：先校验全部受管路径与临时名（任何一项不属于该阶段允许的状态即判定为外部篡改，见下），再回滚或续做回滚：先降级 systemd，再从快照恢复文件，最后恢复 systemd（原本 active 则 restart 并用事务前的 manifest 重跑本机门禁），删除事务区。修改任何受管路径之前的残留直接丢弃事务区。成功返回 0。
+  - **committed**：只向前完成清理（例如 reinstall 提交后要删的旧版本目录），不回滚，删除事务区，返回 0。
+  - **墓碑目录**（`.proxyctl-reality-txn.tomb-<txn_id>`）：整体删除，不读取其中内容，返回 0。
+  - **有事务区但没有 `journal.json`**：只含 `journal.json.tmp`，或者为空，说明崩溃发生在事务开始阶段，没有修改任何受管路径，整体删除，返回 0；其他任何内容都返回 5，不做修改。
+  - recover 自己被中断（进程被杀、系统断电）后再次执行会收敛到同一结果；收到 SIGINT/SIGTERM 时不会中断恢复本身（回滚使用独立的 120 秒预算），只有在恢复开始之前收到才返回 1。
+- **篡改与无法确认**：检测到外部篡改、journal 的 schema 未知（stderr 会给出写入它的 `proxyctl` 版本，请用该版本执行 recover）、门禁失败、回滚超时，返回 5：保留事务区和现场、不修改 journal，stderr 输出事务区路径，处理步骤见 [troubleshooting.md](troubleshooting.md)。
+- **`--abandon`**（人工放弃出口）：只有全部受管路径都已经处于事务前状态、且没有未登记的临时名时才可用——这种情况只会出现在“文件已全部恢复，但恢复后的门禁失败”之后。它**不**重启服务、**不**跑门禁，保持 systemd 当前状态，删除事务区，返回 0，并在 stderr 警告服务可能没有运行、需要人工排查（`systemctl status proxyctl-reality`，必要时 `reinstall`）。条件不满足（包括已提交的事务）返回 1，不做任何修改。`--abandon` 只能出现在 `node service recover` 和 `node publish --recover`（订阅中心，见 [cli-reference.md](cli-reference.md)）上，出现在其他命令里返回 2。
+- 成功时 stdout 没有输出；stderr 说明做了什么，并提示用 `show` 查看当前状态。
+
+### 粘贴输出格式（规格 §10.1）
+
+每个输出块恰好一行不以 `#` 开头的可执行命令；有备选命令时，备选命令连同说明整行以 `#` 开头。所有命令都带 `--publish --min-version v0.10.0`，flag 在节点名之前，参数值用单引号引用（空值 `''`）。四个模板：
+
+```bash
+sudo proxyctl node add --publish --min-version v0.10.0 --type vless-reality --server '<server>' --port '<listen_port>' --uuid '<uuid>' --public-key '<pubkey>' --short-id '<short_id>' --sni '<sni>' --name '<name>'
+sudo proxyctl node enable --publish --min-version v0.10.0 '<name>'
+sudo proxyctl node disable --publish --min-version v0.10.0 '<name>'
+sudo proxyctl node remove --publish --min-version v0.10.0 '<name>'
+```
+
+`uninstall` 输出 disable（备选 remove），`uninstall --purge` 输出 remove（备选 disable），格式同上，每块恰好一条可执行命令。这四条命令在订阅中心上由 `proxyctl node add/enable/disable/remove --publish` 执行（v0.10 Task 9 起可用，参数、幂等规则和退出码见 [cli-reference.md](cli-reference.md) 的“`node publish` 与带 `--publish` 的 CRUD”；中断后的处理见 [troubleshooting.md](troubleshooting.md)）。订阅中心的 `proxyctl` 低于 `--min-version v0.10.0` 时命令会返回 1 并提示升级；更旧、不认识 `--publish` 的 `proxyctl` 会以退出码 2 报“未知 flag”，不修改任何东西。
+
+### 退出码（`node service` 全部子命令）
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功（可能伴随外网探测等告警）；`recover` 无论回滚、向前清理还是丢弃空事务区，成功都是 0 |
+| 1 | 用法之外的失败，且第一个受管资产被修改之前：预检失败、角色或状态不符、锁超时、dest 不可达、下载或 `check` 失败、`--export-backup` 失败、`recover --abandon` 条件不满足等（包括事务区已创建但尚未修改任何受管路径、已被自动删除的情况） |
+| 2 | 用法错误（严格解析失败、缺少必填参数、参数不成对等），不取锁、不发起网络请求、不修改任何文件 |
+| 4 | 已自动回滚到事务前状态 |
+| 5 | 需人工介入：事务已经开始，而本进程无法确认已经恢复——检测到外部篡改、回滚失败或超时、恢复后复查失败，或提交后的向前清理没有完成；stderr 输出保留的事务区路径，处理步骤见 `docs/troubleshooting.md` |
+
+### 信号与取消（规格 §13.3）
+
+`SIGINT`/`SIGTERM` 取消主 context。锁等待期间收到：立即返回 1。第一个受管路径修改之前收到：删除事务区，返回 1。事务进行中收到：回滚，成功返回 4。回滚和提交后的向前清理一律使用独立于主 context 的 context（回滚最长 120 秒），因此回滚过程中或提交后清理过程中再收到信号也不会被打断：回滚仍然完成并返回 4，已提交的事务仍然向前完成并返回 0。事务开始之后任何不能确认已经恢复的失败都返回 5，而不是 1。
+
+### 已知限制
+
+- 修改后的私网拒绝列表只在 `install`/`reinstall` 时生成；网卡地址或 `--server` 解析结果变化后须重新执行一次 `reinstall`。
+- `reinstall` 不接受修改 `name`/`server`/`port`/`sni`；需要这些变化时先 `uninstall --purge` 再重新 `install`（公钥、UUID、short_id 会重新生成，订阅中心需要先 `remove` 旧节点再 `add`）。
+- `--export-backup` 归档没有受支持的导入或解压恢复方式，见上文。
+- 内存：下载 sing-box 时，`extractMember`（`internal/realitynode/download.go`）会把解包出来的整个 `sing-box` 成员（约 76–81 MB）先读入内存缓冲区再写盘，缓冲区扩容过程中旧缓冲区在被回收前仍占用内存，所以瞬时占用数倍于二进制本身（这是读代码得出的原因，未用内存分析工具实测）。真机上，总内存 412 MB、无 swap 的实例执行 `install` 时 `proxyctl` 内存涨到约 197 MB 被 OOM killer 杀掉（`Killed`，退出码 137）；总内存约 1.8 GB 的 arm64 实例上安装成功。**节点机建议至少 1 GB 内存**，该下限尚未在 1 GB 实例上实测确认。内存不足被杀之后，见 [troubleshooting.md](troubleshooting.md) 的“安装被 OOM killer 杀掉”。
+- 真实 systemd 上 uninstall/purge 的一个恢复窗口尚未验证，待 Task 13 真机验收：unit 文件已删除之后、`daemon-reload` 完成之前发生崩溃，或 `daemon-reload` 调用本身失败时，回滚的降级步骤会对已不存在的 unit 文件执行 `systemctl disable`，真实 systemd 可能拒绝，结果是返回 5（而不是 4 或 0），事务区和现场原样保留；处理方式见 [troubleshooting.md](troubleshooting.md) 中关于退出码 5 的通用做法。
+
+## 首次安装（`bootstrap-node.sh`，Task 11，规格 §12）
+
+**首次两步，之后只需记住 `sudo proxyctl node`**。脚本是 v0.10.0 Release 的 asset：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+```
+
+```bash
+sudo bash bootstrap-node.sh
+```
+
+可选校验：另下载同一 Release 的 `checksums.txt`，执行 `sha256sum -c --ignore-missing checksums.txt`，看到 `bootstrap-node.sh: OK` 再运行脚本。
+
+执行顺序（先到先停，前面任何一步失败都不会进入下一步）：
+
+1. 解析自身参数（用法错误返回 2，早于 root 检查、加锁和网络）。
+2. 检查 root、OS（Debian 12、Ubuntu 22.04/24.04/26.04）、架构（amd64/arm64）。
+3. 角色预检：订阅中心角色必须是“否”（`install.json`、`/var/lib/singbox-sub-manager/token`、默认 `nodes.conf` 三者都不存在）。角色是“是”或“不确定”（包括只剩其中一个文件，或没有 `install.json` 的旧订阅中心）一律返回 1，不下载，并提示订阅中心的升级使用 `install-proxy.sh update`；误创建在节点机上的 `nodes.conf` 删除后重试。
+4. 取 L1（`/run/lock/singbox-sub-manager.lock`，等待最长 30 秒，超时返回 1）。持锁期间复查角色、判定本机 `proxyctl`、必要时安装固定版本。L1 同时是共享二进制锁，期间 `install-proxy.sh`、`merge-nodes.sh`、`node service` 变更命令都会等待。
+5. exec 之前先关闭锁文件描述符，因此 `proxyctl node` / `node service install` 可以正常重新取锁并复查角色。
+
+### 本机已有 `proxyctl` 时的决策
+
+固定版本是脚本内置的 `v0.10.0`，不能由环境变量或参数改写。只有 `.sha256` 校验通过的二进制才会被执行（先比对哈希，再 `version`）。
+
+| 本机 proxyctl | 处理 |
+|---|---|
+| 不存在 | 安装固定版本 |
+| `.sha256` 缺失，或与二进制哈希不符 | 不执行该二进制。无 `--replace-proxyctl`：返回 1；有：安装固定版本 |
+| 校验通过，版本不可解析（含 `dev`） | 返回 1 |
+| 校验通过，版本等于固定版本 | 能力探测（`proxyctl node service --help` 退出码 0）通过则复用，否则返回 1 |
+| 校验通过，版本不低于 v0.10.0 且不同于固定版本 | 返回 1，不替换、不降级；比固定版本新时提示直接运行 `sudo proxyctl node`，比固定版本旧时提示执行 `sudo bash bootstrap-node.sh --upgrade`（见下文“升级”） |
+| 校验通过，版本低于 v0.10.0 | 安装固定版本（旧版本没有节点机功能，且这台主机没有需要保护的状态） |
+
+`--replace-proxyctl` 只修复**无法校验的安装文件**（`.sha256` 缺失或不符，典型原因是安装在二进制与 sidecar 两次 rename 之间被 SIGKILL 或断电打断）；它不会替换、降级任何一个校验通过的 `proxyctl`，对“版本相同但缺能力”“版本不可解析”“版本更新”这几行也没有效果。`/usr/local/bin/proxyctl` 或其 `.sha256` 不是普通文件（目录、符号链接）时脚本直接返回 1，不执行、不替换，请先人工检查。
+
+### 安装步骤（需要安装时）
+
+1. 在 `/usr/local/bin/` 里用 `mktemp` 创建临时文件，下载 `proxyctl-linux-<amd64|arm64>` 和 `checksums.txt`（来自 `https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/`，每个文件限时 120 秒）。
+2. `checksums.txt` 中必须恰好有一行对应该资产，SHA256 必须匹配；下载得到的二进制 `version` 输出必须等于 `v0.10.0`，`node service --help` 退出码必须为 0。任何一项失败：删除全部临时文件，返回 1，已安装的文件保持原样。
+3. 先 rename 二进制（0755），再 rename `.sha256`（0644，内容为小写十六进制哈希加换行，与 `install-proxy.sh` 布局相同），都在同一目录内；最后复核已安装二进制的哈希等于 sidecar、`version` 等于固定版本。
+4. SIGINT/SIGTERM 在任何阶段都会终止进行中的下载、删除临时文件、释放锁，返回 1。
+
+### 确认 `proxyctl` 之后
+
+- 无参数且 stdin、stdout 都是终端：`exec proxyctl node`（菜单）。
+- 带参数：去掉 `--replace-proxyctl` 后其余参数原样（逐字节）交给 `exec proxyctl node service install ...`；退出码就是该命令的退出码。
+- 无参数且不是终端：输出用法，返回 2（此时 `proxyctl` 已经装好或修复）。
+
+脚本自己的退出码：`1` 修改之前失败（root/OS/架构/角色不符、锁超时、下载或校验失败、`proxyctl` 决策表要求停止），`2` 用法错误。其余退出码来自被 exec 的 `proxyctl`（含义见 cli-reference）。脚本不写任何 Reality 实例资产，只写 `proxyctl` 及其 `.sha256`。
+
+## 升级（`bootstrap-node.sh --upgrade`，Task 12，规格 §12）
+
+Ubuntu 26.04 上，节点升级的兼容检查使用 GNU `timeout` 结束超时的进程组。标准系统已提供 `gnutimeout`。精简镜像若缺少该命令且默认 `timeout` 为 uutils，请先安装 `gnu-coreutils`。
+
+节点机在套件更新规格交付之前的**唯一**升级入口（节点机不支持 `install-proxy.sh update`，订阅中心才用它）。从**目标版本的 Release** 下载该版本的 `bootstrap-node.sh`（目标版本就是脚本内置的 `v0.10.0`），再升级：
+
+```bash
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+```
+
+```bash
+sudo bash bootstrap-node.sh --upgrade
+```
+
+`--upgrade` 必须是唯一参数；与任何其他参数（包括 `--replace-proxyctl`）同时出现返回 2，早于 root 检查、加锁和网络。升级模式不 exec `proxyctl`，做完就退出。
+
+顺序（先到先停）：解析参数 → root、OS、架构 → 角色预检（订阅中心角色必须是“否”，否则返回 1，不下载）→ 取 L1（`/run/lock/singbox-sub-manager.lock`，30 秒）→ 取 L3（`/run/lock/proxyctl-reality.lock`，10 秒）→ 持锁复查角色 → 检查实例事务 → 判定本机 `proxyctl` → 下载并验证候选 → 只读兼容检查 → 保存旧副本 → 替换 → 验证。
+
+- **实例事务**：`/var/lib/proxyctl-reality-txn/` 或 `/var/lib/.proxyctl-reality-txn.tomb-*` 存在时返回 1，提示先执行 `sudo proxyctl node service recover`，不下载，`proxyctl` 字节不变。
+- **本机 `proxyctl` 的判定**：
+
+| 本机 proxyctl | 处理 |
+|---|---|
+| 不存在 | 返回 1，提示不带 `--upgrade` 运行以完成首次安装 |
+| `.sha256` 缺失或与二进制哈希不符 | 不执行该二进制，返回 1，提示不带 `--upgrade`、改用 `--replace-proxyctl` |
+| 不是普通文件（目录、符号链接） | 返回 1，不执行 |
+| 版本不可解析（含 `dev`） | 返回 1 |
+| 版本等于固定版本 | 返回 0，说明已是该版本；不下载、不做任何修改 |
+| 版本高于固定版本 | 返回 1，不降级 |
+| 版本低于固定版本 | 升级 |
+
+- **候选验证**（任一项失败：删除临时文件，返回 1，其余一概不动）：在 `/usr/local/bin/` 里用 `mktemp` 建临时文件 → 下载 `proxyctl` 与 `checksums.txt`（每个文件 120 秒）→ SHA256 → `version` 必须等于 `v0.10.0` → `node service --help` 退出码为 0。
+- **只读兼容检查**：用通过验证的候选二进制读取本机实例，防止升级后新版本读不懂旧实例。`/var/lib/proxyctl-reality/`、`/etc/proxyctl-reality/`、unit 文件、`/usr/local/lib/proxyctl-reality/` 四个资产根**全部不存在**时没有状态需要验证，跳过；只要有任何一个存在（包括残缺的、悬空符号链接）就执行候选的 `node service show`，必须在 15 秒内（含它自己等 L3）返回 0，stdout 丢弃，诊断信息（stderr）保留。未知 schema、状态不一致、锁超时、执行失败、超时都拒绝升级，返回 1，原二进制、`.sha256`、旧副本和全部实例资产保持不变。检查不会迁移或改写任何状态。
+  锁交接：父进程一直持有 L1（所以实例变更和共享二进制替换都被挡住）、关闭自己的 fd 8 释放 L3；子进程不继承 fd 8 和 fd 9，由 `show` 自己取得并释放 L3。子进程结束后父进程重新取 L3（10 秒），复查角色、事务区/墓碑，并确认四个资产根下每一项的存在性、类型、内容、属主和 mode 与检查前一致；有变化或重取不到锁返回 1，不替换。超时或收到信号时先终止并回收子进程及其子孙，再清理、解锁。
+- **旧副本**：`/var/lib/proxyctl-bootstrap/previous/`（目录 root:root 0700；`proxyctl` 0700，`proxyctl.sha256` 0600），只保留最近一次升级前的那一对，下次升级时覆盖。每个文件先写同目录临时文件、fsync、再 rename，两个文件写完并 fsync 目录后，核对旧副本两文件互相匹配且等于当前安装的字节，才允许开始替换；保存失败返回 1，已安装的二进制和 `.sha256` 不变。保存期间断电可能留下**不匹配的旧副本**，它不能直接用于人工回滚（见下文哈希门禁）。该目录不属于 Reality 实例，不参与角色检测。
+- **替换与验证**：先 rename 二进制（0755），再 rename `.sha256`（0644），都是同目录临时文件；验证已安装二进制的哈希等于 `.sha256`、`proxyctl version` 等于 `v0.10.0`。替换或验证失败：从旧副本恢复两个文件并校验，恢复成功返回 4，恢复失败返回 5，两种情况都输出旧副本路径。
+- **信号**：替换开始之前收到 SIGINT/SIGTERM（下载、兼容检查、保存旧副本期间）：终止并回收子进程，删除临时文件，返回 1。替换开始之后、验证完成之前收到：不打断替换，按失败规则恢复旧副本，返回 4（恢复失败 5）。验证全部通过即成功边界，之后收到的信号只完成临时文件清理和解锁，返回 0，不回滚。
+- **成功后**：stderr 提示新版本固定的 sing-box 版本可能与实例当前使用的不同，请执行 `sudo proxyctl node service show` 查看，必要时 `sudo proxyctl node service reinstall`；锁 fd 8、9 在退出前已关闭。
+
+### 退出码（升级模式）
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功，或本机已是该版本（未做任何修改） |
+| 1 | 替换之前失败（角色、事务、`proxyctl` 判定、下载与校验、兼容检查、取锁超时、保存旧副本失败），已安装文件不变 |
+| 2 | 用法错误（`--upgrade` 之外还有任何参数） |
+| 4 | 替换或验证失败，已从旧副本恢复，旧版本仍在 |
+| 5 | 替换或验证失败，**恢复也失败**，需人工介入；输出旧副本路径，按下文修复 |
+
+### 人工回滚（从旧副本恢复）
+
+只有在下面**全部**满足时才支持直接换回旧版本：
+
+- 升级后只执行过只读的 `node service show`（含兼容检查本身）。只读 `show` 不改变实例，回滚窗口保持打开。
+- 升级后**没有**执行过任何 `node service` 生命周期变更命令：`install`、`reinstall`、`uninstall`、`uninstall --purge`、`recover`、`recover --abandon`，**包括失败的和被取消的变更**。
+- 实例没有未完成事务或墓碑。
+
+一旦执行过任何这类变更命令，新版本可能已经写出了旧版本不认识的格式：**不要直接把旧二进制换回去**，保留新二进制，使用匹配版本的 `recover` 或后续独立的迁移方案；降级不能用来绕过未知 schema 检查。**无法确认是否满足上述条件时，不要执行，先停下来。**
+
+恢复步骤（以 root 执行；先按 L1→L3 取锁，**先验证旧副本是普通文件且二进制哈希与 `.sha256` 严格匹配，才会执行或覆盖任何东西**，两个文件各自原子替换，最后验证并解锁）。把下面这段保存成文件（例如 `restore-proxyctl.sh`），用 `sudo bash restore-proxyctl.sh` 执行；不要直接粘进交互 shell（里面有 `set -eu` 和 `exit`）。这段命令由测试 `tests/test_bootstrap_restore.sh` 原样抽出，在临时根里用真实 flock 执行：
+
+<!-- proxyctl-manual-restore:begin -->
+```bash
+set -eu
+L1=/run/lock/singbox-sub-manager.lock
+L3=/run/lock/proxyctl-reality.lock
+BIN=/usr/local/bin/proxyctl
+PREV=/var/lib/proxyctl-bootstrap/previous
+
+# 1. 先 L1 后 L3，整个恢复期间持有
+exec 9>"$L1"; flock -w 30 9
+exec 8>"$L3"; flock -w 10 8
+
+# 2. 旧副本必须是普通文件（不是符号链接/目录），且二进制哈希等于 .sha256；
+#    不满足就停止：不执行旧副本，也不覆盖当前安装
+for f in "$PREV/proxyctl" "$PREV/proxyctl.sha256"; do
+  if [ ! -f "$f" ] || [ -L "$f" ]; then echo "旧副本缺失或不是普通文件: $f" >&2; exit 1; fi
+done
+for f in "$BIN" "$BIN.sha256"; do
+  if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then echo "当前安装不是普通文件: $f" >&2; exit 1; fi
+done
+want="$(tr -d '[:space:]' < "$PREV/proxyctl.sha256")"
+have="$(sha256sum "$PREV/proxyctl" | cut -d' ' -f1)"
+if [ -z "$want" ] || [ "$want" != "$have" ]; then echo "旧副本二进制与 .sha256 不匹配，停止" >&2; exit 1; fi
+
+# 3. 在目标目录里准备两个临时文件并再次核对
+tmp_bin="$(mktemp "$(dirname "$BIN")/.proxyctl.restore.XXXXXX")"
+tmp_side="$(mktemp "$(dirname "$BIN")/.proxyctl.restore.XXXXXX")"
+cat "$PREV/proxyctl" > "$tmp_bin"; chmod 0755 "$tmp_bin"
+printf '%s\n' "$want" > "$tmp_side"; chmod 0644 "$tmp_side"
+if [ "$(sha256sum "$tmp_bin" | cut -d' ' -f1)" != "$want" ]; then rm -f "$tmp_bin" "$tmp_side"; echo "临时文件校验失败，停止" >&2; exit 1; fi
+
+# 4. 各自原子替换：先二进制，后 .sha256
+mv -f "$tmp_bin" "$BIN"
+mv -f "$tmp_side" "$BIN.sha256"
+
+# 5. 验证后才执行；最后解锁
+if [ "$(sha256sum "$BIN" | cut -d' ' -f1)" != "$want" ] || [ "$(tr -d '[:space:]' < "$BIN.sha256")" != "$want" ]; then echo "恢复后校验失败，不要使用 $BIN" >&2; exit 1; fi
+"$BIN" version
+exec 8>&- 9>&-
+```
+<!-- proxyctl-manual-restore:end -->
+
+恢复只改 `/usr/local/bin/proxyctl` 和 `.sha256`，不碰任何实例资产，也不会改写旧副本。步骤中途被打断时旧副本仍在，整段重新执行即可（幂等）。恢复后再运行一次 `sudo proxyctl node service show` 确认实例读取正常。
+
+### 升级被 SIGKILL 或断电打断：安装文件修复
+
+SIGKILL 和断电无法被捕获。两次安装 rename 之间被打断，会留下**新二进制配旧 `.sha256`**：普通运行（包括不带参数的 `bootstrap-node.sh`）发现 `.sha256` 不符就拒绝执行这个二进制并返回 1。此时用**同一个目标 Release** 的 `bootstrap-node.sh` 加 `--replace-proxyctl` 修复安装文件，修好后再按首次安装模式进入原有菜单或 `install` 流程；不要用更旧的脚本降级：
+
+```bash
+sudo bash bootstrap-node.sh --replace-proxyctl
+```
+
+已安装实例的主机上不带安装参数、又不在终端里运行时，修复本身成功（两个文件一致），随后按首次安装模式的非交互规则输出用法并返回 2，这个 2 不表示修复失败，之后直接运行 `sudo proxyctl node` 即可。修复只重写 `/usr/local/bin/proxyctl` 及 `.sha256`，不触碰实例资产。这与上面的“人工回滚（降级）”是两回事：修复把两个文件修成同一个目标版本，回滚是换回旧版本。
+
+保存旧副本期间被打断则留下不匹配的旧副本，当前安装不受影响；人工回滚的哈希门禁会拒绝它。
+
+### 限制
+
+本版本没有 `proxyctl update/rollback` 命令，也没有节点机更新会话；升级只有 `bootstrap-node.sh --upgrade`，回退只有上面的人工步骤。带会话和自动回滚的节点机升级由后续套件规格定义。
+
+## 交互菜单（`sudo proxyctl node`，Task 10，规格 §4.4）
+
+节点机上不带参数运行 `sudo proxyctl node`（stdin 与 stdout 都是终端）即可用菜单完成安装与日常管理，不必记住命令行参数；管道或脚本里仍只输出用法并返回 2。非 root 时只提示用 `sudo` 重新运行（返回 1），不读取角色。菜单首行显示“订阅中心=是/否/不确定”与 Reality 代理服务的状态；当前状态下不可用的项照样显示并注明原因。存在未完成的事务时，角色行下方给出 `sudo proxyctl node service recover`（发布事务则是 `sudo proxyctl node publish --recover`），菜单没有恢复项。
+
+节点机上可用的项：
+
+- **安装 VLESS Reality 服务**：依次问节点名称、服务端地址、监听端口、SNI。服务端地址的默认值来自对 `api.ipify.org` 的 IPv4 探测（10 秒超时，仅 IPv4），**只是默认值，须你确认或修改**；探测失败时手动输入。SNI 默认 `www.microsoft.com`，同样须确认。提示：大量部署共用同一个 SNI，与云厂商的 IP 段组合在一起，可能成为可识别的特征，建议按需选择不同的、本机所在网络可达的站点。
+- **显示注册命令**：等同 `node service show`，输出粘贴到订阅中心的那一条命令。
+- **幂等重装**：等同 `node service reinstall`。
+- **卸载**：先选“保留身份”或“彻底清除”（已卸载但保留身份的状态只能彻底清除）；彻底清除时再询问是否导出备份归档（归档含私钥，没有受支持的导入方式，见上文）。
+
+每一项都是：收集输入 → 打印等价的完整命令 → 询问确认 → 调用同一个 `node service ...` 命令。**确认之前不取锁、不写入任何文件**；所有确认默认“否”（`[y/N]`），只有只读的“显示注册命令”默认“是”（`[Y/n]`，直接回车即执行 `node service show`）。回答“否”（或任何不是 `y`/`yes` 的内容）、在默认“否”的确认处直接回车、或输入结束（Ctrl-D），都是无副作用的取消。确认之后菜单把控制权交给该命令，退出码、报错和 SIGINT/SIGTERM 行为与直接运行它完全一致（菜单不改写它们）。订阅中心一侧的菜单项见 README“交互菜单”一节和 [cli-reference.md](cli-reference.md)。
+
+## 已实现：只读检测
+
+### 订阅中心角色（`internal/role`）
+
+判定本机是否为订阅中心，三态结果：
+
+- **是**：`install.json` 可解析，`domain` 非空，`subscription_root` 是已存在目录，`token_file` 指向的 token 文件有效，且默认 `nodes.conf` 存在。
+- **否**：`install.json`、默认 token 文件、默认 `nodes.conf` 三者都不存在。
+- **不确定**：其余情况，逐项列出缺失或异常的文件。常见原因和处理方式见 [troubleshooting.md](troubleshooting.md#订阅中心角色检测显示不确定)。
+
+判定完全只读，不创建、不修改任何文件。
+
+### Reality 实例状态（`internal/realitynode`）
+
+按优先级判定本机 Reality 代理实例的状态，命中第一条即停止：
+
+1. **未完成事务**：事务区或墓碑目录存在（优先于其他一切判断）。
+2. **未安装**：`/etc/systemd/system/proxyctl-reality.service`、`/etc/proxyctl-reality/`、`/var/lib/proxyctl-reality/`、`/usr/local/lib/proxyctl-reality/` 全部不存在。
+3. **已安装**：manifest 的 `state=installed`，且 manifest 记录的每项资产（unit、config、私有二进制按内容哈希；`secrets.json`、`instance.json` 按 mode/owner 和内部 schema 字段）都通过校验。
+4. **已卸载但保留身份**：manifest 的 `state=uninstalled`；`secrets.json`、`instance.json` 各有一条 manifest 动态状态条目，且按该条目通过 mode/owner 和内部 schema 字段校验；unit、config、私有二进制目录都不存在。
+5. **不一致**：以上都不满足，逐项列出不一致之处，不提供自动修复。
+
+同样完全只读；`锁文件 /run/lock/proxyctl-reality.lock` 不属于实例资产，不参与判定。
+
+### 身份生成与推导（`internal/realitynode`）
+
+- `GenerateIdentity`：生成 UUIDv4、X25519 私钥（base64 raw-url 编码）和 8 字节 short_id。
+- `DerivePublicKey`：从私钥实时推导公钥；公钥从不持久化存储。任何错误信息都不回显传入的私钥内容。
+
+X25519 推导的正确性由 RFC 7748 §6.1 的标准测试向量验证（`internal/realitynode/identity_test.go`），向量取自 Go 标准库 `crypto/ecdh` 自身的测试数据。
+
+## 已实现：实例配置、私有下载与自检（`internal/realitynode`，Task 6）
+
+以下能力已被上文 `node service install/reinstall/show` 消费（Task 7）。
+
+### 私有 sing-box 下载与校验（`download.go`）
+
+- 固定版本 `1.14.1`，两种架构（amd64/arm64）的 tarball SHA256 编译期写死；`reinstall --singbox-version/--singbox-sha256` 走同一套校验路径。
+- 下载、SHA256 校验、解包（只接受目标成员这一个普通文件，拒绝符号链接/硬链接/其他类型/重复条目，大小上限 200 MB）都发生在调用方提供的事务区 `dl/` 目录（经目录 fd 操作，不经字符串路径）。
+- `sing-box version` 按空白分词精确匹配版本 token（`1.12.1` 不会被 `1.12.10` 误匹配）；`sing-box check -c <config>` 用于配置校验。
+- 所有外部命令（`version`/`check`，以及 `systemd.go` 的 `systemctl`）通过同一个 `ExecRunner`：每次调用有固定超时，子进程置于独立进程组，超时或取消时对整个进程组发 `SIGKILL` 并 `Wait`，避免孙进程残留端口或文件描述符。
+
+### 服务配置、地址与端口选择（`config.go`）
+
+- `--name`/`--server`/`--port`/`--sni` 的参数校验：`--server` 接受 IPv4 字面量或主机名（拒绝 IPv6 字面量），`--sni` 只接受主机名（拒绝任何 IP 字面量）。
+- **SNI 是共用的伪装特征，这本身是一项限制，而不是可以随意忽略的细节**：默认 `www.microsoft.com`，同一个 `--sni` 可以被多个 Reality 节点共用。但大量部署共用同一个 SNI，与云厂商的 IP 段组合在一起，可能成为可被识别的特征（规格 §4.4）。交互式安装时须由用户确认或修改这个默认值，不能不假思索地照单全收。
+- 服务端配置 JSON 的字段结构与 Task 1 用固定版本 sing-box 真实验证过的结构逐字段一致（`internal/realitynode/probe_integration_test.go` 的 `renderServerConfig`）。
+- **私网拒绝规则**：生产配置显式列出 RFC 1918、`100.64.0.0/10`、链路本地、IMDS、IPv6 ULA/link-local 等固定拒绝列表，另外拒绝“本机地址列表”——本机全部非回环接口的 IPv4/IPv6 地址，以及 `--server` 对应的地址（IPv4 字面量直接加入；主机名解析出的全部 A/AAAA 记录加入，覆盖 1:1 NAT 场景下公网地址经隧道绕回本机的风险）。**唯一放行的私网目标**是 `127.0.0.1:<selfcheck_port>`，仅供自检使用。
+- **地址变化不会自动生效**：本机地址列表只在 install、reinstall 时重新生成；网卡地址或 `--server` 解析结果变化后，必须执行一次 `reinstall` 才能刷新拒绝列表。
+- `selfcheck_port` 从 `/proc/sys/net/ipv4/ip_local_port_range` 下限之外的 `[10000, 下限-1]` 区间随机选取，避开 `listen_port`，确认可绑定 `127.0.0.1`，最多尝试 10 次；范围为空或 10 次都失败时判为错误。reinstall 时如果记录的端口不再可绑定，会按同一规则重新选取。
+- systemd unit 内容固定，与 Task 1 的实测夹具（`testdata/probe/reality.service`）逐字节一致，只替换 sing-box 版本号。
+
+### 门禁与自检（`systemd.go`、`selfcheck.go`）
+
+- `Systemctl` 是 `internal/transaction.Systemd` 接口的生产实现（`systemctl` 调用，15 秒超时），并提供 `BuildGate` 构造出的“本机门禁”（规格 §9.2）：最多轮询 10 秒，确认 unit `ActiveState=active`、`0.0.0.0:<listen_port>` 有 TCP 监听、监听 socket 属于 unit 的 `MainPID`、`/proc/<MainPID>/exe` 等于目标版本的私有二进制路径，再执行一次 `sing-box check`。这个 `transaction.Gate` 既用于正向安装/重装的自检，也用于回滚后的门禁复查（回滚时目标 manifest 是事务前 manifest,由调用方传入）。
+- `ProbeDest` 实现 dest 探测（TLS 1.3 握手 `<sni>:443`，系统根证书校验，ALPN 提供 `h2`/`http/1.1` 但不强制协商到 h2）。**dest 探测只能证明安装那一刻可达**：dest 站点后续不可用，或被上游封锁，握手会失败，但不会有任何后续自动告警——两次自检之间无法持续监控 dest 可用性。
+- `RunSelfcheck` 实现本地 Reality 数据通路（E1/E2/E3）与外网探测：`proxyctl` 自身持有 E3（`127.0.0.1:<selfcheck_port>`）返回随机 nonce；临时客户端复用 `health/remote.GenerateConfig` 生成配置，写入事务区（0600，含 uuid），经 E2 请求 E3 验证 nonce；成功后复用同一客户端探测外网（默认 `https://www.gstatic.com/generate_204`），失败只告警，不影响自检结果（结果里单独有一个 egress 分类字段，方便区分“外网告警”和“整体成功”）。四类失败（dest 不可达/本机服务/协议/出口外网）用类型区分，供 CLI 层映射退出码，不依赖错误文本；E2 的最多三次启动重试和 nonce 请求共用规格 §13.2 的同一个 30 秒预算，不是各自独立的 30 秒。E3 绑定失败（端口已被占用）时会尽力给出占用者的 PID 和进程名（读取 `/proc`，查不到时不影响“本机服务”这一判定，只是诊断信息缺失）。
+- 任何退出路径（成功、失败、取消、各类超时）都保证：临时客户端进程被杀且已 `Wait`、E3 监听已关闭、HTTP 连接已释放，端口可立即重新绑定。
+
+## 尚未实现
+
+- 节点机上的 `proxyctl update/rollback` 命令和更新会话：本版本不提供，升级只有 `bootstrap-node.sh --upgrade`（见上文），带会话和自动回滚的节点机升级由后续套件规格定义。
+
+“已实现：只读检测”与“已实现：实例配置、私有下载与自检”两节描述的 Task 2/6 库函数已被上文 `node service install/reinstall/show` 消费，不再是仅能通过 Go 测试触达的独立层。

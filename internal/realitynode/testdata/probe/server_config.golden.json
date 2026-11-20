@@ -1,0 +1,87 @@
+{
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "tag": "reality-in",
+      "tls": {
+        "enabled": true,
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "short_id": [
+            "0123456789abcdef"
+          ]
+        },
+        "server_name": "www.microsoft.com"
+      },
+      "type": "vless",
+      "users": [
+        {
+          "flow": "xtls-rprx-vision",
+          "uuid": "11111111-1111-4111-8111-111111111111"
+        }
+      ]
+    }
+  ],
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct",
+    "rules": [
+      {
+        "ip_cidr": [
+          "127.0.0.1/32"
+        ],
+        "outbound": "direct",
+        "port": [
+          54321
+        ]
+      },
+      {
+        "action": "reject",
+        "ip_cidr": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "224.0.0.0/4",
+          "240.0.0.0/4",
+          "::/128",
+          "::1/128",
+          "::ffff:0:0/96",
+          "64:ff9b::/96",
+          "64:ff9b:1::/48",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8"
+        ]
+      },
+      {
+        "action": "reject",
+        "ip_cidr": [
+          "203.0.113.9/32"
+        ]
+      },
+      {
+        "action": "reject",
+        "ip_is_private": true
+      }
+    ]
+  }
+}

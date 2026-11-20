@@ -1,0 +1,3 @@
+#!/bin/sh
+# fixture placeholder for the pinned sing-box binary; not executed by tests.
+exit 0

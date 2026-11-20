@@ -30,3 +30,75 @@
 **检测能力（不是保证）**：若某个已打开的目录在「打开之后、变更前的祖先链复核之前」被移出可信根或被替换，且复核执行时该变化仍可观察到，复核会发现并使操作以错误失败，不执行后续的创建、替换、删除或读取。发生在复核完成之后、实际系统调用之前的移动不在检测范围内；复核前被移出又移回的目录也观察不到。这只能收窄攻击窗口，不能消除它，只由上述安全前提覆盖。
 
 依据：`docs/superpowers/specs/2026-09-12-v0.7.1-openat-path-hardening-design.md` 第 3.3 节。
+
+## 主机锁编排（`internal/hostlock`）的安全前提（v0.10 起）
+
+`internal/hostlock` 把 v0.10 新增的三把主机级锁（L1 安装锁、L2 恢复锁、L3 Reality 节点锁）统一为固定的 L1→L2→L3 加锁顺序、反向释放顺序，供 `node` 默认 CRUD、`backup`、`restore`、`merge-nodes.sh` 等调用点共用。这只是一套进程内的编排约定，不是可验证的运行时不变量：
+
+- **顺序由调用约定保证，不由内核强制。** 任何调用点如果绕过 `hostlock.Acquire` 直接对 L1/L2/L3 路径执行 `flock`，或者以错误顺序调用，都可能造成死锁或绕过串行——这与其他锁编排代码同样依赖约定而非机制强制一致。
+- **锁文件描述符不得被继承后再次申请。** 同一把 `flock` 锁，从继承的文件描述符上再次申请（即使在同一进程内，或子进程持有父进程已打开的 fd）会阻塞或产生误判；`exec` 前必须显式关闭锁 fd（shell 侧的 `exec 9>&-`），子进程方式调用时被调用者不得再申请调用者已持有的锁。`install-proxy.sh` 持有安装锁期间以子进程方式调用的 `merge`、`health`、`version`、`backup`、`restore` 均遵守这条规则。
+- **反向角色检查是尽力而为的一致性检查，不是访问控制。** 取得相应锁后检查本机是否同时存在 Reality 节点资产与订阅中心资产（或遗留的发布/Reality 事务），目的是防止误配置把同一台主机同时当作两种角色使用；它读取的是 `internal/realitynode` 的只读状态判定，不修改任何路径，检查失败与检查通过之间仍存在竞态窗口（例如另一个持有更高层级权限的进程在复查之后创建了 Reality 资产），本设计不消除这个窗口，只降低误用概率。
+- **锁不提供全局串行保证。** 详见 `README.md`「锁的适用范围（已知限制）」一节列出的、仍可能与之并发的旧路径（`install-proxy.sh` 在未持有恢复锁的窗口内调用 `merge`、用户手动执行的 `merge`/`subscription build`、默认 CRUD 与独立 `restore` 之间）。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 11 节。
+
+## 共用事务引擎（`internal/transaction`）的安全前提（v0.10 起）
+
+`internal/transaction` 是 Reality 实例生命周期（install/reinstall/uninstall/purge/recover）和订阅中心发布共用的 journal、安全路径原语与正向步骤执行器。它复用 v0.7.1 为 `internal/backup` 建立的 openat 加固模式（可信根、逐级 `O_NOFOLLOW|O_DIRECTORY` 打开、变更前祖先链复核），但是一份独立实现，不导出或修改 `internal/backup` 的任何公共符号——两者的复验对象不同：`internal/backup` 复验的是同一次调用内已持有的文件描述符，`internal/transaction` 复验的是持久化在 journal `dir_ids` 里、可能跨越进程重启（recover）读取的记录。
+
+- **事务快照含敏感数据。** `snapshot` 步骤把修改前的文件原样复制进事务区 `snap/` 目录（mode 0600）；对 Reality 实例而言，这可能包括 `secrets.json` 中的私钥。事务区、其墓碑目录，以及任何导出的事务证据，都必须按含私钥文件对待：不得作为诊断信息附加到 issue、日志或截图，委托运维人员处理事务区或墓碑时同样适用私钥、订阅 token 等敏感信息的通用披露限制。
+- **临时文件名格式与作用范围。** 事务在受管路径所在目录中创建的一切临时文件，文件名固定为 `.proxyctl-txn-<txn_id>-<十进制序号>`（`TempName`）；journal 会拒绝任何不匹配这个格式、或与其他步骤重复的登记名字，防止把真实文件名误当作临时名登记。这个格式只在受管路径自身的目录内使用（例如 `/etc/proxyctl-reality/`、`/usr/local/lib/proxyctl-reality/versions/<v>/`、发布目录），不会出现在事务区内部（`journal.json(.tmp)`、`dl/`、`snap/` 使用各自固定或专属的名字，不匹配这个格式，也不参与“未登记临时名”扫描）。“未登记临时名”扫描只检查匹配这个格式、却不在当前 journal `steps[].temps`/`rollback_steps[].temps` 中登记的文件；扫描只看受管路径所在目录本身，不递归、不跟随符号链接，也不解读其他程序自己的临时文件（例如 `nodes.WriteFile` 的 `.nodes.*.tmp`）。
+- **叶子本身的符号链接替换是结构性防御，不是检测。** `write_file`、`remove_file`、`set_meta`、`snapshot` 的最后一步系统调用都相对父目录描述符对叶子名字操作，并且总是带 `O_NOFOLLOW`（或等价地：先以 `O_NOFOLLOW` 打开叶子取得文件描述符，再对该描述符执行 `fchmod`——`set_meta` 的 chmod 用这种方式，是因为经典 `fchmodat` 系统调用本身不支持 `AT_SYMLINK_NOFOLLOW`，`chown` 则用 `Fchownat` 自带的 `AT_SYMLINK_NOFOLLOW`）。打开叶子时还带 `O_NONBLOCK`，防止一个被替换成 FIFO 的叶子在没有写端时把持锁的进程无限期挂起；随后据打开后取得的 `fstat` 结果核实类型，只接受普通文件（或 `set_meta` 场景下的目录），FIFO、设备等一律拒绝。因此叶子在两次系统调用之间被替换成符号链接或其他类型时，后一次调用会直接失败，不会跟随链接改到根外的文件，也不会挂起——这一条不依赖时序运气，是结构性保证，与下面“祖先链复验”的检测性质不同。
+- **每次修改前都会核对现场与计划记录（Pre）是否一致。** 每个原语在真正执行 `rename`、`unlink`、`rmdir`、`mkdir`、`chown` 之前，都会重新读取目标当前的状态（存在性、类型、大小、内容哈希、权限、属主），并要求它与该步骤登记的 Pre 完全一致，不一致就拒绝执行、不做任何修改。这防止了目标已被外部篡改、或计划记录的前提本身就有误时，原语仍然盲目覆盖或删除现场内容。
+- **祖先链复验与修改之间仍是尽力检测，不是保证。** 与 `internal/backup` 相同的结构性限制在这里同样成立：每次修改受管路径之前，本包都会从可信根重新逐级打开并与 journal 当前记录的 `{dev, ino}` 比对，但复验完成之后、实际修改系统调用发生之前仍有一个无法消除的窗口——没有可移植的操作系统原语能在执行变更的同一时刻确认“这个目录描述符仍然对应复验时的那个对象”。本包对这一固有限制的应对方式是把复验点尽量贴近实际修改（每一次创建临时文件、`rename`、`unlink`、`mkdir`、`rmdir`、`fchmod`、`fchown` 之前都重新执行，而不是复用调用早前打开的描述符），但不消除这个窗口，只依赖与 v0.7.1 相同的安全前提：从可信根到每个目标路径之间的所有目录不得被不可信主体重命名、移动、替换或写入目录项。生产部署（`/etc`、`/var/lib`、`/usr/local/lib`、`/etc/systemd/system`、`dirname(subscription_root)` 均为 root 属主、其他用户不可写）满足该前提；发布场景下唯一已知的例外是 `subscription_root` 及其下的 `<token>/` 目录（被安装器 `chown` 给 `caddy`，因此对 `caddy` 可写），这也是本包为它们保留逐级重新打开与比对、而不是长期持有描述符的原因。
+- **目录身份登记的顺序与窗口。** `mkdir` 的顺序是：创建目录、fsync 父目录、设置权限与属主、把新目录的身份写入 journal、最后才把步骤标记为完成；`rmdir` 的顺序是：删除目录、fsync 父目录、把该位置的身份更新为“不存在”、再标记完成。身份写入和步骤完成分别持久化，确保中途中断后，磁盘状态、journal 记录的身份、步骤状态三者的组合始终落在可识别的合法范围内。身份写入之前的窗口（目录已创建或已删除，但身份记录尚未更新）与之后一样：这段时间内如果可信根之下的目录项被不可信主体替换，本包只能在下一次复验时发现身份不匹配并拒绝继续（返回错误，不执行下一步修改），不能阻止替换本身发生。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.1、7.2、7.3、7.4 节；`docs/superpowers/specs/2026-09-12-v0.7.1-openat-path-hardening-design.md` 第 3.3、6.5 节。
+
+### 回滚、recover 与提交后清理（`internal/transaction/recovery.go`，v0.10 Task 5）
+
+- **恢复期两处“确认为合法崩溃中间态”的例外与它们的边界。** 崩溃发生在 `mkdir`/`remove_dir` 完成、但该目录在 journal `dir_ids` 里的身份尚未更新之间时，recover 会看到一个与 `dir_ids` 记录矛盾的祖先目录（该目录记录为“不存在”却物理存在，或记录为存在却物理不存在）。这两种矛盾各自只在**且仅在**对应的 `mkdir`/`remove_dir` 步骤（正向或回滚）当前状态为 `started`，并且（对 `mkdir` 而言）该目录为空、属主与当前进程一致时，才被 `resolveVerifiedParentEx`（`resolveVerifiedParent` 原有签名与行为不变，这是新增的独立入口）新增的 `except` 回调接受为“本次崩溃的合法窗口”，继续读取而不是报告篡改；这个例外只对**只读的状态判定**（`LiveFileState`/`LiveDirState`，以及恢复自身扫描临时文件时对受管目录的解析）开放，任何会真正修改文件系统的原语（`resolveVerifiedParentHooked`，仍走原有 `resolveVerifiedParent`）都不接受这个例外——一个正在执行修改的原语绝不允许在祖先链未验证一致时继续。这与上文“祖先链复验是尽力检测”的固有窗口是同一类限制在恢复路径上的具体化：能在复验与实际修改之间替换目录项的攻击者，仍可能让这个宽限窗口被滥用，SECURITY 层面的应对仍然只是尽力检测、不是阻断保证。
+- **临时文件扫描与清理不接受调用方预先打开的目录描述符。** `forEachManagedScanDir` 只从 journal 自身记录的受管路径出发，通过调用方提供的 `PathResolver` 和当前 `dir_ids` 重新解析、重新打开每一个需要扫描的目录——与任何原语在修改前的复验完全一致，从不复用回滚过程中可能已经改变甚至已经消失的旧描述符。这避免了“先统一打开一批目录，再在回滚删除了其中某个目录之后仍对其旧描述符做操作”的一类问题；相应地，`scanUnregisteredTemps` 本身不再容忍“目录已不存在”，因为调用方现在总是刚刚复验过目录仍然存在才会打开它——目录确认合法缺失（例如已被一个正在进行的 `remove_dir` 删除）时，直接跳过对它的扫描，而不是打开后再静默吞掉错误。
+- **`write_file`/`mkdir`/`set_meta`/`remove_file`/`remove_dir` 的回滚与续做复用同一批系统调用序列，且在继续执行前先判定现场是否已经等于该步骤的 Pre 或 Post。** 这是恢复能够“幂等续做已 `started` 的步骤”的唯一实现依据：写文件时，只有当该步骤在进入本次调用前就已经是 `started`（真正的续做，不是全新调用）才允许把已登记的临时名从 `O_EXCL` 新建改为截断重写；这个放宽同样只在续做路径上生效，全新调用仍然维持“临时名必须是全新创建”的碰撞检测。`mkdir` 续做在目标已经达到 Post 状态时，只有当 journal 当前记录的目录身份与现场身份**不相等**才会重新登记（不是只看键是否存在）——事务开始时未创建的目录已经登记为“不存在”，仅凭键存在与否判断会让新建目录的真实 inode 永远不被登记。
+- **回滚计划一次性登记，不重新构造。** `beginRollback` 只在从 `running` 首次转入 `rolling_back` 时执行一次：把每个受影响路径从“当前已验证的现场状态”直接映射到“事务前状态”，按目录深度分组排序（创建类由浅到深、删除类由深到浅）后随 `phase=rolling_back`、`rollback_frontier`、`rollback_files_done=false` 一起持久化。此后任何一次 recover 都只续做这份已登记的计划，不重新计算、不重排——这是“先登记后执行”原则在回滚分支上的直接延伸。这份计划覆盖**全部**非 systemd 目标，包括发布事务自己的 staging 目录（Provisional 步骤）：判定“第一个受管路径是否已被修改”只用于决定 recover 报告的结果种类，从不决定是否执行这份计划——staging 内容即使从未被计入修改边界，仍然通过登记过的删除步骤清理，不会遗留在事务区之外。
+- **回滚清理会删除仍被正向步骤“登记”、但事实上已经不会再被使用的临时文件，即使这些名字理论上仍在 `steps[].temps` 里。** 一旦进入 `rolling_back`，正向步骤永远不会再执行，它登记的临时名要么已经被自己的 `rename` 消费掉，要么就是一个真正的崩溃残留；回滚开始前的清理只保留仍属于 `rollback_steps[].temps` 的名字，删除其余匹配 `.proxyctl-txn-*` 格式的项，且总在对应目录自身的 `remove_dir` 之前完成，避免合法残留把目录判定为非空。
+- **systemd 降级/恢复是否执行，只看“是否越过了修改边界”，不看 systemd 步骤自身有没有启动。** `continueRollback` 判断要不要跑 stop/disable/恢复文件/daemon-reload/恢复 UnitFileState/restart+门禁这一整套，条件是“journal 登记了 systemd 步骤，且第一个受管路径已经被修改”——不是“systemd 步骤本身的状态是否已经越过 pending”。后一种判断曾经是一个真实缺陷：reinstall 已经写完新二进制（write_file done），但 systemd 的 enable/restart 还是 pending 时，会被误判为“systemd 还没碰过”，从而跳过整套降级/恢复，把服务留在旧配置对应新二进制的不一致状态。现在的判断只依赖冻结的正向 `steps[]`，在 `running` 和 `rolling_back` 之间重复调用结果一致。
+- **systemd 状态在 `rolling_back` 且尚未开始降级时仍按链规则判定，一旦开始降级就不再判定。** 校验现场时，对 `systemd_enable`/`systemd_disable` 步骤读取 unit 当前真实的 `UnitFileState`（通过调用方注入的 `Systemd.UnitFileState`），按 §7.2 已有的链判定规则核对；只有当 `rollback_systemd` 已经进入 `demoting` 或之后时才完全跳过，因为回滚本身已经在改变这个状态,不能再用正向步骤的 Pre/Post 判断它。
+- **安装形状（unit 此前不存在）的 systemd 恢复不假装有状态可恢复。** `unit_state_before.LoadState` 不是 `loaded` 时（unit 文件此前不存在，例如 install 回滚），文件恢复已经把 unit 文件本身删回“不存在”，此时既没有有意义的 `UnitFileState` 可以恢复，也没有正在运行的进程需要 restart/stop/门禁——只执行 `daemon-reload`（让 systemd 感知 unit 文件已被删除）然后直接标记 `restored`。
+- **墓碑删除完全通过已打开的目录描述符相对路径完成，不重新以字符串路径解析。** `DeleteTombstone`/`Recover` 的墓碑清理从可信根开始按名字打开每一级，无法打开时（目录已不存在、或已在此前某次尝试中被部分删除）一律容忍并继续，不把“找不到”当错误；这与其它原语“绝不用裸路径字符串绕过已验证的描述符”的前提一致。删除过程不解读墓碑内容（可能含私钥快照），只做整体递归删除。
+
+依据：同上；本节新增内容对应设计 §7.3、§7.4、§7.5、§7.6。
+
+## Reality 实例的私网拒绝、自检端口例外与临时客户端凭据（`internal/realitynode`，v0.10 Task 6）
+
+- **`selfcheck_port` 是生产配置中唯一放行的私网目标，且没有额外的访问控制。** 生产服务端配置显式列出 RFC 1918、`100.64.0.0/10`、回环、链路本地（含 IPv6 ULA/link-local）、IMDS 等固定拒绝范围，以及本机全部非回环接口地址和 `--server` 解析出的全部地址；唯一的例外是 `127.0.0.1:<selfcheck_port>`，任何持有该 Reality 节点订阅 UUID 的人都可以访问它。本版本不采用给自检单独分配不分发用户、再用 `auth_user` 收紧这条放行规则的方案（设计已评估，留给后续版本）；`selfcheck_port` 平时没有进程监听，只在 `RunSelfcheck` 执行期间由 `proxyctl` 自身持有。具体暴露面：该 Reality 节点的 UUID 会随订阅分发给所有持有订阅 URL 的人，这个放行规则对**全部**订阅持有者可达，不区分身份；两次自检之间，`proxyctl` 不持续监控这个端口，也就不能发现它是否已被其他进程占用或冒充。
+- **本机地址拒绝列表只在 install/reinstall 时刷新，不持续监控。** `LocalAddressCIDRs` 是一次性调用：网卡地址变化、DNS 解析结果变化，都不会让已运行的实例自动感知,必须由运维执行一次 `reinstall` 重新生成配置。在此之前，新出现的本机地址不在拒绝列表内，理论上可能被同一订阅的持有者通过 Reality 隧道访问到——这与“暴露给订阅持有者”是同一类风险，只是触发条件是拓扑变化而不是端口复用。
+- **临时客户端配置含私钥推导出的凭据，写在调用方提供的事务区目录，mode 0600。** `RunSelfcheck` 为 §9.3 自检生成的临时 sing-box 客户端配置（`internal/health/remote.GenerateConfig` 产出）包含明文 `uuid`、`short_id` 和实时推导的公钥；调用方（Task 7 的事务引擎）负责把这个目录当作事务区的一部分对待——与 `secrets.json` 快照同等敏感，不得被诊断信息、日志或截图引用,随事务区一起删除。私钥本身从不写入这份临时配置：只有公钥（由 `DerivePublicKey` 现算）进入其中。
+- **外部命令（下载校验用的 `sing-box version`/`check`、`systemctl`、临时客户端进程）统一用进程组隔离与强制回收。** `ExecRunner`／`managedProc` 启动的每个子进程都带独立进程组（`Setpgid`），超时或调用方取消时对整个进程组发 `SIGKILL` 并 `Wait`，防止子进程通过忽略信号或派生孙进程的方式在超时之后继续持有端口或文件描述符（`selfcheck_port`/E2 端口的这类残留会让下一次自检的端口选择或绑定失败,是可用性问题而不是凭据泄露，但仍记录在此,因为它与“两次自检之间无法持续监控端口占用”是同一个风险面）。
+- **下载校验路径不接受未经哈希核实的内容进入受管资产。** `DownloadSingbox` 在写入最终二进制之前完成 SHA256 校验、单文件类型校验和大小上限检查，全部发生在事务区 `dl/` 目录内、经目录描述符操作（不经字符串路径），失败时清理临时文件、不产生任何受管路径变化;这与上文“事务快照/临时文件含敏感数据”遵循同一条“失败路径不留可被误用的残留”的原则,但这里保护的是二进制完整性而不是私钥。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 6、8.1、9.3、16 节。
+
+## Reality 实例的卸载、purge、`--export-backup` 与 recover（`internal/realitynode`，v0.10 Task 8）
+
+- **`--export-backup` 归档含私钥，保管责任在用户。** `uninstall --purge --export-backup PATH` 写出的 tar.gz（mode 0600）包含 `/var/lib/proxyctl-reality/`（`secrets.json` 的私钥、UUID、short_id，`instance.json`，manifest）和 `/etc/proxyctl-reality/config.json`（同样含私钥）。这是 purge 之后本机上唯一可能残留私钥的文件，也是唯一一份永久备份；`proxyctl` 不加密、不管理、不轮换它，stderr 每次都会警告。本版本没有导入命令，归档不受支持地解压回原位会得到“manifest 为 installed 但 unit 和二进制都不存在”的不一致状态。不要把它上传到 issue、日志或共享位置；不再需要时安全删除。不带 `--export-backup` 的 purge 不会留下任何隐式私钥备份（事务区快照随事务区一起整体删除，见下）。
+- **归档不会覆盖用户文件，也不会留下临时文件（尽力而为的约束）。** 目标名在写入前检查不存在（`AT_SYMLINK_NOFOLLOW`，悬空符号链接也算已存在），临时文件用 `O_EXCL` 创建在同一目录、mode 0600（显式 `fchmod`，不受 umask 影响），fsync 后用 `link(2)` 放到目标名——`link` 不会替换已有名字，所以检查之后、link 之前被别人占用的目标名会使导出失败而不是被覆盖；随后才删除临时名。失败或取消时临时文件被删除，purge 不开始。这只覆盖 `proxyctl` 自己的失败路径：进程被 SIGKILL 或断电时，导出目录里可能留下 `.proxyctl-export-*.tmp`（同样含私钥、mode 0600），需要手工删除。link 成功之后才出现的失败（删除临时名、目录 fsync）会保留完整的归档并返回 1。归档目标不能位于会被 purge 删除的目录里。归档只按 `O_NOFOLLOW` 读取两个目录里的普通文件和目录，遇到符号链接、设备等其他类型拒绝导出。
+- **purge 的事务区和快照含私钥，完成后整体删除。** purge 把 `secrets.json`、`config.json` 等全部受管资产快照进事务区 `snap/`（mode 0600），成功后按 §7.6 先 rename 为墓碑再递归删除，因此成功的 purge 不留任何含私钥的文件；崩溃后残留的事务区或墓碑在被 `recover` 处理之前仍含私钥快照，必须按含私钥文件对待（见上文“事务快照含敏感数据”）。`recover` 发现墓碑时整体删除，不读取其中内容。
+- **`recover` 不是绕过校验的手段。** `recover` 与自动回滚共用同一个恢复引擎：先按 journal 校验全部受管路径和临时名，任何一项不属于该阶段允许的状态，就判定为外部篡改，不修改任何路径、不修改 journal，返回 5 并保留现场——它不会“强行恢复”被篡改的现场。未知 journal schema 同样只读返回 5。`--abandon` 只在全部受管路径已经处于事务前状态时才删除事务区，不重启服务、不跑门禁：它会让一个可能没有运行的服务保持现状，这是有意的人工放弃出口，stderr 会警告。无 journal 的事务区只有在内容仅为空或 `journal.json.tmp` 时才被丢弃，其他任何内容都返回 5 保留原样。
+- **uninstall/purge 只操作实例资产表里的路径。** 共享的 `/usr/local/bin/proxyctl`（及 `.sha256`）、`/usr/local/bin/sing-box`、`/etc/sing-box/`、`/etc/singbox-sub-manager/` 和 `/var/lib/proxyctl-bootstrap/` 从不被读写；实例目录里出现 manifest 没有登记的内容时，预检拒绝（返回 1），而不是在事务中途删除它们。
+- **不做角色检测。** `uninstall`、`uninstall --purge` 和 `recover` 不读取订阅中心的 token 文件，只以实例状态判定是否可执行（规格 §8 复查表），因此在角色检测“不确定”的主机上也能清理一个卡住的实例。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.4、7.6、8.4–8.6、16 节。
+
+## 订阅中心发布事务（`internal/publish`，v0.10 Task 9）
+
+- **发布事务区、staging 和快照含节点凭据。** 事务区 `/var/lib/singbox-sub-manager/publish/`（root:root、0700）的 `snap/`（mode 0600）保存发布前的 `nodes.conf`（节点密码、UUID 等）和已存在的订阅文件；staging 目录 `<dirname(subscription_root)>/.proxyctl-publish-<txn_id>`（root:root、0700，位于 Web 根**之外**）里是渲染后的 `clash.yaml`、`sr.txt`（内含全部启用节点的凭据，mode 0600）。成功提交或回滚后它们随事务区一起删除（事务区先 rename 为墓碑 `.publish.tomb-<txn_id>` 再递归删除）；崩溃后残留的事务区、墓碑、staging 在被 `node publish --recover` 处理之前仍含这些凭据，必须按含密钥文件对待：不得贴到 issue、日志或截图，也不得为排障而整体拷贝。`recover` 遇到墓碑一律整体删除，不读取其中内容。发布路径不产生 `nodes.conf.bak`，所以事务结束后磁盘上不会留下旧版 `nodes.conf` 的第二份拷贝（不带 `--publish` 的 CRUD 仍有 `.bak`，含明文凭据）。
+- **`subscription_root` 与其下的 `<token>/` 对 `caddy` 可写，这是发布场景唯一已知的“可信根之下不可信主体可写”的位置。** 因此每次修改前都从可信根（`dirname(subscription_root)`，要求 root 属主且 group/other 不可写，否则发布前置检查返回 1）重新逐级 `O_NOFOLLOW|O_DIRECTORY` 打开，并与 journal `dir_ids` 记录的 `{dev, ino}` 比对；叶子文件（`clash.yaml`、`sr.txt`、`nodes.conf`）以 `O_NOFOLLOW` 打开且只接受普通文件。caddy 进程被攻破后把 `<token>/` 整个换成符号链接，或把订阅文件换成指向别处的符号链接：发布前置检查发现时返回 1，事务中途发现时下一步修改不执行，回滚按篡改处理返回 5，不读取也不写入链接目标。复验与实际修改系统调用之间的窗口与 v0.7.1 相同，只做尽力检测、不阻断（见上文“共用事务引擎”一节）；`subscription_root` 本身若被换成指向别处的真实目录同样会在下一次复验时被识别。
+- **最终文件的临时名建在目标文件自己的目录里**（`.proxyctl-txn-<txn_id>-<序号>`，写入、`fchmod`、`fchown`、fsync 后 `rename`），不从 staging 跨文件系统 rename；staging 只用于渲染和校验。`nodes.conf` 为 0600 root:root，订阅文件为 0644、属主沿用前状态（前状态不存在时为 `caddy:caddy`，需要能解析 `caddy` 用户，否则在修改任何发布文件之前返回 1）。发布在受管目录内遇到格式匹配 `.proxyctl-txn-*` 却未登记的文件，recover 按篡改处理返回 5；不匹配该格式的其他程序临时文件（例如 `nodes.WriteFile` 的 `.nodes.*.tmp`）不参与判定。
+- **HTTPS 验证证明的是“本机 Caddy 现在对该域名提供的正文”，不是对公网可达性的检查。** 验证连接固定拨 `127.0.0.1:443`，以订阅域名作 TLS SNI 和 Host，TLS 1.2 及以上、系统根证书校验、不跟随重定向，并逐字节比较响应正文的 SHA-256（连接策略与 `proxyctl health` 一致，但 health 只返回布尔结果，这里需要正文哈希，所以单独实现）；因此公网上同内容的响应、同一台机器上其他虚拟主机的响应都不能让验证通过。每个文件 10 秒超时；超时、取消或错误都按验证失败处理并回滚。这不是访问控制：持有 token 的人仍能下载订阅，token 的保密与轮换不由本机制提供。
+- **回滚成功只按本地状态判定。** 回滚完成条件是三个文件的内容、权限、属主和“原本不存在”都已核对恢复；回滚之后对恢复出的文件再做的 HTTPS 复验只产生告警，不改变退出码、不保留事务区——这样 Caddy 故障不会让一个遗留事务区把默认 `nodes.conf` 的管理整体锁死。提交（验证通过）之后只有 staging 与事务区的向前清理，不再回滚。
+- **取消与超时。** 收到 SIGINT/SIGTERM 时取消主 context：修改受管路径之前返回 1；之后使用独立的 120 秒预算完成回滚（不受主 context 影响），成功返回 4，失败或超时返回 5 并保留事务区；提交之后继续完成向前清理，不回滚。HTTPS 验证、锁等待都受 context 约束，连接和 goroutine 在每条退出路径上释放。
+- **并发保证有限。** 发布持有 L1+L2，只与同样持有这些锁的路径（`merge-nodes.sh`、`install-proxy.sh` 的 install/update/rollback、`backup`、`restore`、`monitor`、默认 CRUD）串行；`install-proxy.sh` 在只持有 L1 时调用的 `proxyctl merge`、用户手动执行的 `proxyctl merge` / `subscription build` 不加锁，仍可能与发布并发写订阅文件——本版本不解决，详见 `README.md`「锁的适用范围（已知限制）」。
+- **发布永不创建身份文件。** 发布只读取 `install.json` 的 `domain`/`subscription_root`/`token_file` 与固定默认 `nodes.conf`，不创建 `install.json`、token、发布目录或 `nodes.conf`；缺少时拒绝并提示重新运行安装器。
+
+依据：`docs/superpowers/specs/2026-09-18-v0.10-reality-node-install-design.md` 第 7.1–7.6、10、11、13 节。
