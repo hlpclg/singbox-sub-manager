@@ -131,7 +131,7 @@ sudo proxyctl node migrate
 在独立的节点机（Debian 12、Ubuntu 22.04/24.04/26.04）上执行两步首次安装：
 
 ```bash
-curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/bootstrap-node.sh
 sudo bash bootstrap-node.sh
 ```
 
@@ -181,7 +181,7 @@ sudo proxyctl node
 节点机（`proxyctl` 由 `bootstrap-node.sh` 安装的独立节点主机）升级 `proxyctl` 只有这一个入口，**不要**在节点机上运行 `install-proxy.sh update`。先下载目标版本 Release 里的 `bootstrap-node.sh`（脚本内置的版本就是目标版本），再升级：
 
 ```bash
-curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/bootstrap-node.sh
 ```
 
 ```bash

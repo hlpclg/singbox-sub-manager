@@ -20,7 +20,7 @@ set -euo pipefail
 # Fixed for this script. Deliberately NOT overridable from the environment or
 # the command line: a bootstrap script installs exactly the release it was
 # published with.
-PROXYCTL_VERSION="v0.10.0"
+PROXYCTL_VERSION="v0.10.1"
 PROXYCTL_REPOSITORY="hlpclg/singbox-sub-manager"
 MIN_NODE_VERSION="v0.10.0"
 DOWNLOAD_TIMEOUT=120

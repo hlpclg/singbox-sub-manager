@@ -30,7 +30,7 @@ trap cleanup EXIT
 
 SCRIPT="$REPO_ROOT/bootstrap-node.sh"
 SCRIPT_UNDER_TEST="$SCRIPT"
-FIXED_VERSION="v0.10.0"
+FIXED_VERSION="v0.10.1"
 
 pass=0
 fail=0
@@ -331,8 +331,8 @@ test_first_install() {
   expect_rc "first install: exec'd proxyctl result passes through" 0
   expect "first install: asset and checksums fetched from the fixed Release, env ignored" \
     bash -c '
-      grep -qx "https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/proxyctl-linux-amd64|120|'"$C"'/bin" "$1" &&
-      grep -qx "https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/checksums.txt|120|'"$C"'/bin" "$1" &&
+      grep -qx "https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/proxyctl-linux-amd64|120|'"$C"'/bin" "$1" &&
+      grep -qx "https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/checksums.txt|120|'"$C"'/bin" "$1" &&
       [[ "$(wc -l < "$1")" -eq 2 ]]' _ "$C/log/curl.log"
   expect "first install: binary installed and sidecar matches" installed_matches_download
   expect "first install: binary mode 0755" mode_is "$BIN" 755
@@ -485,7 +485,7 @@ test_row_same_version_no_capability() {
 
 test_row_newer() {
   local v flag
-  for v in v0.10.1 v0.11.0 v1.0.0 v0.10.10; do
+  for v in v0.10.2 v0.11.0 v1.0.0 v0.10.10; do
     for flag in none replace; do
       new_case "row-newer-$v-$flag"
       make_installed "$v" 0 valid
@@ -797,7 +797,7 @@ setup_checksum_two_different_lines() {
   printf '%s  proxyctl-linux-amd64\n%064d  *proxyctl-linux-amd64\n' \
     "$(sha_of "$C/dl/proxyctl-linux-amd64")" 3 > "$C/dl/checksums.txt"
 }
-setup_version_mismatch() { stage_download v0.10.1 0; }
+setup_version_mismatch() { stage_download v0.10.2 0; }
 setup_version_empty() { make_stub "$C/dl/proxyctl-linux-amd64" "" 0 NEW; write_sums "$C/dl/checksums.txt"; }
 setup_capability_fail() { stage_download "$FIXED_VERSION" 1; }
 

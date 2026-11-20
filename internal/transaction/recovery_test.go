@@ -1119,13 +1119,17 @@ func TestIllegalStatesRejected(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BeginTransaction: %v", err)
 		}
-		// Replace "d" with a fresh directory (new inode) between the
-		// transaction starting and this recover attempt.
-		if err := os.Remove(filepath.Join(base, "d")); err != nil {
+		// Keep the original directory alive so the filesystem cannot reuse
+		// its inode when we create the replacement at the registered path.
+		dir := filepath.Join(base, "d")
+		if err := os.Rename(dir, filepath.Join(base, "original-d")); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Mkdir(filepath.Join(base, "d"), 0700); err != nil {
+		if err := os.Mkdir(dir, 0700); err != nil {
 			t.Fatal(err)
+		}
+		if got := dirIdentityOf(t, dir); got == originalID {
+			t.Fatalf("replacement directory identity = %+v, want it to differ from the original", got)
 		}
 		engine := NewEngine(store)
 		rec := baseRecoverer(t, engine, root, base, nil)

@@ -17,7 +17,7 @@ v0.10 起有两类主机，升级入口不同。**先确认这台主机是哪一
 从**目标版本的 Release** 下载 `bootstrap-node.sh`（脚本内置的版本就是目标版本，不接受环境变量或参数覆盖），再执行：
 
 ```bash
-curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.0/bootstrap-node.sh
+curl -fsSLO https://github.com/hlpclg/singbox-sub-manager/releases/download/v0.10.1/bootstrap-node.sh
 ```
 
 ```bash

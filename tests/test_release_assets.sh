@@ -5,7 +5,7 @@
 # root, so it runs unchanged as root and as uid 1000.
 #
 #   synthetic mode (default)
-#     - the three scripts carry the same version, v0.10.0;
+#     - the three scripts carry the same version, v0.10.1;
 #     - ci.yml and release.yml both register every script and every
 #       tests/test_*.sh for `bash -n`, ShellCheck and execution (rules below);
 #     - release.yml publishes exactly the two binaries, the three scripts and
@@ -21,8 +21,8 @@
 #       with the repository, and the version string of both binaries:
 #       EXPECT_VERSION (default $GITHUB_REF_NAME) must match exactly. A binary
 #       for the host architecture is run directly (`version`); the foreign one
-#       (arm64 on an amd64 runner) is run through qemu-user (qemu-aarch64-static
-#       or qemu-x86_64-static; release.yml installs qemu-user-static). It is
+#       (arm64 on an amd64 runner) is run through QEMU (qemu-aarch64 or
+#       qemu-x86_64, with or without the -static suffix). It is
 #       NOT checked through `go version -m`: the release build uses -trimpath,
 #       and Go then leaves -ldflags (so -X main.Version) out of the recorded
 #       build settings (golang/go#52372). Missing EXPECT_VERSION or a missing
@@ -51,7 +51,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CI_YML="${CI_YML:-$REPO_ROOT/.github/workflows/ci.yml}"
 RELEASE_YML="${RELEASE_YML:-$REPO_ROOT/.github/workflows/release.yml}"
-TARGET_VERSION="v0.10.0"
+TARGET_VERSION="v0.10.1"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
