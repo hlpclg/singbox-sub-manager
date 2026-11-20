@@ -104,7 +104,7 @@ jobs:
         # entry per binary.
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+          sudo apt-get install -y qemu-user
           DIST_DIR=dist EXPECT_VERSION="$GITHUB_REF_NAME" bash tests/test_release_assets.sh
       - name: Verify pinned Reality runtime assets
         # --verify-assets only (network, no root/systemd needed); see

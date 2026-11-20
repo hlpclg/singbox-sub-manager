@@ -21,8 +21,8 @@
 #       with the repository, and the version string of both binaries:
 #       EXPECT_VERSION (default $GITHUB_REF_NAME) must match exactly. A binary
 #       for the host architecture is run directly (`version`); the foreign one
-#       (arm64 on an amd64 runner) is run through qemu-user (qemu-aarch64-static
-#       or qemu-x86_64-static; release.yml installs qemu-user-static). It is
+#       (arm64 on an amd64 runner) is run through QEMU (qemu-aarch64 or
+#       qemu-x86_64, with or without the -static suffix). It is
 #       NOT checked through `go version -m`: the release build uses -trimpath,
 #       and Go then leaves -ldflags (so -X main.Version) out of the recorded
 #       build settings (golang/go#52372). Missing EXPECT_VERSION or a missing
